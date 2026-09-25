@@ -10847,6 +10847,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Packed-GQA (cm1) row tiling: nb in [1,8] with a GQA ratio that leaves the
+    // Br=16 row tile only partly filled, so one workgroup must cover several
+    // query positions and share one K/V dequant pass across them.
+    for (int64_t nb : { 1, 2, 3, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  512, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // Ratios that do not divide Br: exercise the partially filled tile.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {7, 1}, 512, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {3, 1}, 512, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 512, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -11055,6 +11067,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // R9700 decode GEMV shapes: Qwen3.8-27B Q6_K weights at the MTP verify width
+    // (n=3 rows). These are 43.8 ms of a ~117 ms 183k decode step.
+    for (int64_t m : { 17408, 12288, 10240, 6144, 5120, 1024 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 3, 5120, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, 3, 17408, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 3, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, 3, 6144, {1, 1}, {1, 1}));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
@@ -11331,6 +11352,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // R9700 target shape: Qwen3.8-27B Q6_K with q8_0/q8_0 KV, hsk=hsv=256, GQA 6:1
+    // (4 KV heads / 24 Q heads), long context. nb is the query-row count: nb=1 is
+    // plain decode, nb=4 is the MTP speculative verify width, nb=512 is prefill.
+    for (int kv : { 71680, 183296, }) {
+        for (int nb : { 1, 2, 3, 4, 8, 512, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
+    // F16 vs q8_0 A/B at one shape: if FA time tracks bytes it is bandwidth-bound;
+    // if it barely moves, the kernel is compute/overhead-bound.
+    for (int nb : { 1, 4, }) {
+        for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, nb, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+        }
+    }
+
+    // MMA/overhead floor: the packed-GQA shape at tiny KV, where the K/V bytes
+    // are negligible and the time is the coopmat + softmax structure itself.
+    for (int kv : { 1024, 8192 }) {
+        for (int nb : { 1, 2, 4 }) {
+            for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+            }
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 576, }) {
