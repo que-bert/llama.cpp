@@ -5,6 +5,8 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 #if defined(BFLOAT16)
 #extension GL_EXT_bfloat16 : enable
@@ -67,6 +69,27 @@ shared O_TYPEV4 pvsh[Br * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// --- int8 QK decode path ----------------------------------------------------
+// For q8_0 K and q8_0 V on RDNA4 decode (n_pos<=8), keep K as raw int8 and feed
+// the int8 coopmat QK^T directly instead of dequantising K to f16 first. Q is
+// quantised to a q8_0-style (d, qs) pair in-shader, per 32-element block, so
+// the per-block scales d_q * d_K can be applied after the int32 accumulation.
+// Softmax and PV (V dequant + f16 coopmat) are unchanged. K is staged one
+// 32-wide block at a time, double-buffered, to keep shared memory small.
+// Selected host-side via Flags bit 6; GGML_VK_FA_NO_DECODE_V3 disables it.
+const bool USE_INT8_QK = (Flags & 64) != 0 &&
+                         FaTypeK == GGML_TYPE_Q8_0 && FaTypeV == GGML_TYPE_Q8_0;
+// uint32 words per K row: HSK int8 + padding.
+const uint32_t I8_KSTRIDE = HSK / 4 + 4;
+// q8 blocks along HSK (HSK is required to be a multiple of 32 host-side).
+const uint32_t I8_NB = HSK / 32;
+// uint32 words per Q row: HSK int8 + padding.
+const uint32_t I8_QSTRIDE = HSK / 4 + 4;
+shared uint32_t fa_kq8[Bc * I8_KSTRIDE];
+shared float    fa_kd8[Bc * I8_NB];
+shared uint32_t fa_qq8[Br * I8_QSTRIDE];
+shared float    fa_qd8[Br * I8_NB];
+
 // --- Packed-GQA row mapping -------------------------------------------------
 // Rows in the Br-wide tile enumerate (position, head) pairs, so one workgroup
 // reads and dequantizes a K/V tile once for POS_PER_TILE query positions and
@@ -98,6 +121,39 @@ void cm1_store_gh(uint gh, uint c, O_TYPEV4 elems, uint o_offset) {
     data_ov4[o_offset + gh * HSV / 4 + c] = D_TYPEV4(elems);
 }
 
+// Stage the whole Bc x HSK q8_0 K tile as raw int8 (no dequant) plus the
+// per-(row, 32-block) scales. fa_kv_index handles the sparse/OOB row case
+// (value 0, scale 0). One thread per (row, 32-block): 8 uint32 words each.
+#if !defined(BFLOAT16)
+void fa_stage_kq8_tile(uint32_t j, uint32_t tid, uint32_t k_offset, uint32_t k_stride) {
+    [[unroll]] for (uint32_t i = 0; i < (Bc * I8_NB) / gl_WorkGroupSize.x + 1; ++i) {
+        const uint32_t idx = i * gl_WorkGroupSize.x + tid;
+        if (idx >= Bc * I8_NB) continue;
+        const uint32_t row = idx / I8_NB;
+        const uint32_t b   = idx % I8_NB;
+        uint32_t kcol;
+        const bool act = fa_kv_index(j * Bc + row, kcol);
+        float dk = 0.0;
+        if (act) {
+            const uint32_t ib = k_offset + kcol * k_stride + b;
+            [[unroll]] for (uint32_t w = 0; w < 8; ++w) {
+                const int16_t lo = k_packed_q8_0.data[ib].qs[w * 2];
+                const int16_t hi = k_packed_q8_0.data[ib].qs[w * 2 + 1];
+                fa_kq8[row * I8_KSTRIDE + b * 8 + w] =
+                    uint32_t(uint16_t(lo)) | (uint32_t(uint16_t(hi)) << 16);
+            }
+            dk = float(k_packed_q8_0.data[ib].d);
+        } else {
+            [[unroll]] for (uint32_t w = 0; w < 8; ++w) {
+                fa_kq8[row * I8_KSTRIDE + b * 8 + w] = 0u;
+            }
+        }
+        fa_kd8[row * I8_NB + b] = dk;
+    }
+}
+
+#endif
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -118,7 +174,7 @@ void main() {
 #define tile_row(r) (row_tid * rows_per_thread + (r))
 
     // Zero-initialize shared memory for Q/K when HSK is not a multiple of 16 (HSK_pad > HSK).
-    if ((HSK % 16) != 0) {
+    if ((HSK % 16) != 0 && !USE_INT8_QK) {
         [[unroll]] for (uint i = 0; i < Br * qstride; i += gl_WorkGroupSize.x) {
             if (i + tid < Br * qstride) {
                 Qf[i + tid] = FLOAT_TYPEV4(0);
@@ -129,14 +185,47 @@ void main() {
 
     uint32_t q_offset = gqa_iq1*p.nb01 + (iq2*p.nb02+iq3*p.nb03) / 4;
 
-    [[unroll]] for (uint32_t idx = 0; idx < Br * HSK / 4; idx += gl_WorkGroupSize.x) {
-        uint32_t d = (idx + tid) % (HSK / 4);
-        uint32_t r = (idx + tid) / (HSK / 4);
-        if (r < Br && d < HSK / 4 &&
-            cm1_row_valid(r)) {
-            const uint32_t gp = cm1_row_pos(r);
-            const uint32_t gh = cm1_row_head(r);
-            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[(gp * p.nb01) / 4 + (gh * p.nb02 + iq3 * p.nb03) / 16 + d] * p.scale);
+    if (USE_INT8_QK) {
+        // Quantise Q to (d, int8) per 32-element block, reading Q from global
+        // (Qf is not needed on the int8 path). Rows outside the packed tile
+        // still produce finite values; their S output is discarded at store.
+        [[unroll]] for (uint32_t idx = 0; idx < Br * I8_NB; idx += gl_WorkGroupSize.x) {
+            if (idx + tid >= Br * I8_NB) continue;
+            const uint32_t r  = (idx + tid) / I8_NB;
+            const uint32_t b  = (idx + tid) % I8_NB;
+            const bool rv = cm1_row_valid(r);
+            const uint32_t gp = rv ? cm1_row_pos(r) : 0u;
+            const uint32_t gh = rv ? cm1_row_head(r) : 0u;
+            const uint32_t qbase = (gp * p.nb01) / 4 + (gh * p.nb02 + iq3 * p.nb03) / 16 + b * 8;
+
+            vec4 qv[8];
+            float mx = 0.0;
+            [[unroll]] for (uint32_t v = 0; v < 8; ++v) {
+                qv[v] = data_qv4[qbase + v] * p.scale;
+                mx = max(mx, max(max(abs(qv[v].x), abs(qv[v].y)), max(abs(qv[v].z), abs(qv[v].w))));
+            }
+            const float dq = (mx > 0.0f) ? (mx / 127.0f) : 1.0f;
+            const float inv = 1.0f / dq;
+            fa_qd8[r * I8_NB + b] = dq;
+            [[unroll]] for (uint32_t v = 0; v < 8; ++v) {
+                const vec4 q = qv[v] * inv;
+                const uint32_t i0 = uint(int(clamp(round(q.x), -127.0f, 127.0f)) & 0xFF);
+                const uint32_t i1 = uint(int(clamp(round(q.y), -127.0f, 127.0f)) & 0xFF);
+                const uint32_t i2 = uint(int(clamp(round(q.z), -127.0f, 127.0f)) & 0xFF);
+                const uint32_t i3 = uint(int(clamp(round(q.w), -127.0f, 127.0f)) & 0xFF);
+                fa_qq8[r * I8_QSTRIDE + b * 8 + v] = i0 | (i1 << 8) | (i2 << 16) | (i3 << 24);
+            }
+        }
+    } else {
+        [[unroll]] for (uint32_t idx = 0; idx < Br * HSK / 4; idx += gl_WorkGroupSize.x) {
+            uint32_t d = (idx + tid) % (HSK / 4);
+            uint32_t r = (idx + tid) / (HSK / 4);
+            if (r < Br && d < HSK / 4 &&
+                cm1_row_valid(r)) {
+                const uint32_t gp = cm1_row_pos(r);
+                const uint32_t gh = cm1_row_head(r);
+                Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[(gp * p.nb01) / 4 + (gh * p.nb02 + iq3 * p.nb03) / 16 + d] * p.scale);
+            }
         }
     }
     barrier();
@@ -172,8 +261,12 @@ void main() {
     }
 
     const uint32_t mo_stride = CEIL_DIV(KV, 16 * Bc);
+    // mask_opt row-block height: for packed-GQA one block spans the query
+    // positions of a packed tile (pos_per_tile), so the bitmask row-block is
+    // selected by the position-tile index gqa_iq1, not by the (always-zero) i.
+    const uint32_t mo_rows = PACKED_GQA ? cm1_pos_per_tile() : Br;
     // mo_offset will point to the tile starting at row i*Br and col 0
-    uint32_t mo_offset = mo_stride * i;
+    uint32_t mo_offset = mo_stride * (PACKED_GQA ? gqa_iq1 : i);
 
     // FaBlockBytesK/V == 2 for f16 (sizeof f16) and == 16 for f32 (vec4) and == ggml block size for quants.
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
@@ -185,7 +278,7 @@ void main() {
     m_stride = KV;
     if (p.nem2 != 1 || p.nem3 != 1) {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
-        mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
+        mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, mo_rows) * mo_stride;
     }
 
     uint32_t mask_opt = 0;
@@ -261,7 +354,7 @@ void main() {
             }
         }
 
-        if (SHMEM_STAGING != 0) {
+        if (SHMEM_STAGING != 0 && !USE_INT8_QK) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSK_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSK_pad / 4);
                 uint32_t c = (idx + tid) / (HSK_pad / 4);
@@ -299,6 +392,44 @@ void main() {
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
 
+        if (USE_INT8_QK) {
+            // int8 QK: K stays int8 (whole Bc x HSK tile staged once, no
+            // dequant); Q is the in-shader q8_0-style quantisation. Each 32-block
+            // gets its own int32 coopmat so the MMAs pipeline; d_q * d_K folds
+            // the scales in after. ROW_TILES==1 is guaranteed host-side.
+#if !defined(BFLOAT16)
+            fa_stage_kq8_tile(j, tid, k_offset, k_stride);
+            barrier();
+
+            const uint32_t q_lanerow = gl_SubgroupInvocationID / MatBr;
+            const uint32_t q_lane = gl_SubgroupInvocationID % MatBr;
+            const uint32_t cm_elems = (MatBc * MatBr) / gl_SubgroupSize;
+
+            // One accumulator at a time: issue the two 16-wide MMAs for a block,
+            // fold d_q*d_K into S, then reuse the accumulator. Keeps VGPR
+            // pressure low (I8_NB int32 tiles would be 8x CM_ELEMS registers).
+            [[unroll]] for (uint32_t b = 0; b < I8_NB; ++b) {
+                coopmat<int32_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> qk_acc =
+                    coopmat<int32_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+                [[unroll]] for (uint32_t h = 0; h < 2; ++h) {
+                    coopmat<int8_t, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat8;
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat8;
+                    coopMatLoad(KMat8, fa_kq8, (gl_SubgroupID * MatBc) * I8_KSTRIDE + b * 8 + h * 4,
+                                I8_KSTRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(QMat8, fa_qq8, b * 8 + h * 4, I8_QSTRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                    qk_acc = coopMatMulAdd(KMat8, QMat8, qk_acc);
+                }
+
+                [[unroll]] for (uint32_t e = 0; e < 8; ++e) {
+                    if (e >= cm_elems) break;
+                    const uint32_t krow = e + q_lanerow * cm_elems;
+                    const uint32_t krow_g = gl_SubgroupID * MatBc + krow;
+                    const float s = fa_qd8[q_lane * I8_NB + b] * fa_kd8[krow_g * I8_NB + b];
+                    SfMat[0][e] = ACC_TYPE(float(SfMat[0][e]) + float(qk_acc[e]) * s);
+                }
+            }
+#endif
+        } else {
         [[unroll]] for (uint32_t d = 0; d < HSK_pad / 16; ++d) {
             // If SHMEM_STAGING is set, a Bc * HSK_pad size tile of K is loaded to shmem
             // If not, K is loaded directly from global memory if aligned, otherwise
@@ -353,6 +484,7 @@ void main() {
                 coopMatLoad(QMat, Qf, t * MatBr * qstride + d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
                 SfMat[t] = coopMatMulAdd(KMat, QMat, SfMat[t]);
             }
+        }
         }
 
         [[unroll]] for (uint32_t t = 0; t < ROW_TILES; ++t) {
