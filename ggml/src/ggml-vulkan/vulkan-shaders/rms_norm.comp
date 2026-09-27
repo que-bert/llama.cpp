@@ -39,7 +39,9 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
+#ifndef BLOCK_SIZE
 #define BLOCK_SIZE 512
+#endif
 
 layout (constant_id = 1) const bool do_multiply = false;
 #if RMS_NORM_ADD_FUSION

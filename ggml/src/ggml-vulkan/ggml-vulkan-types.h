@@ -835,6 +835,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_add_id_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
+    vk_pipeline pipeline_concat_t_i32; // dim 0, transposed src1: shared-memory tile transpose
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
     vk_pipeline pipeline_log[2];
@@ -859,6 +860,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
+    vk_pipeline pipeline_rms_norm_small_f32;      // BLOCK_SIZE 128, ne00 <= 128
+    vk_pipeline pipeline_rms_norm_mul_small_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;

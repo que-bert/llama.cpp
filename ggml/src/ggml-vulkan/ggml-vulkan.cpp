@@ -3296,6 +3296,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_small_f32, "rms_norm_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_small_f32, "rms_norm_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -3416,6 +3418,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_t_i32, "concat_t_i32", concat_t_i32_len, concat_t_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
@@ -4047,6 +4050,33 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
+
+        // Without resizable BAR the DEVICE_LOCAL|HOST_VISIBLE heap is only the 256 MiB PCIe
+        // window. Buffers that fit it get that memory type first, and once the window is
+        // over-subscribed the kernel driver places them in GTT (system RAM over PCIe): e.g. the
+        // mtmd vision compute buffer (~250 MiB) ran every op at ~30 GB/s. Only prefer
+        // host-visible vidmem when it covers (most of) the device-local heap, i.e. ReBAR/UMA
+        // (UMA is handled separately in ggml_vk_create_buffer_device).
+        if (!device->disable_host_visible_vidmem) {
+            const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+            vk::DeviceSize max_local_heap = 0, max_visible_local_heap = 0;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+                const vk::MemoryType & mt = mem_props.memoryTypes[i];
+                if (!(mt.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                    continue;
+                }
+                const vk::DeviceSize heap_size = mem_props.memoryHeaps[mt.heapIndex].size;
+                max_local_heap = std::max(max_local_heap, heap_size);
+                if (mt.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) {
+                    max_visible_local_heap = std::max(max_visible_local_heap, heap_size);
+                }
+            }
+            if (max_visible_local_heap > 0 && max_visible_local_heap < max_local_heap / 2) {
+                device->disable_host_visible_vidmem = true;
+                GGML_LOG_DEBUG("ggml_vulkan: small BAR (%zu of %zu MiB host-visible), not preferring host-visible vidmem\n",
+                               (size_t)(max_visible_local_heap >> 20), (size_t)(max_local_heap >> 20));
+            }
+        }
 
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
@@ -8751,6 +8781,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
         }
+        if (ggml_vk_concat_unit_size(src0->type) == 4 && !ggml_is_quantized(dst->type) &&
+            ggml_get_op_params_i32(dst, 0) == 0 && ggml_is_contiguous(dst) &&
+            src1->nb[0] != ggml_type_size(src1->type) && src1->nb[1] == ggml_type_size(src1->type)) {
+            return ctx->device->pipeline_concat_t_i32;
+        }
         switch (ggml_vk_concat_unit_size(src0->type)) {
         case 1:
             return ctx->device->pipeline_concat_i8;
@@ -8898,6 +8933,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
+            }
+            if (src0->ne[0] <= 128) {
+                return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_small_f32 : ctx->device->pipeline_rms_norm_small_f32;
             }
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
         }
@@ -9676,6 +9714,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_GLU:
     case GGML_OP_CONV_2D_DW:
         {
+            if (op == GGML_OP_CONCAT && pipeline == ctx->device->pipeline_concat_t_i32) {
+                elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)(dst->ne[2] * dst->ne[3]) };
+                break;
+            }
             uint32_t ne = ggml_nelements(dst);
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
                 // Convert from number of logical elements to 2- or 4-byte units.

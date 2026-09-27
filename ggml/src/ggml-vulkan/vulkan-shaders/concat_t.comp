@@ -1,0 +1,42 @@
+#version 450
+
+// CONCAT along dim 0 where src1 is transposed (nb10 != 1, nb11 == 1), e.g. the gated-delta-net
+// conv input concat(conv_states, transpose(qkv_mixed)). The generic concat reads src1 with a
+// stride of ne11 elements per thread; this variant stages a 32x32 tile in shared memory so both
+// the src1 reads (along i1) and the dst writes (along i0) are coalesced.
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+shared D_TYPE tile[32][33];
+
+void main() {
+    const uint i0b = gl_WorkGroupID.x * 32;
+    const uint i1b = gl_WorkGroupID.y * 32;
+    const uint i2  = gl_WorkGroupID.z % p.ne22;
+    const uint i3  = gl_WorkGroupID.z / p.ne22;
+    const uint tx  = gl_LocalInvocationID.x;
+    const uint ty  = gl_LocalInvocationID.y;
+
+    [[unroll]] for (uint r = ty; r < 32; r += 8) {
+        const uint i0 = i0b + r;
+        const uint i1 = i1b + tx;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            tile[r][tx] = i0 < p.ne00
+                ? data_a[get_aoffset() + i3*p.nb03 + i2*p.nb02 + i1*p.nb01 + i0*p.nb00]
+                : data_b[get_boffset() + i3*p.nb13 + i2*p.nb12 + i1*p.nb11 + (i0 - p.ne00)*p.nb10];
+        }
+    }
+
+    barrier();
+
+    [[unroll]] for (uint r = ty; r < 32; r += 8) {
+        const uint i0 = i0b + tx;
+        const uint i1 = i1b + r;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            data_d[get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20] = tile[tx][r];
+        }
+    }
+}
