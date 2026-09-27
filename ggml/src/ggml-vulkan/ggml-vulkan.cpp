@@ -2507,8 +2507,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->coopmat_int_support && rdna4 && getenv("GGML_VK_NO_MMQ_Q6K_RDNA4") == nullptr) {
             const char * ord = getenv("GGML_VK_MMQ_Q6K_ORDER");
             const uint32_t order_n = ord ? (uint32_t)atoi(ord) : 1u;
-            ggml_vk_create_pipeline(device, device->pipeline_mmq_q6k_rdna4, "mul_mmq_q6k_rdna4", mul_mmq_q6k_rdna4_cm1_len, mul_mmq_q6k_rdna4_cm1_data, "main", 3,
-                                    sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 32);
+            const char * wv = getenv("GGML_VK_MMQ_Q6K_WAVE");
+            if (wv && atoi(wv) == 64) {
+                ggml_vk_create_pipeline(device, device->pipeline_mmq_q6k_rdna4, "mul_mmq_q6k_rdna4", mul_mmq_q6k_rdna4_w64_cm1_len, mul_mmq_q6k_rdna4_w64_cm1_data, "main", 3,
+                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+            } else {
+                ggml_vk_create_pipeline(device, device->pipeline_mmq_q6k_rdna4, "mul_mmq_q6k_rdna4", mul_mmq_q6k_rdna4_cm1_len, mul_mmq_q6k_rdna4_cm1_data, "main", 3,
+                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 32);
+            }
         }
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {

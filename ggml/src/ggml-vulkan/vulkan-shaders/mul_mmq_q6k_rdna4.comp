@@ -23,7 +23,9 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 
+#ifndef SG
 #define SG 32
+#endif
 #ifndef WARPS_T
 #define WARPS_T 4            // warps along tokens
 #endif
@@ -58,7 +60,7 @@ struct block_q8_1_x4_packed128 {
     ivec4 qs[8];
 };
 
-layout(binding = 0) readonly buffer A { block_q6_K_packed16 data_a[]; };
+layout(binding = 0) readonly buffer A { uint data_au[]; };   // Q6_K blocks are 210 B (2-byte aligned): read as dwords + funnel shift
 layout(binding = 1) readonly buffer B { block_q8_1_x4_packed128 data_b[]; };
 layout(binding = 2) writeonly buffer D { float data_d[]; };
 
@@ -103,10 +105,9 @@ void main() {
     float sums[TT * TW * CM_ELEMS];
     [[unroll]] for (uint i = 0; i < TT * TW * CM_ELEMS; ++i) sums[i] = 0.0f;
 
-    // prefetch registers
-    uvec4 rql[W_PER], rqh[W_PER];
-    int   rsc[W_PER];
-    float rd[W_PER];
+    // prefetch registers (raw dwords; the 2-byte misalignment of odd Q6_K blocks is fixed at LDS store)
+    uint rql[W_PER][5], rqh[W_PER][5];
+    uint rsc[W_PER], rd[W_PER], rodd[W_PER];
     ivec4 ry[Y_PER];
     float ryd[Y_PER];
 
@@ -114,14 +115,14 @@ void main() {
     const uint sb = (kt) >> 2, c = (kt) & 3, hf = c >> 1; \
     [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
         const uint v = tid + i * NT, row = v >> 2, g = v & 3; \
-        const uint blk = (m0 + row) * nsb + sb; \
-        const uint qlo = hf * 32 + g * 8, qho = hf * 16 + (g & 1) * 8; \
-        [[unroll]] for (uint w = 0; w < 4; ++w) { \
-            rql[i][w] = uint(data_a[blk].ql[qlo + 2 * w]) | (uint(data_a[blk].ql[qlo + 2 * w + 1]) << 16); \
-            rqh[i][w] = uint(data_a[blk].qh[qho + 2 * w]) | (uint(data_a[blk].qh[qho + 2 * w + 1]) << 16); \
-        } \
-        rsc[i] = int(data_a[blk].scales[(c * 4 + g) >> 1]); \
-        rd[i]  = float(data_a[blk].d); \
+        const uint bb = ((m0 + row) * nsb + sb) * 210u; \
+        const uint wl = (bb + hf * 64 + g * 16) >> 2; \
+        const uint wh = (bb + 128 + hf * 32 + (g & 1) * 16) >> 2; \
+        [[unroll]] for (uint w = 0; w < 5; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } \
+        const uint so = bb + 192 + c * 4 + g; \
+        rsc[i] = data_au[so >> 2] >> (8 * (so & 3)); \
+        rd[i]  = data_au[(bb + 208) >> 2] >> (8 * ((bb + 208) & 3)); \
+        rodd[i] = bb & 2; \
     } \
     [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
         const uint v = tid + i * NT, r = v >> 2, q = v & 3; \
@@ -137,12 +138,14 @@ void main() {
         const uint v = tid + i * NT, row = v >> 2, g = v & 3; \
         const uint hsh = 4 * nib + 2 * (g >> 1); \
         [[unroll]] for (uint w = 0; w < 4; ++w) { \
-            uint q = ((rql[i][w] >> (4 * nib)) & 0x0F0F0F0Fu) | (((rqh[i][w] >> hsh) & 0x03030303u) << 4); \
+            const uint l = rodd[i] != 0 ? ((rql[i][w] >> 16) | (rql[i][w + 1] << 16)) : rql[i][w]; \
+            const uint h = rodd[i] != 0 ? ((rqh[i][w] >> 16) | (rqh[i][w + 1] << 16)) : rqh[i][w]; \
+            uint q = ((l >> (4 * nib)) & 0x0F0F0F0Fu) | (((h >> hsh) & 0x03030303u) << 4); \
             q = ((q | 0x80808080u) - 0x20202020u) ^ 0x80808080u; \
             shW[buf][row * STR + g * 4 + w] = q; \
         } \
-        const int sc8 = (g & 1) != 0 ? (rsc[i] >> 8) : ((rsc[i] << 24) >> 24); \
-        shS[buf][g * BM + row] = rd[i] * float(sc8); \
+        const float dw = unpackHalf2x16(rd[i] & 0xFFFFu).x; \
+        shS[buf][g * BM + row] = dw * float(bitfieldExtract(int(rsc[i]), 0, 8)); \
     } \
     [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
         const uint v = tid + i * NT, r = v >> 2, q = v & 3; \
