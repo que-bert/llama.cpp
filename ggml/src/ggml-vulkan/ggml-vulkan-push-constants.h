@@ -832,6 +832,15 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+struct vk_fa_prefill_rdna4_push_constants {
+    uint32_t N; uint32_t KV; uint32_t nhq;
+    uint32_t q_s1; uint32_t q_s2; uint32_t q_s3;
+    uint32_t k_s1; uint32_t k_s2; uint32_t k_s3;
+    uint32_t v_s1; uint32_t v_s2; uint32_t v_s3;
+    uint32_t m_s1; uint32_t m_s3; uint32_t has_mask; uint32_t nem3;
+    float scale;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;

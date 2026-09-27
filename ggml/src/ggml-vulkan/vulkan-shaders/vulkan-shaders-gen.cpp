@@ -926,6 +926,9 @@ void process_shaders() {
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("flash_attn_prefill_rdna4", "flash_attn_prefill_rdna4.comp", {}, true, true, false, false);
+#endif
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});

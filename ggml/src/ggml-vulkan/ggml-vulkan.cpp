@@ -3208,6 +3208,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    if (device->coopmat_support && device->subgroup_require_full_support && device->architecture == vk_device_architecture::AMD_RDNA4) {
+        for (uint32_t g = 1; g <= 6; ++g) {
+            ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4[g], "flash_attn_prefill_rdna4_g" + std::to_string(g),
+                                     flash_attn_prefill_rdna4_cm1_len, flash_attn_prefill_rdna4_cm1_data, "main", 5,
+                                     sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g}, 1, true, true, 32);
+        }
+    }
+#endif
 
     for (auto &it : device->pipeline_fa_mask_opt) {
         auto BrBc = it.first;
@@ -8087,6 +8096,78 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
+
+    // RDNA4 prefill: GQA-packed coopmat1 FA over the f16 scratch (flash_attn_prefill_rdna4.comp).
+    // One workgroup = one KV head x 16 positions x all q heads sharing it. Kill: GGML_VK_NO_FA_PREFILL_RDNA4=1.
+    {
+        static const bool no_prefill_rdna4 = getenv("GGML_VK_NO_FA_PREFILL_RDNA4") != nullptr;
+        const uint32_t G = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
+        float pf_scale = 1.0f, pf_max_bias = 0.0f, pf_softcap = 0.0f;
+        memcpy(&pf_scale,    (const float *) dst->op_params + 0, sizeof(float));
+        memcpy(&pf_max_bias, (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&pf_softcap,  (const float *) dst->op_params + 2, sizeof(float));
+        const bool use_prefill_rdna4 = !no_prefill_rdna4 && use_dequant_kv &&
+            ctx->device->architecture == vk_device_architecture::AMD_RDNA4 &&
+            G >= 1 && G <= 6 && ctx->device->pipeline_fa_prefill_rdna4[G] != nullptr &&
+            k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
+            HSK == 256 && HSV == 256 && neq1 >= 64 &&
+            (int64_t)G * nek2 == neq2 && nek2 == nev2 && neq3 == nek3 && nek3 == nev3 &&
+            (!mask || (mask->type == GGML_TYPE_F16 && nem2 == 1 && mask->nb[0] == sizeof(ggml_fp16_t))) &&
+            !sinks && pf_max_bias == 0.0f && pf_softcap == 0.0f &&
+            (nbq1 % 16) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
+            ggml_is_contiguous(dst);
+        if (use_prefill_rdna4) {
+            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4[G];
+            ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+
+            vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
+            vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
+            vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
+            vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+            vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+
+            const uint64_t fp = sizeof(ggml_fp16_t);
+            const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
+            const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
+            if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
+                ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
+            vk_pipeline tr_v = ctx->device->pipeline_dequant_transpose[v->type];
+            ggml_pipeline_request_descriptor_sets(ctx, tr_k, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, tr_v, 1);
+            if (ctx->prealloc_x_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            vk_subbuffer k_dst = vk_subbuffer{ ctx->prealloc_x, 0,        k_f16_sz };
+            vk_subbuffer v_dst = vk_subbuffer{ ctx->prealloc_x, k_f16_sz, v_f16_sz };
+            const uint32_t k_nel = (uint32_t)ggml_nelements(k);
+            const uint32_t v_nel = (uint32_t)ggml_nelements(v);
+            { const std::vector<uint32_t> tpc = { (uint32_t)HSK, (uint32_t)nek2, (uint32_t)KV, 0, k_nel };
+              ggml_vk_dispatch_pipeline(ctx, subctx, tr_k, { k_buf, k_dst }, tpc, { k_nel, 1, 1 }); }
+            { const std::vector<uint32_t> tpc = { (uint32_t)HSV, (uint32_t)nev2, (uint32_t)KV, 0, v_nel };
+              ggml_vk_dispatch_pipeline(ctx, subctx, tr_v, { v_buf, v_dst }, tpc, { v_nel, 1, 1 }); }
+            ggml_vk_sync_buffers(ctx, subctx);
+
+            // scratch layout: [ne3][head][kv][d] f16, HSK/8 uvec4 per row
+            const vk_fa_prefill_rdna4_push_constants ppc = {
+                (uint32_t)neq1, KV, (uint32_t)neq2,
+                (uint32_t)(nbq1 / 4), (uint32_t)(nbq2 / 4), (uint32_t)(nbq3 / 4),
+                HSK / 8, KV * (HSK / 8), KV * (HSK / 8) * (uint32_t)nek2,
+                HSV / 8, KV * (HSV / 8), KV * (HSV / 8) * (uint32_t)nev2,
+                mask ? (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)) : 0u,
+                mask ? (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)) : 0u,
+                mask ? 1u : 0u,
+                mask ? std::max<uint32_t>(1u, nem3) : 1u,
+                pf_scale,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pl, { q_buf, k_dst, v_dst, mask_buf, dst_buf }, ppc,
+                                      { (uint32_t)CEIL_DIV(neq1, 16), (uint32_t)nek2, (uint32_t)neq3 });
+            ctx->prealloc_x_need_sync = true;
+            return;
+        }
+    }
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
