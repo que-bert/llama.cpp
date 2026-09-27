@@ -28,7 +28,9 @@
 #endif
 #define NT (WARPS_M * WARPS_N * SG)
 #define BM 128
+#ifndef BN
 #define BN 128
+#endif
 #define BK 32
 #ifndef PAD
 #define PAD 2
@@ -73,7 +75,9 @@ shared uint shY[NBUF][BN * STR];
 
 #define MAT(T, U) coopmat<T, gl_ScopeSubgroup, 16, 16, U>
 
-#define W_PER ((BM * 2) / NT)   // (row, 16-group) items per thread
+#define GW ((BM * BK) / (4 * NT)) // 4-value words dequantised per thread per K step (4: 128x128, 2: 128x256)
+#define GPR (8 / GW)            // items per weight row per K step
+#define W_PER ((BM * GPR) / NT) // (row, group) items per thread
 #ifdef Y_F32
 #define Y_VR 8                  // uvec4 (4 x f32) per token row per K step
 #else
@@ -115,21 +119,32 @@ void main() {
     MAT(float, gl_MatrixUseAccumulator) acc[TM * TN];
     [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = MAT(float, gl_MatrixUseAccumulator)(0.0f);
 
-    uint rql[W_PER][5], rqh[W_PER][5];
+    uint rql[W_PER][GW + 1], rqh[W_PER][GW + 1];
     uint rsc[W_PER], rd[W_PER], rodd[W_PER];
     uvec4 ry[Y_PER];
 
     // step kt covers K elements [32 kt, 32 kt + 32): Q6_K block sb = kt / 8, chunk c = kt % 8
     // (half hf = c / 4, quadrant qd = c % 4), 16-group g in {0, 1}
+#ifdef UPAR
+// nsb even (host-checked): block parity (row * nsb + sb) & 1 == sb & 1 is workgroup-uniform, so the
+// 2-byte-misaligned select is a uniform branch and even blocks load 4 aligned dwords instead of 5
+#define ODDQ(kt) ((((kt) >> 3) & 1u) != 0)
+#define LOADQ(wl, wh, sb) \
+    if (((sb) & 1u) != 0) { [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } } \
+    else { [[unroll]] for (uint w = 0; w < GW; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } }
+#else
+#define ODDQ(kt) ((rodd[i] & 2) != 0)
+#define LOADQ(wl, wh, sb) [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; }
+#endif
 #define GLOAD(kt) { \
     const uint sb = (kt) >> 3, c = (kt) & 7, hf = c >> 2, qd = c & 3; \
     [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
-        const uint v = tid + i * NT, row = v >> 1, g = v & 1; \
+        const uint v = tid + i * NT, row = v / GPR, g = v % GPR, go = g * 4 * GW; \
         const uint bb = ((m0 + row) * nsb + sb) * 210u; \
-        const uint wl = (bb + hf * 64 + (qd & 1) * 32 + g * 16) >> 2; \
-        const uint wh = (bb + 128 + hf * 32 + g * 16) >> 2; \
-        [[unroll]] for (uint w = 0; w < 5; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } \
-        const uint so = bb + 192 + c * 2 + g; \
+        const uint wl = (bb + hf * 64 + (qd & 1) * 32 + go) >> 2; \
+        const uint wh = (bb + 128 + hf * 32 + go) >> 2; \
+        LOADQ(wl, wh, sb) \
+        const uint so = bb + 192 + c * 2 + (go >> 4); \
         rsc[i] = data_au[so >> 2]; \
         rd[i]  = data_au[(bb + 208) >> 2]; \
         rodd[i] = (bb & 2u) | ((so & 3u) << 8); \
@@ -144,17 +159,17 @@ void main() {
     const uint c = (kt) & 7, qd = c & 3; \
     const uint lsh = 4 * (qd >> 1), hsh = 2 * qd; \
     [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
-        const uint v = tid + i * NT, row = v >> 1, g = v & 1; \
-        const bool odd = (rodd[i] & 2) != 0; \
+        const uint v = tid + i * NT, row = v / GPR, g = v % GPR; \
+        const bool odd = ODDQ(kt); \
         const float dsc = unpackHalf2x16(odd ? (rd[i] >> 16) : rd[i]).x * float(bitfieldExtract(int(rsc[i]), int(8 * (rodd[i] >> 8)), 8)); \
         const f16vec2 s = f16vec2(float16_t(dsc)); \
-        [[unroll]] for (uint w = 0; w < 4; ++w) { \
+        [[unroll]] for (uint w = 0; w < GW; ++w) { \
             const uint l = odd ? ((rql[i][w] >> 16) | (rql[i][w + 1] << 16)) : rql[i][w]; \
             const uint h = odd ? ((rqh[i][w] >> 16) | (rqh[i][w + 1] << 16)) : rqh[i][w]; \
             const uint q = ((l >> lsh) & 0x0F0F0F0Fu) | (((h >> hsh) & 0x03030303u) << 4); \
             uint o0, o1; deq4(q, s, o0, o1); \
-            shW[buf][row * STR + g * 8 + 2 * w] = o0; \
-            shW[buf][row * STR + g * 8 + 2 * w + 1] = o1; \
+            shW[buf][row * STR + g * 2 * GW + 2 * w] = o0; \
+            shW[buf][row * STR + g * 2 * GW + 2 * w + 1] = o1; \
         } \
     } \
     [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
@@ -162,13 +177,23 @@ void main() {
         STORE_Y(buf, r, q, ry[i]) \
     } }
 
+#ifdef SPLITK
+    // split-K: z-slice kz covers K [kz * k_split, (kz + 1) * k_split) and writes its partial sums to
+    // slice kz of the split-k scratch (reduced by split_k_reduce)
+    const uint kt0 = gl_WorkGroupID.z * (p.k_split / BK);
+    const uint nk  = min(kt0 + p.k_split / BK, p.K / BK);
+    const uint dbase = gl_WorkGroupID.z * p.batch_stride_d;
+#else
+    const uint kt0 = 0;
     const uint nk = p.K / BK;
-    GLOAD(0)
-    SSTORE(0, 0)
+    const uint dbase = 0;
+#endif
+    GLOAD(kt0)
+    SSTORE(0, kt0)
     barrier();
 
-    for (uint kt = 0; kt < nk; ++kt) {
-        const uint cur = NBUF == 1 ? 0 : (kt & 1);
+    for (uint kt = kt0; kt < nk; ++kt) {
+        const uint cur = NBUF == 1 ? 0 : ((kt - kt0) & 1);
         // unconditional (clamped) prefetch and store keep the loop branch-free so the global loads
         // stay in flight across the WMMA block
         const uint kn = min(kt + 1, nk - 1);
@@ -196,7 +221,7 @@ void main() {
     if (n0 + BN <= p.N) {
         [[unroll]] for (uint j = 0; j < TN; ++j)
             [[unroll]] for (uint i = 0; i < TM; ++i)
-                coopMatStore(acc[j * TM + i], data_d, (n0 + wn * WTN + j * 16) * p.stride_d + m0 + wm * WTM + i * 16, p.stride_d,
+                coopMatStore(acc[j * TM + i], data_d, dbase + (n0 + wn * WTN + j * 16) * p.stride_d + m0 + wm * WTM + i * 16, p.stride_d,
                              gl_CooperativeMatrixLayoutColumnMajor);
     } else {
         // token tail: stage each 16x16 tile through LDS (reusing shW) and store the in-range columns
@@ -210,7 +235,7 @@ void main() {
                     const uint cn = e / 16, rm = e % 16;
                     const uint tok = n0 + wn * WTN + j * 16 + cn;
                     if (tok < p.N) {
-                        data_d[tok * p.stride_d + m0 + wm * WTM + i * 16 + rm] = uintBitsToFloat(shW[0][scr + e]);
+                        data_d[dbase + tok * p.stride_d + m0 + wm * WTM + i * 16 + rm] = uintBitsToFloat(shW[0][scr + e]);
                     }
                 }
                 subgroupMemoryBarrierShared();
