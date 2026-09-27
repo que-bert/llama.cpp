@@ -794,6 +794,7 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_id_tile_selector;
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    vk_pipeline pipeline_mmq_q6k_rdna4;  // RDNA4 Q6_K x q8_1 prefill GEMM (GGML_VK_NO_MMQ_Q6K_RDNA4=1 disables)
     vk_pipeline pipeline_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];

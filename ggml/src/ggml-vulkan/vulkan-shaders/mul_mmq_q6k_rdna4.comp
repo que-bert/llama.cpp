@@ -1,0 +1,213 @@
+#version 450
+
+// RDNA4 prefill GEMM: D[n][m] = sum_k W[m][k] * Y[n][k]
+//   W = Q6_K weights (decoded to int8 q-32 on the global->LDS path)
+//   Y = q8_1_x4 activations (int8 + per-32 f16 scale)
+// int8 WMMA (16x16x16) with an operand orientation chosen so the epilogue is cheap:
+//   A operand = activations (rows = tokens), B operand = weights (cols = weight rows).
+//   In the RDNA4 accumulator layout a lane owns one column (lane % 16) and CM_ELEMS rows, so the
+//   per-(weight row, 16-block) Q6_K scale d*sc is a lane scalar and only the per-(token, 32-block)
+//   q8_1 scale varies per element.
+// Per 32-deep q8_1 block the two per-16 int32 partials are initialised with the magic bias
+// 0x4B400000 so intBitsToFloat() is the int->float conversion; the epilogue is 3 FMAs per element
+// per 32 K (x = fma(P0, s0, nb); x = fma(P1, s1, x); acc = fma(x, d_y, acc)).
+// Tiling: BM x BN = 128 weight rows x 128 tokens, BK = 64, double-buffered LDS, register prefetch.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+#define SG 32
+#ifndef WARPS_T
+#define WARPS_T 4            // warps along tokens
+#endif
+#ifndef WARPS_W
+#define WARPS_W 2            // warps along weight rows
+#endif
+#define NT (WARPS_T * WARPS_W * SG)
+#define BM 128               // weight rows per workgroup
+#define BN 128               // tokens per workgroup
+#define BK 64
+#define PAD 2
+#define STR (BK / 4 + PAD)   // LDS row stride in uint32
+#define WTN (BN / WARPS_T)   // tokens per warp
+#define WTM (BM / WARPS_W)   // weight rows per warp
+#define TT (WTN / 16)
+#define TW (WTM / 16)
+#define CM_ELEMS (256 / SG)
+
+#define ACC_BIAS_BITS 0x4B400000
+#define ACC_BIAS_F    12582912.0f
+
+layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
+
+struct block_q6_K_packed16 {
+    uint16_t ql[64];
+    uint16_t qh[32];
+    int16_t scales[8];
+    float16_t d;
+};
+struct block_q8_1_x4_packed128 {
+    f16vec2 ds[4];
+    ivec4 qs[8];
+};
+
+layout(binding = 0) readonly buffer A { block_q6_K_packed16 data_a[]; };
+layout(binding = 1) readonly buffer B { block_q8_1_x4_packed128 data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint M; uint N; uint K;
+    uint stride_a; uint stride_b; uint stride_d;
+    uint batch_stride_a; uint batch_stride_b; uint batch_stride_d;
+    uint base_work_group_z; uint num_batches; uint k_split;
+    uint ne02; uint ne12; uint broadcast2; uint broadcast3; uint padded_n;
+} p;
+
+// 0: weight tiles vary fastest (grid order); 1: the token tiles of one weight tile run adjacently.
+layout(constant_id = 0) const uint ORDER_N = 1;
+
+shared uint  shY[2][BN * STR];
+shared uint  shW[2][BM * STR];
+shared float shS[2][4 * BM];   // [16-block j][weight row] = d * sc
+shared float shD[2][2 * BN];   // [32-block][token]       = d_y
+
+#define W_PER ((BM * 4) / NT)  // (row, 16-group) items per thread
+#define Y_PER ((BN * 4) / NT)  // (token, uvec4) items per thread
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint warp = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wt = warp % WARPS_T, ww = warp / WARPS_T;
+
+    uint mt, nt;
+    if (ORDER_N != 0) {
+        const uint lin = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        mt = lin / gl_NumWorkGroups.y;
+        nt = lin % gl_NumWorkGroups.y;
+    } else {
+        mt = gl_WorkGroupID.x;
+        nt = gl_WorkGroupID.y;
+    }
+    const uint m0 = mt * BM, n0 = nt * BN;
+    const uint nsb = p.K / 256;       // Q6_K blocks per weight row
+    const uint nx4 = p.stride_b / 128; // q8_1_x4 blocks per token row
+
+    float sums[TT * TW * CM_ELEMS];
+    [[unroll]] for (uint i = 0; i < TT * TW * CM_ELEMS; ++i) sums[i] = 0.0f;
+
+    // prefetch registers
+    uvec4 rql[W_PER], rqh[W_PER];
+    int   rsc[W_PER];
+    float rd[W_PER];
+    ivec4 ry[Y_PER];
+    float ryd[Y_PER];
+
+#define GLOAD(kt) { \
+    const uint sb = (kt) >> 2, c = (kt) & 3, hf = c >> 1; \
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
+        const uint v = tid + i * NT, row = v >> 2, g = v & 3; \
+        const uint blk = (m0 + row) * nsb + sb; \
+        const uint qlo = hf * 32 + g * 8, qho = hf * 16 + (g & 1) * 8; \
+        [[unroll]] for (uint w = 0; w < 4; ++w) { \
+            rql[i][w] = uint(data_a[blk].ql[qlo + 2 * w]) | (uint(data_a[blk].ql[qlo + 2 * w + 1]) << 16); \
+            rqh[i][w] = uint(data_a[blk].qh[qho + 2 * w]) | (uint(data_a[blk].qh[qho + 2 * w + 1]) << 16); \
+        } \
+        rsc[i] = int(data_a[blk].scales[(c * 4 + g) >> 1]); \
+        rd[i]  = float(data_a[blk].d); \
+    } \
+    [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+        const uint v = tid + i * NT, r = v >> 2, q = v & 3; \
+        const uint tok = min(n0 + r, p.N - 1); \
+        const uint bx = tok * nx4 + ((kt) >> 1); \
+        ry[i]  = data_b[bx].qs[((kt) & 1) * 4 + q]; \
+        ryd[i] = float(data_b[bx].ds[((kt) & 1) * 2 + (q >> 1)].x); \
+    } }
+
+#define SSTORE(buf, kt) { \
+    const uint c = (kt) & 3, nib = c & 1; \
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
+        const uint v = tid + i * NT, row = v >> 2, g = v & 3; \
+        const uint hsh = 4 * nib + 2 * (g >> 1); \
+        [[unroll]] for (uint w = 0; w < 4; ++w) { \
+            uint q = ((rql[i][w] >> (4 * nib)) & 0x0F0F0F0Fu) | (((rqh[i][w] >> hsh) & 0x03030303u) << 4); \
+            q = ((q | 0x80808080u) - 0x20202020u) ^ 0x80808080u; \
+            shW[buf][row * STR + g * 4 + w] = q; \
+        } \
+        const int sc8 = (g & 1) != 0 ? (rsc[i] >> 8) : ((rsc[i] << 24) >> 24); \
+        shS[buf][g * BM + row] = rd[i] * float(sc8); \
+    } \
+    [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+        const uint v = tid + i * NT, r = v >> 2, q = v & 3; \
+        const uint o = r * STR + q * 4; \
+        shY[buf][o] = ry[i].x; shY[buf][o + 1] = ry[i].y; shY[buf][o + 2] = ry[i].z; shY[buf][o + 3] = ry[i].w; \
+        if ((q & 1) == 0) shD[buf][(q >> 1) * BN + r] = ryd[i]; \
+    } }
+
+    const uint nk = p.K / BK;
+    GLOAD(0)
+    SSTORE(0, 0)
+    barrier();
+
+    const coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> biasm =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(int32_t(ACC_BIAS_BITS));
+    const uint row_half = lane / 16;
+
+    for (uint kt = 0; kt < nk; ++kt) {
+        const uint cur = kt & 1;
+        if (kt + 1 < nk) GLOAD(kt + 1)
+
+        [[unroll]] for (uint b = 0; b < 2; ++b) {
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa[TT * 2];
+            [[unroll]] for (uint it = 0; it < TT; ++it)
+                [[unroll]] for (uint h = 0; h < 2; ++h)
+                    coopMatLoad(fa[it * 2 + h], shY[cur], (wt * WTN + it * 16) * STR + (2 * b + h) * 4, STR, gl_CooperativeMatrixLayoutRowMajor);
+            float dy[TT * CM_ELEMS];
+            [[unroll]] for (uint it = 0; it < TT; ++it)
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e)
+                    dy[it * CM_ELEMS + e] = shD[cur][b * BN + wt * WTN + it * 16 + row_half * CM_ELEMS + e];
+
+            [[unroll]] for (uint jw = 0; jw < TW; ++jw) {
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb0, fb1;
+                coopMatLoad(fb0, shW[cur], (ww * WTM + jw * 16) * STR + (2 * b) * 4,     STR, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(fb1, shW[cur], (ww * WTM + jw * 16) * STR + (2 * b + 1) * 4, STR, gl_CooperativeMatrixLayoutColumnMajor);
+                const uint col = ww * WTM + jw * 16 + (lane % 16);
+                const float s0 = shS[cur][(2 * b) * BM + col];
+                const float s1 = shS[cur][(2 * b + 1) * BM + col];
+                const float nb = -ACC_BIAS_F * (s0 + s1);
+                [[unroll]] for (uint it = 0; it < TT; ++it) {
+                    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> p0 = coopMatMulAdd(fa[it * 2], fb0, biasm);
+                    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> p1 = coopMatMulAdd(fa[it * 2 + 1], fb1, biasm);
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+                        float x = fma(intBitsToFloat(p0[e]), s0, nb);
+                        x = fma(intBitsToFloat(p1[e]), s1, x);
+                        const uint si = (it * TW + jw) * CM_ELEMS + e;
+                        sums[si] = fma(x, dy[it * CM_ELEMS + e], sums[si]);
+                    }
+                }
+            }
+        }
+
+        if (kt + 1 < nk) SSTORE(cur ^ 1, kt + 1)
+        barrier();
+    }
+
+    [[unroll]] for (uint it = 0; it < TT; ++it) {
+        [[unroll]] for (uint e = 0; e < CM_ELEMS; ++e) {
+            const uint tok = n0 + wt * WTN + it * 16 + row_half * CM_ELEMS + e;
+            if (tok < p.N) {
+                [[unroll]] for (uint jw = 0; jw < TW; ++jw) {
+                    const uint m = m0 + ww * WTM + jw * 16 + (lane % 16);
+                    data_d[tok * p.stride_d + m] = sums[(it * TW + jw) * CM_ELEMS + e];
+                }
+            }
+        }
+    }
+}

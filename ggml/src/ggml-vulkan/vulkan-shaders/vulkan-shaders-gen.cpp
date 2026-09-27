@@ -932,6 +932,9 @@ void process_shaders() {
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("mul_mmq_q6k_rdna4", "mul_mmq_q6k_rdna4.comp", {}, true, true);
+#endif
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
