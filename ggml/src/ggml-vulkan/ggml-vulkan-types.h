@@ -3,6 +3,7 @@
 #include "ggml-vulkan.h"
 
 #include <vulkan/vulkan_core.h>
+#include <cstring>
 
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -1202,6 +1203,11 @@ class vk_perf_logger {
 
 
     void log_timing(const ggml_tensor * node, const char *fusion_name, uint64_t time) {
+        if (fusion_name && strcmp(fusion_name, "FA_DEQUANT_KV") == 0) {
+            // sub-entry emitted inside FLASH_ATTN_EXT: K/V dequant_q8_0_transpose scratch
+            timings[std::string("FA_DEQUANT_KV kv=") + std::to_string(node->src[1]->ne[1])].push_back(time);
+            return;
+        }
         uint64_t n_flops;
         std::string name = get_node_fusion_name(node, fusion_name, &n_flops);
         if (n_flops) {
