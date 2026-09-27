@@ -1002,6 +1002,8 @@ struct vk_device_struct {
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_decode_q8;
     // flash_attn_decode_q8r (register-fed coopmat): same key
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_decode_q8r;
+    // flash_attn_decode_q8v (q8r with 16-byte K / dword V loads): same key
+    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_decode_q8v;
 
     vk_pipeline pipeline_fa_sparse_compact;
     vk_pipeline pipeline_fa_sparse_compact_subgroup;

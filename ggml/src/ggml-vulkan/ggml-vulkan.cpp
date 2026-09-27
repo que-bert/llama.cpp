@@ -3270,6 +3270,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool r1 = GP.first * GP.second <= 16;
         ggml_vk_create_pipeline(device, it.second, r1 ? "flash_attn_decode_q8r1" : "flash_attn_decode_q8r2", r1 ? flash_attn_decode_q8r1_cm1_len : flash_attn_decode_q8r2_cm1_len, r1 ? flash_attn_decode_q8r1_cm1_data : flash_attn_decode_q8r2_cm1_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 32);
     }
+    for (auto &it : device->pipeline_fa_decode_q8v) {
+        const auto GP = it.first;
+        const bool r1 = GP.first * GP.second <= 16;
+        ggml_vk_create_pipeline(device, it.second, r1 ? "flash_attn_decode_q8v1" : "flash_attn_decode_q8v2", r1 ? flash_attn_decode_q8v1_cm1_len : flash_attn_decode_q8v2_cm1_len, r1 ? flash_attn_decode_q8v1_cm1_data : flash_attn_decode_q8v2_cm1_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 32);
+    }
 #endif
 
     {
@@ -8199,6 +8204,15 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
         return false;
     }
 
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    // q8v: q8r with 16-byte K and dword V loads (flash_attn_decode_q8v.comp).
+    // Opt-in (GGML_VK_DECODE_Q8V=1): kv=183296 interleaved, N=1 738 vs 758 us,
+    // but N=4 971 vs 920 us (VGPRs stay at 256), so q8r remains the default.
+    static const bool q8v_env_on = getenv("GGML_VK_DECODE_Q8V") && atoi(getenv("GGML_VK_DECODE_Q8V")) != 0;
+    const bool use_q8v = use_q8r && q8v_env_on && (k_buf.offset % 16) == 0 && (v_buf.offset % 4) == 0 &&
+                         (v->nb[1] % 4) == 0 && (v->nb[2] % 4) == 0;
     const uint32_t KV = (uint32_t)k->ne[1];
     const uint32_t n_kv_head = (uint32_t)k->ne[2];
     const uint32_t n_head = (uint32_t)dst->ne[1];
@@ -8215,7 +8229,7 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     vk_pipeline pipeline;
     {
         std::lock_guard<std::mutex> guard(device->compile_mutex);
-        auto &pipelines = use_q8r ? device->pipeline_fa_decode_q8r : device->pipeline_fa_decode_q8;
+        auto &pipelines = use_q8v ? device->pipeline_fa_decode_q8v : use_q8r ? device->pipeline_fa_decode_q8r : device->pipeline_fa_decode_q8;
         auto it = pipelines.find({G, P});
         if (it != pipelines.end()) {
             pipeline = it->second;
@@ -8238,9 +8252,6 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
-    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
-    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
@@ -8258,7 +8269,7 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
         static uint32_t last_kv = 0; static int64_t last_n = 0;
         if (KV != last_kv || N != last_n) {
             last_kv = KV; last_n = N;
-            std::cerr << "decode_q8: selected " << (use_q8r ? "q8r(coopmat)" : "valu") << " G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv
+            std::cerr << "decode_q8: selected " << (use_q8v ? "q8v(coopmat)" : use_q8r ? "q8r(coopmat)" : "valu") << " G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv
                       << " KV=" << KV << " n_kv_max=" << ggml_get_op_params_i32(dst, 4) << " mask_ne=" << (mask ? mask->ne[0] : 0) << "x" << (mask ? mask->ne[1] : 0)
                       << " k_nb1=" << k->nb[1] << " k_nb2=" << k->nb[2] << " v_nb1=" << v->nb[1] << " v_nb2=" << v->nb[2] << std::endl;
         }
