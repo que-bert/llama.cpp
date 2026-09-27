@@ -935,6 +935,14 @@ void process_shaders() {
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("mul_mmq_q6k_rdna4", "mul_mmq_q6k_rdna4.comp", {}, true, true);
+    string_to_spv("mul_mmq_q6k_rdna4_w64", "mul_mmq_q6k_rdna4.comp", {{"SG", "64"}, {"WARPS_T", "2"}, {"WARPS_W", "2"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16", "mul_mm_q6k_rdna4_f16.comp", {}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_w32", "mul_mm_q6k_rdna4_f16.comp", {{"SG", "32"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f32y", "mul_mm_q6k_rdna4_f16.comp", {{"Y_F32", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_sb", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}}, true, true);
+#endif
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
