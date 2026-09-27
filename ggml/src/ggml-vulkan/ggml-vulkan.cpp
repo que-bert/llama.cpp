@@ -2504,7 +2504,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef X_CM1
 
-        if (device->coopmat_int_support && rdna4 && getenv("GGML_VK_NO_MMQ_Q6K_RDNA4") == nullptr) {
+        // Opt-in (GGML_VK_MMQ_Q6K_RDNA4=1) until the model-level PPL=inf bug is fixed; test-backend-ops passes.
+        if (device->coopmat_int_support && rdna4 && getenv("GGML_VK_MMQ_Q6K_RDNA4") != nullptr && getenv("GGML_VK_NO_MMQ_Q6K_RDNA4") == nullptr) {
             const char * ord = getenv("GGML_VK_MMQ_Q6K_ORDER");
             const uint32_t order_n = ord ? (uint32_t)atoi(ord) : 1u;
             const char * wv = getenv("GGML_VK_MMQ_Q6K_WAVE");
