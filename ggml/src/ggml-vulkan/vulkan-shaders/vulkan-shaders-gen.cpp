@@ -931,6 +931,11 @@ void process_shaders() {
     // "_dot2" suffix: spirv-opt does not know SPV_VALVE_mixed_float_dot_product
     string_to_spv("flash_attn_decode_q8", "flash_attn_decode_q8.comp", {});
     string_to_spv("flash_attn_decode_q8_dot2", "flash_attn_decode_q8.comp", {{"DOT2_F16", "1"}});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // register-fed coopmat decode FA (q8_0 K/V), RT = 16-row tiles
+    string_to_spv("flash_attn_decode_q8r1", "flash_attn_decode_q8r.comp", {{"RT", "1"}}, true, true);
+    string_to_spv("flash_attn_decode_q8r2", "flash_attn_decode_q8r.comp", {{"RT", "2"}}, true, true);
+#endif
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
