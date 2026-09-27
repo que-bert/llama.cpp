@@ -850,6 +850,25 @@ struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t sinks;
 };
 
+// flash_attn_decode_q8.comp
+struct vk_fa_decode_q8_push_constants {
+    uint32_t N;
+    uint32_t KV;
+    uint32_t n_head;
+    uint32_t has_mask;
+    uint32_t q_s1;
+    uint32_t q_s2;
+    uint32_t k_s1;
+    uint32_t k_s2;
+    uint32_t v_s1;
+    uint32_t v_s2;
+    uint32_t m_s1;
+    float    scale;
+    uint32_t split_kv;
+    uint32_t k_num;
+    uint32_t n_kv_head;
+};
+
 struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nem0;
     uint32_t nem1;

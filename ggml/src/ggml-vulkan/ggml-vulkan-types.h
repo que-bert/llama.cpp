@@ -997,6 +997,10 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
+    // flash_attn_decode_q8: keyed by (G query heads per KV head, P positions per WG)
+    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_decode_q8;
+    // flash_attn_decode_q8r (register-fed coopmat): same key
+    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_decode_q8r;
 
     vk_pipeline pipeline_fa_sparse_compact;
     vk_pipeline pipeline_fa_sparse_compact_subgroup;

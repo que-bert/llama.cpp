@@ -3260,6 +3260,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
 
+    for (auto &it : device->pipeline_fa_decode_q8) {
+        const auto GP = it.first;
+        ggml_vk_create_pipeline(device, it.second, "flash_attn_decode_q8", device->dot2_f16 ? flash_attn_decode_q8_dot2_len : flash_attn_decode_q8_len, device->dot2_f16 ? flash_attn_decode_q8_dot2_data : flash_attn_decode_q8_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 64);
+    }
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    for (auto &it : device->pipeline_fa_decode_q8r) {
+        const auto GP = it.first;
+        const bool r1 = GP.first * GP.second <= 16;
+        ggml_vk_create_pipeline(device, it.second, r1 ? "flash_attn_decode_q8r1" : "flash_attn_decode_q8r2", r1 ? flash_attn_decode_q8r1_cm1_len : flash_attn_decode_q8r2_cm1_len, r1 ? flash_attn_decode_q8r1_cm1_data : flash_attn_decode_q8r2_cm1_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 32);
+    }
+#endif
+
     {
         // Large workgroup so the per-row KV scan parallelizes; capped to device limits.
         const uint32_t compact_max = std::min({1024u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
@@ -8119,7 +8131,153 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// Decode FA for q8_0 K/V (flash_attn_decode_q8.comp): a separate module and
+// pipeline, vector ALU, K/V read once per KV head into registers, split-KV with
+// the fa_split_k_reduce combine. Default for RDNA4 at N <= 8;
+// GGML_VK_NO_DECODE_Q8=1 falls back to the generic path.
+static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_VK_NO_DECODE_Q8") != nullptr;
+    static const bool debug = getenv("GGML_VK_DECODE_Q8_DEBUG") != nullptr;
+    const vk_device & device = ctx->device;
+    static bool printed_caps = false;
+    if (debug && !printed_caps) {
+        printed_caps = true;
+        std::cerr << "decode_q8: rdna4=" << (device->architecture == vk_device_architecture::AMD_RDNA4) << " dot2=" << device->dot2_f16
+                  << " sgctl=" << device->subgroup_size_control << " sg=[" << device->subgroup_min_size << "," << device->subgroup_max_size << "]"
+                  << " K/V=" << ggml_type_name(k->type) << "/" << ggml_type_name(v->type) << " N=" << q->ne[1] << std::endl;
+    }
+    if (disabled || device->architecture != vk_device_architecture::AMD_RDNA4 ||
+        !device->subgroup_size_control || device->subgroup_min_size > 64 || device->subgroup_max_size < 64) {
+        return false;
+    }
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q8_0 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const uint32_t D = 256;
+    const int64_t N = q->ne[1];
+    // Without VK_VALVE_shader_mixed_float_dot_product (RADV 26.0) the f32-FMA
+    // variant is issue-bound at N=4 (4284 us vs 1826 baseline @183k) but wins
+    // at N=1 (789 vs 985). Default: N=1 only; GGML_VK_DECODE_Q8_NMAX raises it.
+    static const int env_nmax = getenv("GGML_VK_DECODE_Q8_NMAX") ? atoi(getenv("GGML_VK_DECODE_Q8_NMAX")) : 0;
+    // Register-fed coopmat variant (flash_attn_decode_q8r.comp): 4 x wave32,
+    // K/V dequantized in registers straight into coopmat B operands. Default
+    // for N = 1..8 (R9700, G=6, kv=183296: N=1 692 us vs VALU 798 / cm1 1014;
+    // N=4 892 us vs cm1 1992).
+    // GGML_VK_DECODE_Q8R=0 disables it, GGML_VK_DECODE_Q8R_NMIN sets the
+    // smallest N that uses it (below that the VALU variant is used).
+    static const bool q8r_env_off = getenv("GGML_VK_DECODE_Q8R") && atoi(getenv("GGML_VK_DECODE_Q8R")) == 0;
+    static const int q8r_nmin = getenv("GGML_VK_DECODE_Q8R_NMIN") ? atoi(getenv("GGML_VK_DECODE_Q8R_NMIN")) : 1;
+    bool use_q8r = false;
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    use_q8r = !q8r_env_off && device->coopmat_support && device->coopmat_support_16x16x16_f32acc &&
+              device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32 && N >= q8r_nmin && N <= 8 &&
+              (k->nb[1] % 8) == 0 && (k->nb[2] % 8) == 0;
+#endif
+    const int64_t n_max = use_q8r ? 8 : env_nmax > 0 ? std::min(env_nmax, 8) : (device->dot2_f16 ? 8 : 1);
+    if (q->ne[0] != D || k->ne[0] != D || v->ne[0] != D || N < 1 || N > n_max ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || dst->ne[3] != 1 ||
+        k->ne[2] != v->ne[2] || k->ne[2] < 1 || (q->ne[2] % k->ne[2]) != 0) {
+        return false;
+    }
+    const uint32_t G = (uint32_t)(q->ne[2] / k->ne[2]);
+    if (G < 1 || G > (use_q8r ? 32u : 24u)) {
+        return false;
+    }
+    float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] > 1 || mask->ne[3] > 1 || mask->ne[0] < k->ne[1] || mask->ne[1] < N)) {
+        return false;
+    }
+    if ((q->nb[1] % 16) != 0 || (q->nb[2] % 16) != 0 || q->nb[0] != sizeof(float) ||
+        (k->nb[1] % 16) != 0 || (k->nb[2] % 16) != 0 || (v->nb[1] % 2) != 0 || (v->nb[2] % 2) != 0 ||
+        dst->nb[1] != D * sizeof(float) || dst->nb[2] != dst->nb[1] * dst->ne[1]) {
+        return false;
+    }
+
+    const uint32_t KV = (uint32_t)k->ne[1];
+    const uint32_t n_kv_head = (uint32_t)k->ne[2];
+    const uint32_t n_head = (uint32_t)dst->ne[1];
+    const uint32_t P = std::min<uint32_t>((uint32_t)N, (use_q8r ? 32u : 24u) / G);
+    const uint32_t zg = CEIL_DIV((uint32_t)N, P);
+
+    static const int env_wgs = getenv("GGML_VK_DECODE_Q8_WGS") ? atoi(getenv("GGML_VK_DECODE_Q8_WGS")) : 0;
+    const uint32_t target_wgs = env_wgs > 0 ? (uint32_t)env_wgs : 512;
+    const uint32_t bc = use_q8r ? 64u : 32u;
+    uint32_t k_num = std::max(1u, target_wgs / (n_kv_head * zg));
+    uint32_t split_kv = ROUNDUP_POW2(std::max(bc, CEIL_DIV(KV, k_num)), bc);
+    k_num = CEIL_DIV(KV, split_kv);
+
+    vk_pipeline pipeline;
+    {
+        std::lock_guard<std::mutex> guard(device->compile_mutex);
+        auto &pipelines = use_q8r ? device->pipeline_fa_decode_q8r : device->pipeline_fa_decode_q8;
+        auto it = pipelines.find({G, P});
+        if (it != pipelines.end()) {
+            pipeline = it->second;
+        } else {
+            pipelines[{G, P}] = pipeline = std::make_shared<vk_pipeline_struct>();
+        }
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, device->pipeline_flash_attn_split_k_reduce, 1);
+
+    const uint64_t split_k_size = ((uint64_t)D * n_head * sizeof(float) + n_head * sizeof(float) * 2) * k_num * N;
+    if (split_k_size > device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    if (ctx->prealloc_size_split_k < split_k_size) {
+        ctx->prealloc_size_split_k = split_k_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+    vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+    const vk_fa_decode_q8_push_constants pc = {
+        (uint32_t)N, KV, n_head, mask != nullptr ? 1u : 0u,
+        (uint32_t)(q->nb[1] / 16), (uint32_t)(q->nb[2] / 16),
+        (uint32_t)k->nb[1], (uint32_t)k->nb[2],
+        (uint32_t)v->nb[1], (uint32_t)v->nb[2],
+        mask ? (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)) : 0u,
+        scale, split_kv, k_num, n_kv_head,
+    };
+    if (debug) {
+        static uint32_t last_kv = 0; static int64_t last_n = 0;
+        if (KV != last_kv || N != last_n) {
+            last_kv = KV; last_n = N;
+            std::cerr << "decode_q8: selected " << (use_q8r ? "q8r(coopmat)" : "valu") << " G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv
+                      << " KV=" << KV << " n_kv_max=" << ggml_get_op_params_i32(dst, 4) << " mask_ne=" << (mask ? mask->ne[0] : 0) << "x" << (mask ? mask->ne[1] : 0)
+                      << " k_nb1=" << k->nb[1] << " k_nb2=" << k->nb[2] << " v_nb1=" << v->nb[1] << " v_nb2=" << v->nb[2] << std::endl;
+        }
+    }
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, mask_buf, split_k_buf }, pc,
+                              { n_kv_head * k_num, 1, zg });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { D, n_head, (uint32_t)N, 1u, k_num, (sinks != nullptr) };
+    ggml_vk_dispatch_pipeline(ctx, subctx, device->pipeline_flash_attn_split_k_reduce,
+                              { split_k_buf, sinks_buf, dst_buf }, pc2, { n_head, D, (uint32_t)N });
+    ctx->prealloc_split_k_need_sync = true;
+    return true;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    if (ggml_vk_flash_attn_decode_q8(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
