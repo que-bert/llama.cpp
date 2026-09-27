@@ -1,0 +1,263 @@
+#version 450
+
+// Decode flash attention for q8_0 K and V, HSK == HSV == 256, few query
+// positions (N <= 8), grouped-query attention. One wave64 workgroup handles one
+// KV head and one KV split for P query positions x G query heads (ROWS = P*G
+// <= 24 rows), so every K/V byte of the split is read from DRAM once and used
+// by all ROWS rows. No coopmat and no LDS staging of K/V: q8_0 blocks are
+// loaded straight into registers and converted there; LDS only holds Q (f16)
+// and the per-block P tile. Each workgroup writes an unnormalised partial
+// (O, L, M) in the fa_split_k_reduce layout; that shader combines splits.
+//
+// QK: lane = 4*rp + c. Lane owns kv rows j0+2rp, j0+2rp+1 and the 64-wide d
+// chunk c (two q8_0 blocks); partial dots are summed over the 4-lane cluster.
+// PV: lane owns d = 4*lane .. 4*lane+3 for all ROWS rows (O = ROWS*4 floats),
+// and contracts pairs of kv rows with v_dot2_f32_f16.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"],
+                  capabilities = [6912], id = 6916)
+float v_dot2_f32_f16(f16vec2 a, f16vec2 b, float acc);
+
+layout (constant_id = 0) const uint G = 6;   // query heads per KV head
+layout (constant_id = 1) const uint P = 4;   // query positions per workgroup
+const uint ROWS = G * P;
+const uint RS   = (ROWS + 3) & ~3u;          // padded row stride for the P tile
+const uint D    = 256;
+const uint BC   = 32;                        // kv rows per iteration
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Q   { vec4 data_q4[]; };
+layout (binding = 1) readonly buffer K   { uint data_k32[]; };
+layout (binding = 2) readonly buffer V   { uint16_t data_v16[]; };
+layout (binding = 3) readonly buffer M   { float16_t data_m[]; };
+layout (binding = 4) writeonly buffer O  { float data_o[]; };
+layout (binding = 4) writeonly buffer O4 { vec4 data_o4[]; };
+
+layout (push_constant) uniform parameter {
+    uint N;          // query positions
+    uint KV;
+    uint n_head;     // dst ne1 (query heads)
+    uint has_mask;
+    uint q_s1;       // Q stride between positions, in vec4
+    uint q_s2;       // Q stride between heads, in vec4
+    uint k_s1;       // K stride between kv rows, bytes
+    uint k_s2;       // K stride between kv heads, bytes
+    uint v_s1;
+    uint v_s2;
+    uint m_s1;       // mask stride between positions, f16 elements
+    float scale;
+    uint split_kv;
+    uint k_num;
+    uint n_kv_head;
+} p;
+
+shared uvec4 Qsh[ROWS * (D / 8)];   // Q as f16, 8 per uvec4
+shared uvec4 Psh[(BC / 2) * RS / 4]; // P tile: [kv pair][row] packed f16x2
+
+#define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
+#define NEG_INF uintBitsToFloat(0xFF800000)
+
+// int8 x4 (as uint) -> two f16 pairs, exact: 0x64XX as f16 is 1024 + XX.
+f16vec2 q8lo(uint wx) {
+    return unpackFloat2x16(((wx & 0xFFu) | ((wx & 0xFF00u) << 8)) | 0x64006400u) - f16vec2(1152.0hf);
+}
+f16vec2 q8hi(uint wx) {
+    return unpackFloat2x16(((wx >> 16) & 0xFFu) | ((wx >> 8) & 0xFF0000u) | 0x64006400u) - f16vec2(1152.0hf);
+}
+
+void main() {
+    const uint lane  = gl_LocalInvocationID.x;
+    const uint h     = gl_WorkGroupID.x % p.n_kv_head;
+    const uint split = gl_WorkGroupID.x / p.n_kv_head;
+    const uint p0    = gl_WorkGroupID.z * P;
+
+    // ---- Q -> LDS (f16) ----
+    for (uint idx = lane; idx < ROWS * (D / 8); idx += 64) {
+        const uint r  = idx / (D / 8);
+        const uint d8 = idx % (D / 8);
+        const uint pos = p0 + r / G;
+        uvec4 v = uvec4(0);
+        if (pos < p.N) {
+            const uint qb = pos * p.q_s1 + (h * G + r % G) * p.q_s2 + d8 * 2;
+            const vec4 a = data_q4[qb];
+            const vec4 b = data_q4[qb + 1];
+            v = uvec4(packHalf2x16(a.xy), packHalf2x16(a.zw), packHalf2x16(b.xy), packHalf2x16(b.zw));
+        }
+        Qsh[idx] = v;
+    }
+    barrier();
+
+    const uint c  = lane & 3;
+    const uint rp = lane >> 2;
+
+    float Of[ROWS][4];
+    float l[ROWS];
+    float m[ROWS];
+    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+        [[unroll]] for (uint k = 0; k < 4; ++k) Of[r][k] = 0.0;
+        l[r] = 0.0;
+        m[r] = NEG_FLT_MAX_OVER_2;
+    }
+
+    const uint kv_begin = split * p.split_kv;
+    const uint kv_end   = min(p.KV, kv_begin + p.split_kv);
+
+    const uint kbase = h * p.k_s2;
+    const uint vbase = h * p.v_s2;
+
+    // PV lane mapping: block b = lane/8, dword kq = lane%8 inside the block
+    const uint vb_off = (lane >> 3) * 34;           // bytes to block start
+    const uint vq_off = vb_off + 2 + (lane & 7) * 4; // bytes to this lane's 4 qs
+
+    for (uint j0 = kv_begin; j0 < kv_end; j0 += BC) {
+        // ---- mask for this lane's two kv rows ----
+        float mk[2][P];
+        bool all_inf = true;
+        [[unroll]] for (uint i = 0; i < 2; ++i) {
+            const uint j = j0 + 2 * rp + i;
+            [[unroll]] for (uint pl = 0; pl < P; ++pl) {
+                float mv = 0.0;
+                if (j >= kv_end || p0 + pl >= p.N) {
+                    mv = NEG_INF;
+                } else if (p.has_mask != 0) {
+                    mv = float(data_m[(p0 + pl) * p.m_s1 + j]);
+                }
+                mk[i][pl] = mv;
+                all_inf = all_inf && (mv == NEG_INF);
+            }
+        }
+        if (subgroupAll(all_inf)) {
+            continue;
+        }
+
+        // ---- QK ----
+        float S[2][ROWS];
+        [[unroll]] for (uint i = 0; i < 2; ++i) {
+            [[unroll]] for (uint r = 0; r < ROWS; ++r) S[i][r] = 0.0;
+        }
+        uint w[2][17];
+        float dk[2][2];
+        [[unroll]] for (uint i = 0; i < 2; ++i) {
+            const uint j = min(j0 + 2 * rp + i, kv_end - 1);
+            const uint kb = (kbase + j * p.k_s1) / 4 + 17 * c;
+            [[unroll]] for (uint t = 0; t < 17; ++t) w[i][t] = data_k32[kb + t];
+            dk[i][0] = unpackHalf2x16(w[i][0]).x * p.scale;
+            dk[i][1] = unpackHalf2x16(w[i][8]).y * p.scale;
+        }
+        [[unroll]] for (uint blk = 0; blk < 2; ++blk) {
+            f16vec2 kp[2][16];
+            [[unroll]] for (uint i = 0; i < 2; ++i) {
+                [[unroll]] for (uint t = 0; t < 8; ++t) {
+                    uint q;
+                    if (blk == 0) {
+                        q = (w[i][t] >> 16) | (w[i][t + 1] << 16);
+                    } else {
+                        q = w[i][9 + t];
+                    }
+                    q ^= 0x80808080u;
+                    kp[i][2 * t]     = q8lo(q);
+                    kp[i][2 * t + 1] = q8hi(q);
+                }
+            }
+            [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+                float a0 = 0.0, a1 = 0.0;
+                [[unroll]] for (uint t = 0; t < 4; ++t) {
+                    const uvec4 qv = Qsh[r * (D / 8) + c * 8 + blk * 4 + t];
+                    [[unroll]] for (uint e = 0; e < 4; ++e) {
+                        const f16vec2 qh = unpackFloat2x16(qv[e]);
+                        a0 = v_dot2_f32_f16(qh, kp[0][4 * t + e], a0);
+                        a1 = v_dot2_f32_f16(qh, kp[1][4 * t + e], a1);
+                    }
+                }
+                S[0][r] = fma(a0, dk[0][blk], S[0][r]);
+                S[1][r] = fma(a1, dk[1][blk], S[1][r]);
+            }
+        }
+
+        // ---- online softmax ----
+        float alpha[ROWS];
+        bool rescale = false;
+        [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+            const uint pl = r / G;
+            const float s0 = subgroupClusteredAdd(S[0][r], 4) + mk[0][pl];
+            const float s1 = subgroupClusteredAdd(S[1][r], 4) + mk[1][pl];
+            const float mnew = max(m[r], subgroupMax(max(s0, s1)));
+            alpha[r] = exp(m[r] - mnew);
+            rescale = rescale || (mnew != m[r]);
+            m[r] = mnew;
+            const float p0v = exp(s0 - mnew);
+            const float p1v = exp(s1 - mnew);
+            l[r] = fma(l[r], alpha[r], p0v + p1v);
+            if (c == 0) {
+                // Psh as a flat uint array: index rp*RS + r
+                const uint fi = rp * RS + r;
+                Psh[fi / 4][fi % 4] = packHalf2x16(vec2(p0v, p1v));
+            }
+        }
+        barrier();
+
+        if (rescale) {
+            [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+                [[unroll]] for (uint k = 0; k < 4; ++k) Of[r][k] *= alpha[r];
+            }
+        }
+
+        // ---- PV ----
+        [[unroll]] for (uint q = 0; q < BC / 2; ++q) {
+            const uint ja = min(j0 + 2 * q,     kv_end - 1);
+            const uint jb = min(j0 + 2 * q + 1, kv_end - 1);
+            const uint va = (vbase + ja * p.v_s1) / 2;
+            const uint vb = (vbase + jb * p.v_s1) / 2;
+            const uint qa = uint(data_v16[va + vq_off / 2]) | (uint(data_v16[va + vq_off / 2 + 1]) << 16);
+            const uint qb = uint(data_v16[vb + vq_off / 2]) | (uint(data_v16[vb + vq_off / 2 + 1]) << 16);
+            const f16vec2 dv = f16vec2(uint16BitsToHalf(data_v16[va + vb_off / 2]), uint16BitsToHalf(data_v16[vb + vb_off / 2]));
+            const uint xa = qa ^ 0x80808080u;
+            const uint xb = qb ^ 0x80808080u;
+            f16vec2 vp[4];
+            [[unroll]] for (uint k = 0; k < 4; ++k) {
+                const uint ba = (xa >> (8 * k)) & 0xFFu;
+                const uint bb = (xb >> (8 * k)) & 0xFFu;
+                vp[k] = (unpackFloat2x16(ba | (bb << 16) | 0x64006400u) - f16vec2(1152.0hf)) * dv;
+            }
+            [[unroll]] for (uint r4 = 0; r4 < RS; r4 += 4) {
+                const uvec4 pv = Psh[(q * RS + r4) / 4];
+                [[unroll]] for (uint e = 0; e < 4; ++e) {
+                    if (r4 + e < ROWS) {
+                        const f16vec2 ph = unpackFloat2x16(pv[e]);
+                        [[unroll]] for (uint k = 0; k < 4; ++k) {
+                            Of[r4 + e][k] = v_dot2_f32_f16(ph, vp[k], Of[r4 + e][k]);
+                        }
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    // ---- write the partial in fa_split_k_reduce layout ----
+    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+        const float lsum = subgroupAdd(c == 0 ? l[r] : 0.0);
+        const uint pos = p0 + r / G;
+        if (pos < p.N) {
+            const uint n = h * G + r % G;
+            const uint ob = D * p.n_head * (split + p.k_num * pos) + D * n;
+            data_o4[ob / 4 + lane] = vec4(Of[r][0], Of[r][1], Of[r][2], Of[r][3]);
+            if (lane == 0) {
+                const uint lb = D * p.n_head * p.N * p.k_num + p.n_head * 2 * (split + p.k_num * pos) + n;
+                data_o[lb] = lsum;
+                data_o[lb + p.n_head] = m[r];
+            }
+        }
+    }
+}

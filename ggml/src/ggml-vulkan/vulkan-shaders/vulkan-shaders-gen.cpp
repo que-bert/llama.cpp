@@ -928,6 +928,8 @@ void process_shaders() {
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
+    // "_dot2" suffix: spirv-opt does not know SPV_VALVE_mixed_float_dot_product
+    string_to_spv("flash_attn_decode_q8_dot2", "flash_attn_decode_q8.comp", {});
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
