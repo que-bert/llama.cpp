@@ -55,13 +55,31 @@ layout(push_constant) uniform parameter {
 
 layout(constant_id = 0) const uint ORDER_N = 1;
 
-shared uint shW[2][BM * STR];
-shared uint shY[2][BN * STR];
+#ifdef SINGLE_BUF
+#define NBUF 1
+#else
+#define NBUF 2
+#endif
+shared uint shW[NBUF][BM * STR];
+shared uint shY[NBUF][BN * STR];
+
+#ifdef Y_F32
+#define STORE_Y(buf, r, q, YV) { const uint o = (r) * STR + (q) * 2; \
+    shY[buf][o] = packHalf2x16(uintBitsToFloat((YV).xy)); shY[buf][o + 1] = packHalf2x16(uintBitsToFloat((YV).zw)); }
+#else
+#define STORE_Y(buf, r, q, YV) { const uint o = (r) * STR + (q) * 4; \
+    shY[buf][o] = (YV).x; shY[buf][o + 1] = (YV).y; shY[buf][o + 2] = (YV).z; shY[buf][o + 3] = (YV).w; }
+#endif
 
 #define MAT(T, U) coopmat<T, gl_ScopeSubgroup, 16, 16, U>
 
 #define W_PER ((BM * 2) / NT)   // (row, 16-group) items per thread
-#define Y_PER ((BN * 4) / NT)   // (token, uvec4) items per thread
+#ifdef Y_F32
+#define Y_VR 8                  // uvec4 (4 x f32) per token row per K step
+#else
+#define Y_VR 4                  // uvec4 (8 x f16)
+#endif
+#define Y_PER ((BN * Y_VR) / NT) // (token, uvec4) items per thread
 
 // four 6-bit values (one per byte) -> two f16vec2 of (u - 32) * s
 void deq4(const uint q, const f16vec2 s, out uint o0, out uint o1) {
@@ -88,7 +106,11 @@ void main() {
     }
     const uint m0 = mt * BM, n0 = nt * BN;
     const uint nsb = p.K / 256;
-    const uint kv  = p.stride_b / 8;   // uvec4 per activation row
+#ifdef Y_F32
+    const uint kv  = p.stride_b / 4;   // uvec4 per activation row
+#else
+    const uint kv  = p.stride_b / 8;
+#endif
 
     MAT(float, gl_MatrixUseAccumulator) acc[TM * TN];
     [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = MAT(float, gl_MatrixUseAccumulator)(0.0f);
@@ -113,9 +135,9 @@ void main() {
         rodd[i] = (bb & 2u) | ((so & 3u) << 8); \
     } \
     [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
-        const uint v = tid + i * NT, r = v >> 2, q = v & 3; \
+        const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
         const uint tok = min(n0 + r, p.N - 1); \
-        ry[i] = data_b[tok * kv + (kt) * 4 + q]; \
+        ry[i] = data_b[tok * kv + (kt) * Y_VR + q]; \
     } }
 
 #define SSTORE(buf, kt) { \
@@ -136,9 +158,8 @@ void main() {
         } \
     } \
     [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
-        const uint v = tid + i * NT, r = v >> 2, q = v & 3; \
-        const uint o = r * STR + q * 4; \
-        shY[buf][o] = ry[i].x; shY[buf][o + 1] = ry[i].y; shY[buf][o + 2] = ry[i].z; shY[buf][o + 3] = ry[i].w; \
+        const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
+        STORE_Y(buf, r, q, ry[i]) \
     } }
 
     const uint nk = p.K / BK;
@@ -147,7 +168,7 @@ void main() {
     barrier();
 
     for (uint kt = 0; kt < nk; ++kt) {
-        const uint cur = kt & 1;
+        const uint cur = NBUF == 1 ? 0 : (kt & 1);
         // unconditional (clamped) prefetch and store keep the loop branch-free so the global loads
         // stay in flight across the WMMA block
         const uint kn = min(kt + 1, nk - 1);
@@ -162,7 +183,12 @@ void main() {
                 [[unroll]] for (uint i = 0; i < TM; ++i) acc[j * TM + i] = coopMatMulAdd(ma[i], mb, acc[j * TM + i]);
             }
         }
+#ifdef SINGLE_BUF
+        barrier();
+        SSTORE(0, kn)
+#else
         SSTORE(cur ^ 1, kn)
+#endif
         barrier();
     }
 

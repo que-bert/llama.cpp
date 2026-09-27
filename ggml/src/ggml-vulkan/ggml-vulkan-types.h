@@ -795,6 +795,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_mmq_q6k_rdna4;     // RDNA4 Q6_K x q8_1 prefill GEMM, int8 WMMA (GGML_VK_MMQ_Q6K_RDNA4=int8)
+    vk_pipeline pipeline_mm_q6k_rdna4_f32y; // same, activations read as f32 and converted in-kernel (no f32->f16 pre-pass)
     vk_pipeline pipeline_mm_q6k_rdna4_f16;  // RDNA4 Q6_K x f16 prefill GEMM, f16 WMMA (default; GGML_VK_NO_MMQ_Q6K_RDNA4=1 disables)
     vk_pipeline pipeline_quantize_q8_1_x4;
 

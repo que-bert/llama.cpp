@@ -2505,7 +2505,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef X_CM1
 
         // RDNA4 Q6_K prefill GEMM (separate modules). Default: f16-WMMA variant.
-        //   GGML_VK_MMQ_Q6K_RDNA4=int8 selects the int8 x q8_1 variant, =0 (or GGML_VK_NO_MMQ_Q6K_RDNA4=1) disables both.
+        //   GGML_VK_MMQ_Q6K_RDNA4=int8 selects the int8 x q8_1 variant, =f16db the double-buffered f16 one, =f32y the
+        //   in-kernel f32->f16 activation one; =0 (or GGML_VK_NO_MMQ_Q6K_RDNA4=1) disables all.
         //   GGML_VK_MMQ_Q6K_WAVE=32|64 picks the subgroup size (f16 default 64, int8 default 32; int8 wave64 is known-wrong).
         //   GGML_VK_MMQ_Q6K_ORDER=0 restores m-fast workgroup order.
         if (rdna4 && device->coopmat_support && getenv("GGML_VK_NO_MMQ_Q6K_RDNA4") == nullptr) {
@@ -2522,7 +2523,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_mmq_q6k_rdna4, "mul_mmq_q6k_rdna4", mul_mmq_q6k_rdna4_cm1_len, mul_mmq_q6k_rdna4_cm1_data, "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 32);
                 }
+            } else if (mode == "f32y") {
+                ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f32y, "mul_mm_q6k_rdna4_f32y", mul_mm_q6k_rdna4_f32y_cm1_len, mul_mm_q6k_rdna4_f32y_cm1_data, "main", 3,
+                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
             } else if (mode == "f16" || mode == "1") {
+                // single-buffered LDS (18 KB, 120 VGPRs): 81 TF at 17408x5120 vs 75 for the double-buffered "f16db"
+                ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16, "mul_mm_q6k_rdna4_f16", mul_mm_q6k_rdna4_f16_sb_cm1_len, mul_mm_q6k_rdna4_f16_sb_cm1_data, "main", 3,
+                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+            } else if (mode == "f16db") {
                 if (wv && atoi(wv) == 32) {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16, "mul_mm_q6k_rdna4_f16", mul_mm_q6k_rdna4_f16_w32_cm1_len, mul_mm_q6k_rdna4_f16_w32_cm1_data, "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 32);
@@ -6320,6 +6328,19 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool q6k_rdna4_shape = src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
                                  ne01 % 128 == 0 && ne10 % 256 == 0 && ne11 >= 64 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
                                  ggml_vk_dim01_contiguous(src0);
+    // f32y variant: reads the f32 activations directly (converted to f16 on the global->LDS path), no pre-pass.
+    if (q6k_rdna4_shape && ctx->device->pipeline_mm_q6k_rdna4_f32y != nullptr && !ctx->device->uma && ggml_is_contiguous(src1)) {
+        vk_pipeline & qp = ctx->device->pipeline_mm_q6k_rdna4_f32y;
+        ggml_pipeline_request_descriptor_sets(ctx, qp, 1);
+        const vk_mat_mat_push_constants pc = { (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, stride_d,
+                                               (uint32_t)(ne00*ne01), (uint32_t)(ne10*ne11), stride_batch_d, 0, 1, (uint32_t)ne10, 1, 1, 1, 1, (uint32_t)ne11 };
+        ggml_vk_dispatch_pipeline(ctx, subctx, qp,
+            { vk_subbuffer{ src0_buf_ctx->dev_buffer, vk_tensor_offset(src0) + src0->view_offs, ggml_nbytes(src0) },
+              vk_subbuffer{ src1_buf_ctx->dev_buffer, vk_tensor_offset(src1) + src1->view_offs, ggml_nbytes(src1) },
+              vk_subbuffer{ dst_buf_ctx->dev_buffer,  vk_tensor_offset(dst)  + dst->view_offs,  ggml_nbytes(dst) } },
+            pc, { (uint32_t)ne01, (uint32_t)ne11, 1 });
+        return;
+    }
     // f16 variant: activations go through the f32->f16 copy into prealloc_y (y_non_contig), no q8_1 quantisation.
     const bool want_q6k_f16 = q6k_rdna4_shape && ctx->device->pipeline_mm_q6k_rdna4_f16 != nullptr;
 
@@ -6534,7 +6555,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool use_q6k_f16   = want_q6k_f16 && !qx_needs_dequant && d_Y == ctx->prealloc_y && y_buf_offset == 0;
     const bool use_q6k_rdna4 = use_q6k_f16 || (quantize_y && q6k_rdna4_shape && ctx->device->pipeline_mmq_q6k_rdna4 != nullptr);
     if (use_q6k_rdna4) {
-        if (getenv("GGML_VK_MMQ_Q6K_LOG")) {
+        static const bool q6k_log = getenv("GGML_VK_MMQ_Q6K_LOG") != nullptr;
+        if (q6k_log) {
             fprintf(stderr, "q6k_rdna4(%s): m=%u n=%u k=%u stride_d=%u xoff=%zu yoff=%zu doff=%zu src0=%s dst=%s\n", use_q6k_f16 ? "f16" : "int8", (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, stride_d,
                     (size_t)x_buf_offset, (size_t)y_buf_offset, (size_t)d_buf_offset, src0->name, dst->name);
         }
