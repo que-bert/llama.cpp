@@ -8026,7 +8026,9 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     static const bool disabled = getenv("GGML_VK_NO_DECODE_Q8") != nullptr;
     static const bool debug = getenv("GGML_VK_DECODE_Q8_DEBUG") != nullptr;
     const vk_device & device = ctx->device;
-    if (debug) {
+    static bool printed_caps = false;
+    if (debug && !printed_caps) {
+        printed_caps = true;
         std::cerr << "decode_q8: rdna4=" << (device->architecture == vk_device_architecture::AMD_RDNA4) << " dot2=" << device->dot2_f16
                   << " sgctl=" << device->subgroup_size_control << " sg=[" << device->subgroup_min_size << "," << device->subgroup_max_size << "]"
                   << " K/V=" << ggml_type_name(k->type) << "/" << ggml_type_name(v->type) << " N=" << q->ne[1] << std::endl;
@@ -8140,7 +8142,13 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
         scale, split_kv, k_num, n_kv_head,
     };
     if (debug) {
-        std::cerr << "decode_q8: selected " << (use_q8r ? "q8r(coopmat)" : "valu") << " G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv << std::endl;
+        static uint32_t last_kv = 0; static int64_t last_n = 0;
+        if (KV != last_kv || N != last_n) {
+            last_kv = KV; last_n = N;
+            std::cerr << "decode_q8: selected " << (use_q8r ? "q8r(coopmat)" : "valu") << " G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv
+                      << " KV=" << KV << " n_kv_max=" << ggml_get_op_params_i32(dst, 4) << " mask_ne=" << (mask ? mask->ne[0] : 0) << "x" << (mask ? mask->ne[1] : 0)
+                      << " k_nb1=" << k->nb[1] << " k_nb2=" << k->nb[2] << " v_nb1=" << v->nb[1] << " v_nb2=" << v->nb[2] << std::endl;
+        }
     }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, mask_buf, split_k_buf }, pc,
                               { n_kv_head * k_num, 1, zg });

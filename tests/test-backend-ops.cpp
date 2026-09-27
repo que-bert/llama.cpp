@@ -11381,6 +11381,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Same shape with the KV-cache layout the server passes (heads interleaved
+    // per cell: K nb1 = 4*272, nb2 = 272), which the contiguous cases above miss.
+    for (int kv : { 71680, 183296, }) {
+        for (int nb : { 1, 4, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        }
+    }
+
     // WS1 diagnostics: f16 KV and mask-off at the exact decode shape, to size
     // the q8_0 dequant/LDS penalty and the mask-processing share.
     for (int kv : { 71680, 183296, }) {
