@@ -3216,7 +3216,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (auto &it : device->pipeline_fa_decode_q8) {
         const auto GP = it.first;
-        ggml_vk_create_pipeline(device, it.second, "flash_attn_decode_q8", flash_attn_decode_q8_dot2_len, flash_attn_decode_q8_dot2_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 64);
+        ggml_vk_create_pipeline(device, it.second, "flash_attn_decode_q8", device->dot2_f16 ? flash_attn_decode_q8_dot2_len : flash_attn_decode_q8_len, device->dot2_f16 ? flash_attn_decode_q8_dot2_data : flash_attn_decode_q8_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 64);
     }
 
     {
@@ -8017,8 +8017,14 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 // GGML_VK_NO_DECODE_Q8=1 falls back to the generic path.
 static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     static const bool disabled = getenv("GGML_VK_NO_DECODE_Q8") != nullptr;
+    static const bool debug = getenv("GGML_VK_DECODE_Q8_DEBUG") != nullptr;
     const vk_device & device = ctx->device;
-    if (disabled || device->architecture != vk_device_architecture::AMD_RDNA4 || !device->dot2_f16 ||
+    if (debug) {
+        std::cerr << "decode_q8: rdna4=" << (device->architecture == vk_device_architecture::AMD_RDNA4) << " dot2=" << device->dot2_f16
+                  << " sgctl=" << device->subgroup_size_control << " sg=[" << device->subgroup_min_size << "," << device->subgroup_max_size << "]"
+                  << " K/V=" << ggml_type_name(k->type) << "/" << ggml_type_name(v->type) << " N=" << q->ne[1] << std::endl;
+    }
+    if (disabled || device->architecture != vk_device_architecture::AMD_RDNA4 ||
         !device->subgroup_size_control || device->subgroup_min_size > 64 || device->subgroup_max_size < 64) {
         return false;
     }
@@ -8027,7 +8033,12 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     }
     const uint32_t D = 256;
     const int64_t N = q->ne[1];
-    if (q->ne[0] != D || k->ne[0] != D || v->ne[0] != D || N < 1 || N > 8 ||
+    // Without VK_VALVE_shader_mixed_float_dot_product (RADV 26.0) the f32-FMA
+    // variant is issue-bound at N=4 (4284 us vs 1826 baseline @183k) but wins
+    // at N=1 (789 vs 985). Default: N=1 only; GGML_VK_DECODE_Q8_NMAX raises it.
+    static const int env_nmax = getenv("GGML_VK_DECODE_Q8_NMAX") ? atoi(getenv("GGML_VK_DECODE_Q8_NMAX")) : 0;
+    const int64_t n_max = env_nmax > 0 ? std::min(env_nmax, 8) : (device->dot2_f16 ? 8 : 1);
+    if (q->ne[0] != D || k->ne[0] != D || v->ne[0] != D || N < 1 || N > n_max ||
         q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || dst->ne[3] != 1 ||
         k->ne[2] != v->ne[2] || k->ne[2] < 1 || (q->ne[2] % k->ne[2]) != 0) {
         return false;
@@ -8047,7 +8058,7 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
         return false;
     }
     if ((q->nb[1] % 16) != 0 || (q->nb[2] % 16) != 0 || q->nb[0] != sizeof(float) ||
-        (k->nb[1] % 4) != 0 || (k->nb[2] % 4) != 0 || (v->nb[1] % 2) != 0 || (v->nb[2] % 2) != 0 ||
+        (k->nb[1] % 16) != 0 || (k->nb[2] % 16) != 0 || (v->nb[1] % 2) != 0 || (v->nb[2] % 2) != 0 ||
         dst->nb[1] != D * sizeof(float) || dst->nb[2] != dst->nb[1] * dst->ne[1]) {
         return false;
     }
@@ -8106,6 +8117,9 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
         mask ? (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)) : 0u,
         scale, split_kv, k_num, n_kv_head,
     };
+    if (debug) {
+        std::cerr << "decode_q8: selected G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv << std::endl;
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, mask_buf, split_k_buf }, pc,
                               { n_kv_head * k_num, 1, zg });
     ggml_vk_sync_buffers(ctx, subctx);

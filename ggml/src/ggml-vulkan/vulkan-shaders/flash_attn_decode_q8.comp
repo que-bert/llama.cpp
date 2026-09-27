@@ -22,11 +22,18 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_clustered : enable
 #extension GL_KHR_shader_subgroup_vote : enable
+#ifdef DOT2_F16
 #extension GL_EXT_spirv_intrinsics : require
-
 spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"],
                   capabilities = [6912], id = 6916)
 float v_dot2_f32_f16(f16vec2 a, f16vec2 b, float acc);
+#else
+// RADV 26.0 does not expose VK_VALVE_shader_mixed_float_dot_product: f16
+// operands, f32 accumulation (ACO: v_fma_mix_f32 or cvt + fmac).
+float v_dot2_f32_f16(f16vec2 a, f16vec2 b, float acc) {
+    return fma(float(a.y), float(b.y), fma(float(a.x), float(b.x), acc));
+}
+#endif
 
 layout (constant_id = 0) const uint G = 6;   // query heads per KV head
 layout (constant_id = 1) const uint P = 4;   // query positions per workgroup
@@ -38,7 +45,11 @@ const uint BC   = 32;                        // kv rows per iteration
 layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer Q   { vec4 data_q4[]; };
+#ifndef KSTAGE
+#define KSTAGE 1
+#endif
 layout (binding = 1) readonly buffer K   { uint data_k32[]; };
+layout (binding = 1) readonly buffer K4  { uvec4 data_k128[]; };
 layout (binding = 2) readonly buffer V   { uint16_t data_v16[]; };
 layout (binding = 3) readonly buffer M   { float16_t data_m[]; };
 layout (binding = 4) writeonly buffer O  { float data_o[]; };
@@ -64,6 +75,9 @@ layout (push_constant) uniform parameter {
 
 shared uvec4 Qsh[ROWS * (D / 8)];   // Q as f16, 8 per uvec4
 shared uvec4 Psh[(BC / 2) * RS / 4]; // P tile: [kv pair][row] packed f16x2
+#if KSTAGE
+shared uvec4 Ksh[BC * 17];           // raw q8_0 K tile, 272 B per row
+#endif
 
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
 #define NEG_INF uintBitsToFloat(0xFF800000)
@@ -146,12 +160,31 @@ void main() {
         [[unroll]] for (uint i = 0; i < 2; ++i) {
             [[unroll]] for (uint r = 0; r < ROWS; ++r) S[i][r] = 0.0;
         }
+#if KSTAGE
+        // Coalesced raw copy of the K tile (32 rows x 272 B) into LDS, then
+        // per-lane conflict-free dword reads. Strided per-lane global reads
+        // touch ~40 cache lines per instruction.
+        [[unroll]] for (uint it = 0; it < (BC * 17 + 63) / 64; ++it) {
+            const uint idx = it * 64 + lane;
+            if ((BC * 17) % 64 == 0 || idx < BC * 17) {
+                const uint row = idx / 17;
+                const uint j = min(j0 + row, kv_end - 1);
+                Ksh[idx] = data_k128[(kbase + j * p.k_s1) / 16 + idx % 17];
+            }
+        }
+        barrier();
+#endif
         uint w[2][17];
         float dk[2][2];
         [[unroll]] for (uint i = 0; i < 2; ++i) {
+#if KSTAGE
+            const uint kb = (2 * rp + i) * 68 + 17 * c;
+            [[unroll]] for (uint t = 0; t < 17; ++t) w[i][t] = Ksh[(kb + t) / 4][(kb + t) % 4];
+#else
             const uint j = min(j0 + 2 * rp + i, kv_end - 1);
             const uint kb = (kbase + j * p.k_s1) / 4 + 17 * c;
             [[unroll]] for (uint t = 0; t < 17; ++t) w[i][t] = data_k32[kb + t];
+#endif
             dk[i][0] = unpackHalf2x16(w[i][0]).x * p.scale;
             dk[i][1] = unpackHalf2x16(w[i][8]).y * p.scale;
         }
