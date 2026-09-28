@@ -3769,6 +3769,22 @@ struct test_rms_norm_scale : public test_case {
     }
 };
 
+// RMS_NORM -> MUL(weight) -> MUL(SILU(z)) (qwen35 build_norm_gated)
+struct test_rms_norm_mul_silu_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    std::string vars() override { return VARS_TO_STR1(ne); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "RMS_NORM_MUL_SILU_MUL"; }
+    bool run_whole_graph() override { return true; }
+    test_rms_norm_mul_silu_mul(std::array<int64_t, 4> ne = {128, 48, 4, 1}) : ne(ne) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        return ggml_mul(ctx, n, ggml_silu(ctx, z));
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -4752,16 +4768,17 @@ struct test_gdn_recurrent_cache : public test_case {
     const int64_t conv_d;
     const int64_t conv_c;
     const int32_t src_row;
+    const bool gate; // qwen35 gate chain: g = softplus(alpha + dt) * a, beta = sigmoid(beta_raw)
 
     std::vector<ggml_tensor *> verify;
 
     std::string vars() override {
-        return VARS_TO_STR7(head_count, head_size, n_seq_tokens, K, conv_d, conv_c, src_row);
+        return VARS_TO_STR7(head_count, head_size, n_seq_tokens, K, conv_d, conv_c, src_row) + ",gate=" + std::to_string(gate);
     }
 
     test_gdn_recurrent_cache(int64_t head_count = 4, int64_t head_size = 128, int64_t n_seq_tokens = 4, int64_t K = 4,
-            int64_t conv_d = 3, int64_t conv_c = 256, int32_t src_row = 0)
-        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), K(K), conv_d(conv_d), conv_c(conv_c), src_row(src_row) {}
+            int64_t conv_d = 3, int64_t conv_c = 256, int32_t src_row = 0, bool gate = false)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), K(K), conv_d(conv_d), conv_c(conv_c), src_row(src_row), gate(gate) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const ggml_type type = GGML_TYPE_F32;
@@ -4802,6 +4819,18 @@ struct test_gdn_recurrent_cache : public test_case {
         ggml_set_name(v, "v");
         ggml_set_name(g, "g");
         ggml_set_name(beta, "beta");
+        if (gate) {
+            ggml_tensor * alpha = ggml_new_tensor_2d(ctx, type, H, T);
+            ggml_tensor * dt    = ggml_new_tensor_1d(ctx, type, H);
+            ggml_tensor * ga    = ggml_new_tensor_1d(ctx, type, H);
+            ggml_tensor * braw  = ggml_new_tensor_2d(ctx, type, H, T);
+            ggml_set_name(alpha, "alpha_raw");
+            ggml_set_name(dt, "dt");
+            ggml_set_name(ga, "ga");
+            ggml_set_name(braw, "beta_raw");
+            g    = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), ga), 1, H, T, 1);
+            beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, braw, 1, H, T, 1));
+        }
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * ssm = ggml_new_tensor_2d(ctx, type, D, K);
@@ -4840,6 +4869,12 @@ struct test_gdn_recurrent_cache : public test_case {
                 init_tensor_uniform(t, -2.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "alpha_raw") == 0) {
+                init_tensor_uniform(t, -4.0f, 22.0f);  // spans the softplus x > 20 branch
+            } else if (strcmp(t->name, "ga") == 0) {
+                init_tensor_uniform(t, -0.2f, -0.01f);
+            } else if (strcmp(t->name, "beta_raw") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -11251,6 +11286,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_recurrent_cache(4, 128, 2, 4, 3, 300, 1));
     test_cases.emplace_back(new test_gdn_recurrent_cache(2, 128, 8, 4, 3, 256, 1));
     test_cases.emplace_back(new test_gdn_recurrent_cache(4, 32,  4, 2, 3, 64,  1));
+    test_cases.emplace_back(new test_gdn_recurrent_cache(4, 128, 4, 4, 3, 256, 2, true));
+    test_cases.emplace_back(new test_gdn_recurrent_cache(8, 64,  1, 4, 3, 100, 3, true));
+    test_cases.emplace_back(new test_gdn_recurrent_cache(48, 128, 4, 4, 3, 256, 1, true));
+    test_cases.emplace_back(new test_gdn_recurrent_cache(4, 32,  8, 4, 3, 64,  0, true));
+    for (auto ne : std::vector<std::array<int64_t, 4>>{ {128, 48, 4, 1}, {128, 48, 1, 1}, {5120, 4, 1, 1}, {96, 3, 5, 1}, {1000, 7, 1, 1} }) {
+        test_cases.emplace_back(new test_rms_norm_mul_silu_mul(ne));
+    }
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 

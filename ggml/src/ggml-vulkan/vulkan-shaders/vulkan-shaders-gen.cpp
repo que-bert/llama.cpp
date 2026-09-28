@@ -857,6 +857,13 @@ void process_shaders() {
     string_to_spv("rms_norm_small_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "128"}}));
     string_to_spv("rms_norm_scale_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_SCALE_FUSION", "1"}}));
     string_to_spv("rms_norm_scale_small_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "128"}, {"RMS_NORM_SCALE_FUSION", "1"}}));
+    // RMS_NORM_FAST: unconditional loads + subgroup-shuffle tail of the same reduction tree
+    string_to_spv("rms_norm_fast_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_FAST", "1"}}));
+    string_to_spv("rms_norm_small_fast_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "128"}, {"RMS_NORM_FAST", "1"}}));
+    string_to_spv("rms_norm_scale_fast_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_SCALE_FUSION", "1"}, {"RMS_NORM_FAST", "1"}}));
+    string_to_spv("rms_norm_scale_small_fast_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "128"}, {"RMS_NORM_SCALE_FUSION", "1"}, {"RMS_NORM_FAST", "1"}}));
+    string_to_spv("rms_norm_gate_fast_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_GATE_FUSION", "1"}, {"RMS_NORM_FAST", "1"}}));
+    string_to_spv("rms_norm_gate_small_fast_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "128"}, {"RMS_NORM_GATE_FUSION", "1"}, {"RMS_NORM_FAST", "1"}}));
     string_to_spv("rms_norm_mul_add_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_mul_add_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_set_rows_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}));

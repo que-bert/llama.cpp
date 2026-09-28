@@ -691,6 +691,7 @@ struct vk_op_gated_delta_net_cache_push_constants {
     uint32_t out_seq_stride;  // floats
     uint32_t out_slot_stride; // floats
     uint32_t n_slots;
+    uint32_t gate_fused;      // 1: bindings 3/4 hold raw alpha/beta, 8/9 hold dt/a (gate chain folded in)
 };
 
 // conv-state gather + concat + K snapshot stores in one pass (gdn_conv_state.comp)

@@ -38,6 +38,7 @@ layout(push_constant) uniform Parameters {
     uint out_seq_stride;
     uint out_slot_stride;
     uint n_slots;
+    uint gate_fused;
 #endif
 };
 
@@ -52,6 +53,9 @@ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 // the same shard, and n_seqs == 1, so the in-place update has no cross-workgroup hazard.
 layout(binding = 5)           buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 7) readonly  buffer IdsBuf   { int data_ids[]; };
+// gate_fused: bindings 3/4 hold the raw alpha/beta projections, 8/9 the per-head dt bias and a
+layout(binding = 8) readonly  buffer DtBuf    { float data_dt[]; };
+layout(binding = 9) readonly  buffer GABuf    { float data_ga[]; };
 #else
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 #endif
@@ -142,7 +146,15 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
+#if GDN_CACHE
+        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        if (gate_fused != 0) {
+            // same expression as unary.comp op_sigmoid
+            beta_val = FLOAT_TYPE(1.0f / (1.0f + exp(-float(beta_val))));
+        }
+#else
         const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+#endif
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];
@@ -154,7 +166,18 @@ void main() {
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {
+#if GDN_CACHE
+            float g_in = float(data_g[gb_off]);
+            if (gate_fused != 0) {
+                // ADD(dt) -> op_softplus -> MUL(a), each rounded to f32 as the separate ops do
+                const float x = g_in + data_dt[head_id];
+                const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+                g_in = sp * data_ga[head_id];
+            }
+            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(g_in));
+#else
             const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+#endif
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 g_exp[r] = g_val;
             }

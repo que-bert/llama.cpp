@@ -869,6 +869,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_f32;
     vk_pipeline pipeline_rms_norm_small_f32;      // BLOCK_SIZE 128, ne00 <= 128
     vk_pipeline pipeline_rms_norm_mul_small_f32;
+    // RMS_NORM_FAST variants: [0]=plain [1]=mul [2]=small [3]=mul_small [4]=scale [5]=scale_small (null if unsupported)
+    vk_pipeline pipeline_rms_norm_fast[6];
+    // RMS_NORM_MUL + SILU_MUL (norm_gated) on the fast shader: [0]=512 threads [1]=128 (null if unsupported)
+    vk_pipeline pipeline_rms_norm_gate[2];
     vk_pipeline pipeline_rms_norm_scale_f32;        // rms_norm -> scale fused
     vk_pipeline pipeline_rms_norm_scale_small_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
@@ -1323,6 +1327,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_q6k_swiglu {};
+    bool fused_rms_gate {};
 
     // recurrent-cache fusion (GGML_VK_NO_GDN_CACHE=1 disables): GET_ROWS/CPY nodes whose work is done by
     // the GATED_DELTA_NET or CONCAT node that owns them. Rebuilt per graph.
@@ -1332,6 +1337,11 @@ struct ggml_backend_vk_context {
         const ggml_tensor * cpy_dst[4]; // snapshot destinations (views of cache)
         uint32_t t_off[4];              // concat time offset of each snapshot (CONCAT only)
         uint32_t n_cpy;
+        // GDN gate chain folded in (GATED_DELTA_NET only): g = softplus(alpha + dt) * a, beta = sigmoid(beta_raw)
+        const ggml_tensor * gate_alpha;
+        const ggml_tensor * gate_dt;
+        const ggml_tensor * gate_a;
+        const ggml_tensor * gate_beta;
     };
     std::unordered_set<const ggml_tensor *> gdn_skip_nodes;
     std::unordered_map<const ggml_tensor *, vk_gdn_cache_fuse> gdn_cache_fuse;

@@ -36,9 +36,18 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 
+#elif RMS_NORM_GATE_FUSION
+
+// rms_norm -> mul(weight) -> mul(silu(z)): z has the dst layout (host checks contiguity, no misalign)
+layout (binding = 3) readonly buffer Z {float data_z[];};
+
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
+#if RMS_NORM_FAST
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+#endif
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 512
 #endif
@@ -77,6 +86,66 @@ void rms_norm(uint num_iters) {
     uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
 #endif
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
+
+#if RMS_NORM_FAST
+    // Same arithmetic and reduction tree as below (bit-identical result), but every load is issued
+    // unconditionally (clamped column) up front and kept in registers for the output pass, and the
+    // tree levels inside one subgroup use shuffles instead of LDS + barrier.
+    FLOAT_TYPE xs[16];
+    FLOAT_TYPE ws[16];
+    [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
+        const uint col = tid + idx * BLOCK_SIZE;
+        const uint cc  = min(col, ncols - 1);
+        const FLOAT_TYPE xv = FLOAT_TYPE(data_a[a_offset + cc]);
+        xs[idx] = col < ncols ? xv : FLOAT_TYPE(0);
+        if (do_multiply) {
+            ws[idx] = FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(cc, p.ne10) : cc)]);
+        }
+    }
+    [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
+        sum += xs[idx] * xs[idx];
+    }
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (uint(s) >= gl_SubgroupSize) {
+            if (tid < s) {
+                sum += sumsh[tid + s];
+                sumsh[tid] = sum;
+            }
+            barrier();
+        } else {
+            sum += subgroupShuffleDown(sum, uint(s));
+        }
+    }
+    if (tid == 0) {
+        sumsh[0] = sum;
+    }
+    barrier();
+    sum = sumsh[0];
+    {
+        const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
+        const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
+        [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
+            const uint col = tid + idx * BLOCK_SIZE;
+            if (col < ncols) {
+#if RMS_NORM_SCALE_FUSION
+                const FLOAT_TYPE normed = scale * xs[idx];
+                data_d[d_offset + col] = D_TYPE(normed * FLOAT_TYPE(p.param2));
+#elif RMS_NORM_GATE_FUSION
+                // same roundings as RMS_NORM_MUL then SILU_MUL (unary.comp op_silu)
+                const FLOAT_TYPE normed = scale * xs[idx] * ws[idx];
+                const float zv = data_z[d_offset - get_doffset() + col];
+                const FLOAT_TYPE sz = FLOAT_TYPE(zv / (1.0f + exp(-zv)));
+                data_d[d_offset + col] = D_TYPE(normed * sz);
+#else
+                data_d[d_offset + col] = D_TYPE(do_multiply ? scale * xs[idx] * ws[idx] : scale * xs[idx]);
+#endif
+            }
+        }
+    }
+    return;
+#endif
 
     [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
         FLOAT_TYPE xi = FLOAT_TYPE(0);
@@ -163,6 +232,27 @@ void main() {
     // instantiate the rms_norm function for several different
     // dimensions, to allow loop unrolling
     uint num_blocks = (p.ne00 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+#if RMS_NORM_FAST
+    // host guarantees num_blocks <= 16
+    if (num_blocks > 12) {
+        rms_norm(16);
+    } else if (num_blocks > 10) {
+        rms_norm(12);
+    } else if (num_blocks > 8) {
+        rms_norm(10);
+    } else if (num_blocks > 4) {
+        rms_norm(8);
+    } else if (num_blocks == 4) {
+        rms_norm(4);
+    } else if (num_blocks == 3) {
+        rms_norm(3);
+    } else if (num_blocks == 2) {
+        rms_norm(2);
+    } else {
+        rms_norm(1);
+    }
+    return;
+#endif
     if (num_blocks > 32) {
         rms_norm(num_blocks);
     } else if (num_blocks > 16) {
