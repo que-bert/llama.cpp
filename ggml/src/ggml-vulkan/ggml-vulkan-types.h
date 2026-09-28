@@ -1032,6 +1032,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_fa_prefill_rdna4_vt[7];
     // same, softmax in registers (flash_attn_prefill_rdna4_rs.comp); GGML_VK_NO_FA_PREFILL_RDNA4_RS=1 disables
     vk_pipeline pipeline_fa_prefill_rdna4_rs[7];
+    vk_pipeline pipeline_fa_prefill_rdna4_v64[7];
+    vk_pipeline pipeline_fa_dequant_q8_0_rdna4;
     vk_pipeline pipeline_count_experts;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)

@@ -3347,8 +3347,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_rs[g], "flash_attn_prefill_rdna4_rs_g" + std::to_string(g),
                                              flash_attn_prefill_rdna4_rs_cm1_len, flash_attn_prefill_rdna4_rs_cm1_data, "main", 5,
                                              sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                    // V scratch pre-transposed per 32-kv tile (fa_dequant_q8_0_rdna4); GGML_VK_NO_FA_PREFILL_RDNA4_V64=1 disables
+                    if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_V64") == nullptr) {
+                        ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
+                                                 flash_attn_prefill_rdna4_v64_cm1_len, flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
+                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                    }
                 }
             }
+        }
+        if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_V64") == nullptr) {
+            ggml_vk_create_pipeline2(device, device->pipeline_fa_dequant_q8_0_rdna4, "fa_dequant_q8_0_rdna4", fa_dequant_q8_0_rdna4_len, fa_dequant_q8_0_rdna4_data,
+                                     "main", 2, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true, true, 32);
         }
     }
 #endif
@@ -8640,6 +8650,64 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             !sinks && pf_max_bias == 0.0f && pf_softcap == 0.0f &&
             (nbq1 % 16) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
             ggml_is_contiguous(dst);
+        const bool use_v64 = use_prefill_rdna4 && ctx->device->pipeline_fa_prefill_rdna4_v64[G] != nullptr &&
+                             ctx->device->pipeline_fa_dequant_q8_0_rdna4 != nullptr &&
+                             // the dequant reads whole 272-byte q8_0 rows as uvec4
+                             (ggml_vk_tensor_subbuffer(ctx, k).offset % 16) == 0 && (ggml_vk_tensor_subbuffer(ctx, v).offset % 16) == 0 &&
+                             (nbk1 % 16) == 0 && (nbv1 % 16) == 0;
+        if (use_v64) {
+            // _v64: one dequant pass writes K rows [ns][h][kv][d] and V tiles [ns][h][kv/32][d][32 kv] (zero-padded)
+            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_v64[G];
+            vk_pipeline dq = ctx->device->pipeline_fa_dequant_q8_0_rdna4;
+            ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, dq, 2);
+
+            vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
+            vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
+            vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
+            vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+            vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+
+            const uint32_t NT = CEIL_DIV(KV, 32);
+            const uint64_t fp = sizeof(ggml_fp16_t);
+            const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
+            const uint64_t v_f16_sz = (uint64_t)NT * 32 * HSV * nev2 * nev3 * fp;
+            if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
+                ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            if (ctx->prealloc_x_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            vk_subbuffer k_dst = vk_subbuffer{ ctx->prealloc_x, 0,        k_f16_sz };
+            vk_subbuffer v_dst = vk_subbuffer{ ctx->prealloc_x, k_f16_sz, v_f16_sz };
+            { const std::array<uint32_t, 4> dpc = { (uint32_t)nek2, KV, NT, 0u };
+              ggml_vk_dispatch_pipeline(ctx, subctx, dq, { k_buf, k_dst }, dpc, { (uint32_t)nek2, NT, (uint32_t)nek3 }); }
+            { const std::array<uint32_t, 4> dpc = { (uint32_t)nev2, KV, NT, 1u };
+              ggml_vk_dispatch_pipeline(ctx, subctx, dq, { v_buf, v_dst }, dpc, { (uint32_t)nev2, NT, (uint32_t)nev3 }); }
+            ggml_vk_sync_buffers(ctx, subctx);
+            if (vk_perf_logger_enabled && !vk_perf_logger_concurrent && ctx->query_pool && ctx->query_idx < ctx->num_queries) {
+                ctx->query_nodes[ctx->query_idx] = dst;
+                ctx->query_fusion_names[ctx->query_idx] = "FA_DEQUANT_KV";
+                subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+            }
+
+            const vk_fa_prefill_rdna4_push_constants ppc = {
+                (uint32_t)neq1, KV, (uint32_t)neq2,
+                (uint32_t)(nbq1 / 4), (uint32_t)(nbq2 / 4), (uint32_t)(nbq3 / 4),
+                HSK / 8, KV * (HSK / 8), KV * (HSK / 8) * (uint32_t)nek2,
+                HSV * 32 / 8, NT * (HSV * 32 / 8), NT * (HSV * 32 / 8) * (uint32_t)nev2,
+                mask ? (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)) : 0u,
+                mask ? (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)) : 0u,
+                mask ? 1u : 0u,
+                mask ? std::max<uint32_t>(1u, nem3) : 1u,
+                pf_scale,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pl, { q_buf, k_dst, v_dst, mask_buf, dst_buf }, ppc,
+                                      { (uint32_t)CEIL_DIV(neq1, 16), (uint32_t)nek2, (uint32_t)neq3 });
+            ctx->prealloc_x_need_sync = true;
+            return;
+        }
         if (use_prefill_rdna4) {
             vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_rs[G] != nullptr ? ctx->device->pipeline_fa_prefill_rdna4_rs[G]
                            : ctx->device->pipeline_fa_prefill_rdna4_vt[G] != nullptr ? ctx->device->pipeline_fa_prefill_rdna4_vt[G]
