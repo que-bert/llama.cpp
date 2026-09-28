@@ -3270,6 +3270,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool r1 = GP.first * GP.second <= 16;
         ggml_vk_create_pipeline(device, it.second, r1 ? "flash_attn_decode_q8r1" : "flash_attn_decode_q8r2", r1 ? flash_attn_decode_q8r1_cm1_len : flash_attn_decode_q8r2_cm1_len, r1 ? flash_attn_decode_q8r1_cm1_data : flash_attn_decode_q8r2_cm1_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 32);
     }
+    for (auto &it : device->pipeline_fa_decode_q8w) {
+        const auto GP = it.first;
+        const bool r1 = GP.first * GP.second <= 16;
+        ggml_vk_create_pipeline(device, it.second, r1 ? "flash_attn_decode_q8w1" : "flash_attn_decode_q8w2", r1 ? flash_attn_decode_q8w1_cm1_len : flash_attn_decode_q8w2_cm1_len, r1 ? flash_attn_decode_q8w1_cm1_data : flash_attn_decode_q8w2_cm1_data, "main", 5, sizeof(vk_fa_decode_q8_push_constants), {1, 1, 1}, {GP.first, GP.second}, 1, true, true, 32);
+    }
     for (auto &it : device->pipeline_fa_decode_q8v) {
         const auto GP = it.first;
         const bool r1 = GP.first * GP.second <= 16;
@@ -8213,6 +8218,11 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     static const bool q8v_env_on = getenv("GGML_VK_DECODE_Q8V") && atoi(getenv("GGML_VK_DECODE_Q8V")) != 0;
     const bool use_q8v = use_q8r && q8v_env_on && (k_buf.offset % 16) == 0 && (v_buf.offset % 4) == 0 &&
                          (v->nb[1] % 4) == 0 && (v->nb[2] % 4) == 0;
+    // q8w: 8 x wave32 per WG, 32 d per wave, V loaded per PV step, LDS sized
+    // to the used rows (flash_attn_decode_q8w.comp). GGML_VK_DECODE_Q8W=0
+    // falls back to q8r/q8v.
+    static const bool q8w_env_off = getenv("GGML_VK_DECODE_Q8W") && atoi(getenv("GGML_VK_DECODE_Q8W")) == 0;
+    const bool use_q8w = use_q8r && !use_q8v && !q8w_env_off;
     const uint32_t KV = (uint32_t)k->ne[1];
     const uint32_t n_kv_head = (uint32_t)k->ne[2];
     const uint32_t n_head = (uint32_t)dst->ne[1];
@@ -8220,8 +8230,13 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     const uint32_t zg = CEIL_DIV((uint32_t)N, P);
 
     static const int env_wgs = getenv("GGML_VK_DECODE_Q8_WGS") ? atoi(getenv("GGML_VK_DECODE_Q8_WGS")) : 0;
-    const uint32_t target_wgs = env_wgs > 0 ? (uint32_t)env_wgs : 512;
-    const uint32_t bc = use_q8r ? 64u : 32u;
+    // Coopmat variants: one full round of workgroups (fewer, longer splits
+    // also shrink the split-K partials). R9700 kv=183296 interleaved, q8w
+    // nb=4: 128 WGs 734-739 us, 256 754-757, 512 797-799; q8r nb=4: 96 872,
+    // 128 864, 256 907, 512 920. 2 WGs per CU (128 on the R9700's 64 CUs).
+    const uint32_t coopmat_wgs = device->shader_core_count > 0 ? 2 * device->shader_core_count : 128;
+    const uint32_t target_wgs = env_wgs > 0 ? (uint32_t)env_wgs : use_q8r ? coopmat_wgs : 512;
+    const uint32_t bc = use_q8w ? 128u : use_q8r ? 64u : 32u;
     uint32_t k_num = std::max(1u, target_wgs / (n_kv_head * zg));
     uint32_t split_kv = ROUNDUP_POW2(std::max(bc, CEIL_DIV(KV, k_num)), bc);
     k_num = CEIL_DIV(KV, split_kv);
@@ -8229,7 +8244,7 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     vk_pipeline pipeline;
     {
         std::lock_guard<std::mutex> guard(device->compile_mutex);
-        auto &pipelines = use_q8v ? device->pipeline_fa_decode_q8v : use_q8r ? device->pipeline_fa_decode_q8r : device->pipeline_fa_decode_q8;
+        auto &pipelines = use_q8w ? device->pipeline_fa_decode_q8w : use_q8v ? device->pipeline_fa_decode_q8v : use_q8r ? device->pipeline_fa_decode_q8r : device->pipeline_fa_decode_q8;
         auto it = pipelines.find({G, P});
         if (it != pipelines.end()) {
             pipeline = it->second;
@@ -8269,7 +8284,7 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
         static uint32_t last_kv = 0; static int64_t last_n = 0;
         if (KV != last_kv || N != last_n) {
             last_kv = KV; last_n = N;
-            std::cerr << "decode_q8: selected " << (use_q8v ? "q8v(coopmat)" : use_q8r ? "q8r(coopmat)" : "valu") << " G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv
+            std::cerr << "decode_q8: selected " << (use_q8w ? "q8w(coopmat)" : use_q8v ? "q8v(coopmat)" : use_q8r ? "q8r(coopmat)" : "valu") << " G=" << G << " P=" << P << " zg=" << zg << " k_num=" << k_num << " split_kv=" << split_kv
                       << " KV=" << KV << " n_kv_max=" << ggml_get_op_params_i32(dst, 4) << " mask_ne=" << (mask ? mask->ne[0] : 0) << "x" << (mask ? mask->ne[1] : 0)
                       << " k_nb1=" << k->nb[1] << " k_nb2=" << k->nb[2] << " v_nb1=" << v->nb[1] << " v_nb2=" << v->nb[2] << std::endl;
         }
