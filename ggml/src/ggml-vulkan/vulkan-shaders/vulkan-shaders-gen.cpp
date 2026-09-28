@@ -974,6 +974,12 @@ void process_shaders() {
     string_to_spv("mul_mm_q6k_rdna4_f16_n256sk", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"BN", "256"}, {"WARPS_N", "4"}, {"SPLITK", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_glu", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"GLU", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_glun256", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"GLU", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqup", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqupsk", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"SPLITK", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqn256", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqn256sk", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"BN", "256"}, {"WARPS_N", "4"}, {"SPLITK", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqglu", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqglun256", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_p2", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_p2sk", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}, {"SPLITK", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_n256p2", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);

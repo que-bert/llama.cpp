@@ -97,6 +97,22 @@ void deq4(const uint q, const f16vec2 s, out uint o0, out uint o1) {
     o1 = packFloat2x16((unpackFloat2x16(hi | 0x64006400u) - b) * s);
 }
 
+#ifdef LEANQ
+// lean dequant (UPAR only): the 2-byte block misalignment and the nibble / 2-bit shift of a K step are one
+// workgroup-uniform funnel shift of the dword pair (v_alignbit_b32), and the byte spread with the 0x64
+// exponent byte is one byte permute per f16 pair (v_perm_b32): ~11 VALU per 4 values instead of ~20
+uint fsh(const uint lo, const uint hi, const uint s) { return uint(pack64(u32vec2(lo, hi)) >> s); }
+// byte spread as bitfield selects (v_bfi_b32) + one and_or with the exponent (ACO lowers a u8vec4 pack
+// byte by byte, 4 v_perm per pair)
+void deq4p(const uint q, const f16vec2 s, out uint o0, out uint o1) {
+    const uint lo = (((q & 0x0000FFFFu) | ((q << 8) & 0xFFFF0000u)) & 0x00FF00FFu) | 0x64006400u;
+    const uint hi = ((((q >> 16) & 0x0000FFFFu) | ((q >> 8) & 0xFFFF0000u)) & 0x00FF00FFu) | 0x64006400u;
+    const f16vec2 c = f16vec2(float16_t(1056.0));
+    o0 = packFloat2x16((unpackFloat2x16(lo) - c) * s);
+    o1 = packFloat2x16((unpackFloat2x16(hi) - c) * s);
+}
+#endif
+
 void main() {
     const uint tid  = gl_LocalInvocationID.x;
     const uint warp = gl_SubgroupID;
@@ -144,7 +160,19 @@ void main() {
 #define ODDQ(kt) ((rodd[i] & 2) != 0)
 #define LOADQ(wl, wh, sb) [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; }
 #endif
+#ifdef LEANQ
+    // per-item block-row byte base, hoisted out of the K loop (the in-loop part is a scalar sb * 210)
+    uint rbase[W_PER];
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) {
+        const uint row = (tid + i * NT) / GPR;
 #ifdef GLU
+        rbase[i] = (row < BM / 2 ? p.batch_stride_a : p.batch_stride_b) + (mg0 + row % (BM / 2)) * nsb * 210u;
+#else
+        rbase[i] = (m0 + row) * nsb * 210u;
+#endif
+    }
+#define BBASE(bb, row, sb) const uint bb = rbase[i] + (sb) * 210u;
+#elif defined(GLU)
 #define BBASE(bb, row, sb) const uint bb = ((row) < BM / 2 ? p.batch_stride_a : p.batch_stride_b) + ((mg0 + (row) % (BM / 2)) * nsb + (sb)) * 210u;
 #else
 #define BBASE(bb, row, sb) const uint bb = ((m0 + (row)) * nsb + (sb)) * 210u;
@@ -168,6 +196,56 @@ void main() {
         ry[i] = data_b[tok * kv + (kt) * Y_VR + q]; \
     } }
 
+#ifdef LEANQ
+// the K loop is unrolled by 4 so the quadrant QD = kt & 3 of every step is a compile-time constant: qh (shared
+// by the 4 quadrants of a half) and d are loaded at QD 0 only, ql at QD 0 (reused by QD 2, the high nibbles)
+// and QD 1 (reused by QD 3); only the sub-block scale byte is loaded every step. 11 instead of 24 weight
+// load instructions per 4 steps. Out-of-phase use at the clamped tail only feeds the unused last store.
+    uint rq0[W_PER][GW + 1], rq1[W_PER][GW + 1];
+#define GLOADQ(kt, QD) { \
+    const uint sb = (kt) >> 3, c = (kt) & 7, hf = c >> 2; \
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
+        const uint v = tid + i * NT, g = v % GPR, go = g * 4 * GW; \
+        const uint bb = rbase[i] + sb * 210u; \
+        if ((QD) == 0) { \
+            const uint wl = (bb + hf * 64 + go) >> 2, wh = (bb + 128 + hf * 32 + go) >> 2; \
+            [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rq0[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } \
+            rd[i] = data_au[(bb + 208) >> 2]; \
+        } \
+        if ((QD) == 1) { \
+            const uint wl = (bb + hf * 64 + 32 + go) >> 2; \
+            [[unroll]] for (uint w = 0; w < GW + 1; ++w) rq1[i][w] = data_au[wl + w]; \
+        } \
+        const uint so = bb + 192 + c * 2 + (go >> 4); \
+        rsc[i] = data_au[so >> 2]; \
+        rodd[i] = (so & 3u) << 8; \
+    } \
+    [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+        const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
+        const uint tok = min(n0 + r, p.N - 1); \
+        ry[i] = data_b[tok * kv + (kt) * Y_VR + q]; \
+    } }
+#define SSTOREQ(buf, kt, QD) { \
+    const uint oh = (((kt) >> 3) & 1u) * 16u; \
+    const uint sl = oh + 4 * ((QD) >> 1), sh = oh + 2 * (QD); \
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
+        const uint v = tid + i * NT, row = v / GPR, g = v % GPR; \
+        const float dsc = unpackHalf2x16(rd[i] >> oh).x * float(bitfieldExtract(int(rsc[i]), int(8 * (rodd[i] >> 8)), 8)); \
+        const f16vec2 s = f16vec2(float16_t(dsc)); \
+        [[unroll]] for (uint w = 0; w < GW; ++w) { \
+            const uint l = ((QD) & 1) != 0 ? fsh(rq1[i][w], rq1[i][w + 1], sl) : fsh(rq0[i][w], rq0[i][w + 1], sl); \
+            const uint h = fsh(rqh[i][w], rqh[i][w + 1], sh); \
+            const uint q = (l & 0x0F0F0F0Fu) | ((h << 4) & 0x30303030u); \
+            uint o0, o1; deq4p(q, s, o0, o1); \
+            shW[buf][row * STR + g * 2 * GW + 2 * w] = o0; \
+            shW[buf][row * STR + g * 2 * GW + 2 * w + 1] = o1; \
+        } \
+    } \
+    [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+        const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
+        STORE_Y(buf, r, q, ry[i]) \
+    } }
+#else
 #define SSTORE(buf, kt) { \
     const uint c = (kt) & 7, qd = c & 3; \
     const uint lsh = 4 * (qd >> 1), hsh = 2 * qd; \
@@ -189,6 +267,7 @@ void main() {
         const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
         STORE_Y(buf, r, q, ry[i]) \
     } }
+#endif
 
 #ifdef SPLITK
     // split-K: z-slice kz covers K [kz * k_split, (kz + 1) * k_split) and writes its partial sums to
@@ -201,9 +280,35 @@ void main() {
     const uint nk = p.K / BK;
     const uint dbase = 0;
 #endif
+#ifdef LEANQ
+    GLOADQ(kt0, 0)
+    SSTOREQ(0, kt0, 0)
+    barrier();
+    for (uint k4 = kt0; k4 < nk; k4 += 4) {   // kt0, nk are multiples of 8
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            const uint kn = min(k4 + j + 1, nk - 1);
+            GLOADQ(kn, (j + 1) & 3)
+            [[unroll]] for (uint kk = 0; kk < BK / 16; ++kk) {
+                MAT(float16_t, gl_MatrixUseA) ma[TM];
+                [[unroll]] for (uint i = 0; i < TM; ++i)
+                    coopMatLoad(ma[i], shW[0], (wm * WTM + i * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint jn = 0; jn < TN; ++jn) {
+                    MAT(float16_t, gl_MatrixUseB) mb;
+                    coopMatLoad(mb, shY[0], (wn * WTN + jn * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutColumnMajor);
+                    [[unroll]] for (uint i = 0; i < TM; ++i) acc[jn * TM + i] = coopMatMulAdd(ma[i], mb, acc[jn * TM + i]);
+                }
+            }
+            barrier();
+            SSTOREQ(0, kn, (j + 1) & 3)
+            barrier();
+        }
+    }
+#else
     GLOAD(kt0)
     SSTORE(0, kt0)
-#ifdef PIPE2
+#endif
+#if defined(LEANQ)
+#elif defined(PIPE2)
     // 2-phase software pipeline, one barrier per step: step kt dequantises/stores tile kt+1 (loaded
     // one full step earlier) into the other buffer, then issues the loads for tile kt+2 into the
     // same registers, then runs the WMMAs of tile kt
