@@ -941,6 +941,10 @@ void process_shaders() {
     // register-fed coopmat decode FA (q8_0 K/V), RT = 16-row tiles
     string_to_spv("flash_attn_decode_q8r1", "flash_attn_decode_q8r.comp", {{"RT", "1"}}, true, true);
     string_to_spv("flash_attn_decode_q8r2", "flash_attn_decode_q8r.comp", {{"RT", "2"}}, true, true);
+    string_to_spv("flash_attn_decode_q8v1", "flash_attn_decode_q8v.comp", {{"RT", "1"}}, true, true);
+    string_to_spv("flash_attn_decode_q8v2", "flash_attn_decode_q8v.comp", {{"RT", "2"}}, true, true);
+    string_to_spv("flash_attn_decode_q8w1", "flash_attn_decode_q8w.comp", {{"RT", "1"}}, true, true);
+    string_to_spv("flash_attn_decode_q8w2", "flash_attn_decode_q8w.comp", {{"RT", "2"}}, true, true);
 #endif
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
