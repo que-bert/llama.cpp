@@ -1676,12 +1676,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                static const bool sched_it = getenv("GGML_SCHED_INPUT_TIMING") && atoi(getenv("GGML_SCHED_INPUT_TIMING"));
+                static uint64_t it_n = 0, it_calls = 0; static double it_sync = 0, it_copy = 0, it_bytes = 0;
+                const int64_t it0 = sched_it ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                const int64_t it1 = sched_it ? ggml_time_us() : 0;
+                // user inputs live in host memory: upload them asynchronously on the split backend
+                // (one command stream with the graph) instead of a blocking staging write + fence
+                // per input. The caller must not overwrite the host inputs before the graph has
+                // completed (llama_context synchronizes before set_inputs).
+                // GGML_SCHED_SYNC_INPUT_COPY=1 restores the blocking copy.
+                static const bool sync_input_copy = getenv("GGML_SCHED_SYNC_INPUT_COPY") && atoi(getenv("GGML_SCHED_SYNC_INPUT_COPY"));
+                if (!sync_input_copy && split_backend->iface.set_tensor_async != NULL && input->buffer &&
+                        ggml_backend_buffer_is_host(input->buffer) && input_cpy->buffer && !ggml_backend_buffer_is_host(input_cpy->buffer) &&
+                        ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy)) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
+                if (sched_it) {
+                    it_sync += it1 - it0; it_copy += ggml_time_us() - it1; it_bytes += ggml_nbytes(input); it_n++;
+                    if (input_id == 0) { it_calls++; }
+                    if (it_n >= 10000) {
+                        fprintf(stderr, "GGML_SCHED_INPUT_TIMING inputs %llu (%.2f/split) sync %.1f us copy %.1f us mean bytes %.0f\n",
+                            (unsigned long long) it_n, (double) it_n / std::max<uint64_t>(1, it_calls), it_sync/it_n, it_copy/it_n, it_bytes/it_n);
+                        fflush(stderr);
+                        it_n = 0; it_calls = 0; it_sync = it_copy = it_bytes = 0;
+                    }
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {

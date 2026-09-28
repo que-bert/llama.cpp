@@ -13154,6 +13154,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    ggml_vk_destroy_buffer(ctx->input_staging);
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -13486,6 +13487,39 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
+    // non-pinned source: copy it into the bump staging buffer now and record the device copy,
+    // instead of a blocking sync-staging write + full synchronize per call.
+    // GGML_VK_NO_INPUT_STAGING=1 restores the blocking path.
+    static const bool no_input_staging = getenv("GGML_VK_NO_INPUT_STAGING") && atoi(getenv("GGML_VK_NO_INPUT_STAGING"));
+    static constexpr size_t input_staging_cap = 32u << 20;
+    if (!ret && !no_input_staging) {
+        const size_t staging_size = size * n_copies;
+        const size_t off = (ctx->input_staging_off + 255) & ~(size_t) 255;
+        if (off + staging_size <= input_staging_cap) {
+            if (ctx->input_staging == nullptr) {
+                ctx->input_staging = ggml_vk_create_buffer_check(ctx->device, input_staging_cap,
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            }
+            uint8_t * dst_ptr = (uint8_t *) ctx->input_staging->ptr + off;
+            std::vector<vk::BufferCopy> slices(1);
+            if (size == stride_tensor && size == stride_data) {
+                memcpy(dst_ptr, data, staging_size);
+                slices[0] = vk::BufferCopy{ off, dst_offset, staging_size };
+            } else {
+                slices.resize(n_copies);
+                for (size_t i = 0; i < n_copies; i++) {
+                    memcpy(dst_ptr + i * size, (const uint8_t *) data + i * stride_data, size);
+                    slices[i] = vk::BufferCopy{ off + i * size, dst_offset + i * stride_tensor, size };
+                }
+            }
+            ggml_vk_sync_buffers(nullptr, cpy_ctx);
+            cpy_ctx->s->buffer->buf.copyBuffer(ctx->input_staging->buffer, buf->buffer, slices);
+            ctx->input_staging_off = off + staging_size;
+            return;
+        }
+    }
+
     if (!ret) {
         const size_t staging_size = size * n_copies;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
@@ -13723,6 +13757,9 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+
+    // everything submitted so far has completed: the input staging can be recycled
+    ctx->input_staging_off = 0;
 
     if (vk_st.enabled) {
         const int64_t t1 = vk_step_timing::now();

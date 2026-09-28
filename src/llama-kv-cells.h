@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -31,6 +32,17 @@ struct llama_kv_cell_ext {
     }
 };
 
+// identity of a llama_kv_cells instance: every copy gets a fresh id, so a consumer that caches
+// data derived from the cells (the KQ mask cache) can tell "same object, same history" apart
+// from "copied / restored state"
+struct llama_kv_cells_uid {
+    uint64_t v;
+    static uint64_t next() { static std::atomic<uint64_t> c{1}; return c.fetch_add(1); }
+    llama_kv_cells_uid() : v(next()) {}
+    llama_kv_cells_uid(const llama_kv_cells_uid &) : v(next()) {}
+    llama_kv_cells_uid & operator=(const llama_kv_cells_uid &) { v = next(); return *this; }
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -38,6 +50,7 @@ public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     void reset() {
+        dirty_all();
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
@@ -164,6 +177,7 @@ public:
 
     // set the state of cells [i, i + other.pos.size()) (used for save/restore the state of the cells)
     void set(uint32_t i, const llama_kv_cells & other) {
+        dirty_mark(i); if (!other.pos.empty()) { dirty_mark(i + other.pos.size() - 1); }
         assert(i + other.pos.size() <= pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
@@ -195,6 +209,7 @@ public:
 
     // set the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
     void set(const std::vector<uint32_t> & idxs, const llama_kv_cells & other) {
+        for (const auto idx : idxs) { dirty_mark(idx); }
         assert(idxs.size() == other.pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
@@ -226,6 +241,7 @@ public:
 
     // clear a non-empty cell
     void rm(uint32_t i) {
+        dirty_mark(i);
         assert(i < pos.size());
         assert(pos[i] != -1);
 
@@ -242,6 +258,7 @@ public:
     // note: call only if the cell has seq_id
     // return true if the cell becomes empty
     bool seq_rm(uint32_t i, llama_seq_id seq_id) {
+        dirty_mark(i);
         assert(i < pos.size());
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
@@ -265,6 +282,7 @@ public:
 
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
+        dirty_mark(i);
         assert(i < pos.size());
 
         if (seq[i].test(seq_id)) {
@@ -338,6 +356,7 @@ public:
 
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
+        dirty_mark(i);
         assert(i < pos.size());
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
@@ -420,6 +439,7 @@ public:
     // does not modify "has_shift"
     // note: call only if the cell is empty
     void pos_set(uint32_t i, llama_pos p) {
+        dirty_mark(i);
         assert(i < pos.size());
         assert(pos[i] == -1);
         assert(seq[i].none());
@@ -430,6 +450,7 @@ public:
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
+        dirty_mark(i);
         assert(i < ext.size());
         ext[i] = p;
     }
@@ -438,6 +459,7 @@ public:
     // sets "has_shift" to true
     // note: call only if the cell is not empty
     bool pos_add(uint32_t i, llama_pos d) {
+        dirty_mark(i);
         assert(i < pos.size());
         assert(pos[i] != -1);
 
@@ -467,6 +489,7 @@ public:
     // sets "has_shift" to true
     // note: call only if the cell is not empty
     void pos_div(uint32_t i, int d) {
+        dirty_mark(i);
         assert(i < pos.size());
         assert(pos[i] != -1);
 
@@ -480,6 +503,39 @@ public:
         seq_pos_add(i);
 
         has_shift = true;
+    }
+
+    // --- change tracking (for caches derived from the cell state, e.g. the KQ mask cache) ---
+    // [dirty_lo, dirty_hi) covers every cell modified since the last dirty_clear()
+    uint64_t uid_get() const { return uid.v; }
+    uint32_t dirty_lo_get() const { return dirty_lo; }
+    uint32_t dirty_hi_get() const { return dirty_hi; }
+    void dirty_clear() const { dirty_lo = UINT32_MAX; dirty_hi = 0; }
+
+    // call f(cell) for every cell of seq_id with position in (p_lo, p_hi]
+    template <typename F>
+    void seq_pos_range(llama_seq_id seq_id, llama_pos p_lo, llama_pos p_hi, F && f) const {
+        if (p_hi <= p_lo) {
+            return;
+        }
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.upper_bound({ p_lo, std::numeric_limits<uint32_t>::max() }); it != sp.end() && it->first <= p_hi; ++it) {
+            f(it->second);
+        }
+    }
+
+private:
+    llama_kv_cells_uid uid;
+    mutable uint32_t dirty_lo = 0;
+    mutable uint32_t dirty_hi = UINT32_MAX;
+
+    void dirty_mark(uint32_t i) {
+        dirty_lo = std::min(dirty_lo, i);
+        dirty_hi = std::max(dirty_hi, i + 1);
+    }
+    void dirty_all() {
+        dirty_lo = 0;
+        dirty_hi = UINT32_MAX;
     }
 
 private:
