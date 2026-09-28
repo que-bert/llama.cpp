@@ -1,0 +1,100 @@
+#version 450
+
+// q8_0 K/V cache -> f16 scratch for the RDNA4 prefill FA _v64 variant (flash_attn_prefill_rdna4_v64.comp).
+// Input: contiguous [HS = 256, NH, KV, NS] q8_0 (the cache layout, same assumption as dequant_q8_0_transpose).
+// One workgroup = one (head, 32-kv tile, seq); thread = (kv r in tile, 32-wide d block b).
+//   mode 0 (K): out [NS][NH][KV][256] f16, rows of the tile written as uvec4 (kv >= KV skipped)
+//   mode 1 (V): out [NS][NH][NT][256 d][32 kv] f16, each tile a contiguous 16 KB d-major block, so the FA
+//               kernel stages V with plain uvec4 copies into 64-byte rows. kv >= KV is written as 0.
+// Values are float16_t(d * q) in f32, as in dequant_q8_0.comp.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter { uint NH; uint KV; uint NT; uint mode; } p;
+
+// q8_0 block = f16 d + 32 x int8 = 34 bytes; one (kv, head) row = 8 blocks = 272 bytes = 17 uvec4
+layout(binding = 0) readonly buffer A { uvec4 data_a[]; };
+layout(binding = 1) writeonly buffer D { uvec4 data_d[]; };
+
+shared uvec4 sT[256 * 5];                      // V tile transposed: [d][32 kv halves + 8 pad]
+shared uvec4 sRaw[32 * 17];                    // the tile's 32 raw q8_0 rows
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.x, t = gl_WorkGroupID.y, ns = gl_WorkGroupID.z;   // heads fastest: adjacent WGs read adjacent 272-byte rows
+    const uint NH = p.NH, KV = p.KV;
+    const bool vmode = p.mode != 0;
+
+    // coalesced raw row loads (rows past KV are not read; their values are zeroed below)
+    [[unroll]] for (uint i = 0; i < (32 * 17 + 255) / 256; ++i) {
+        const uint e = tid + 256 * i;
+        if (e < 32 * 17) {
+            const uint rr = e / 17, c = e - rr * 17;
+            const uint kvr = t * 32 + rr;
+            if (kvr < KV) sRaw[e] = data_a[((ns * KV + kvr) * NH + h) * 17 + c];
+        }
+    }
+    barrier();
+
+    // V: lanes vary kv (conflict-free transposed LDS stores); K: lanes vary d block (coalesced row writes)
+    const uint r = vmode ? (tid & 31) : (tid >> 3);
+    const uint b = vmode ? (tid >> 5) : (tid & 7);
+    const uint kv = t * 32 + r;
+
+    f16vec2 v[16];
+    {
+        // block bytes start at r*272 + b*34 (2-byte aligned): 9 dwords, funnel-shifted by 0 or 16 bits
+        const uint off = r * 272 + b * 34;
+        const uint w0 = off >> 2;
+        const uint sh = (off & 2) * 8;
+        uint x[10];
+        [[unroll]] for (uint k = 0; k < 10; ++k) {
+            const uint wi = min(w0 + k, 32 * 68 - 1);
+            x[k] = sRaw[wi >> 2][wi & 3];
+        }
+        uint y[9];
+        [[unroll]] for (uint k = 0; k < 9; ++k) y[k] = sh == 0 ? x[k] : ((x[k] >> 16) | (x[k + 1] << 16));
+        const float d = kv < KV ? float(unpackFloat2x16(y[0]).x) : 0.0;
+        [[unroll]] for (uint k = 0; k < 8; ++k) {
+            const uint q = (y[k] >> 16) | (y[k + 1] << 16);   // qs bytes 4k .. 4k+3
+            const ivec4 qi = ivec4(bitfieldExtract(int(q), 0, 8), bitfieldExtract(int(q), 8, 8),
+                                   bitfieldExtract(int(q), 16, 8), bitfieldExtract(int(q), 24, 8));
+            v[2 * k]     = f16vec2(d * float(qi.x), d * float(qi.y));
+            v[2 * k + 1] = f16vec2(d * float(qi.z), d * float(qi.w));
+        }
+    }
+
+    if (!vmode) {
+        if (kv < KV) {
+            const uint o = ((ns * NH + h) * KV + kv) * 32 + b * 4;
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                data_d[o + c] = uvec4(packFloat2x16(v[4 * c]), packFloat2x16(v[4 * c + 1]),
+                                      packFloat2x16(v[4 * c + 2]), packFloat2x16(v[4 * c + 3]));
+            }
+        }
+        return;
+    }
+
+    // V: transpose through LDS, row d = kv 0..31 as halves (5 uvec4 per row, 4 used). Lanes r, r^1 own
+    // one dword of rows d0 = 32b + 2i and d0 + 1: the even lane stores row d0, the odd lane row d0 + 1.
+    [[unroll]] for (uint i = 0; i < 16; ++i) {
+        const uint d0 = 32 * b + 2 * i;
+        const bool odd = (r & 1) != 0;
+        const uint m = packFloat2x16(v[i]);
+        const uint o = subgroupShuffleXor(m, 1);
+        const uint w = odd ? ((o >> 16) | (m & 0xFFFF0000u)) : ((m & 0xFFFFu) | (o << 16));
+        const uint idx = (d0 + (odd ? 1 : 0)) * 20 + (r >> 1);
+        sT[idx >> 2][idx & 3] = w;
+    }
+    barrier();
+    const uint obase = ((ns * NH + h) * p.NT + t) * 1024;
+    [[unroll]] for (uint q = 0; q < 4; ++q) {
+        const uint e = tid + 256 * q;
+        data_d[obase + e] = sT[(e >> 2) * 5 + (e & 3)];
+    }
+}
