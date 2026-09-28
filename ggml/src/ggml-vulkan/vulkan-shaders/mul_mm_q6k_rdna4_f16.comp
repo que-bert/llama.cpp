@@ -67,6 +67,21 @@ layout(constant_id = 1) const uint DIAG = 0;
 #endif
 shared uint shW[NBUF][BM * STR];
 shared uint shY[NBUF][BN * STR];
+#ifdef STAGE
+// raw Q6_K staging (STAGE: implies UPAR + LEANQ, 128x128, 256 threads): per 4 K steps (one half hf of a super-block)
+// every weight row's raw bytes are copied cooperatively into LDS, 16 B per lane, lane-consecutive, from the dword
+// floor of the (2-byte-aligned, parity-uniform) block start ("window" dwords, shifted by 2 bytes when sb is odd):
+//   shR[row * 7 + 0..3] = ql window dwords 16 hf + [0, 16), shR[row * 7 + 4..5] = qh 32 + 8 hf + [0, 8),
+//   shR[row * 7 + 6] = sc dwords 48..51; shX[row] / shX[128 + row] / shX[256 + row] = the funnel-shift dwords
+//   16 hf + 16, 40 + 8 hf and dword 52 (d, and the last two scales of an odd block).
+// 14 KB + 1.5 KB (+ 18 KB f16 tiles = 33.9 KB: 3 workgroups per 128 KB WGP).
+// Bank map (64 x 4 B): staging stores are one linear run -> conflict-free; the dequant item is row = tid % 128,
+// so a 16-lane b128 phase reads 16 consecutive rows at dword 28 r + const, and 7 r mod 16 is a bijection ->
+// conflict-free; the b32 reads of shX / .x are lane-consecutive rows (stride 1 / 28 dwords) -> 1- / 4-way.
+#define SRS 7
+shared uvec4 shR[BM * SRS];
+shared uint shX[3 * BM];
+#endif
 
 #ifdef Y_F32
 #define STORE_Y(buf, r, q, YV) { const uint o = (r) * STR + (q) * 2; \
@@ -280,7 +295,117 @@ void main() {
     const uint nk = p.K / BK;
     const uint dbase = 0;
 #endif
-#ifdef LEANQ
+#if defined(STAGE)
+#if SG != 64 || NT != 256 || BM != 128 || BN != 128 || !defined(UPAR) || !defined(SINGLE_BUF)
+#error "STAGE: 128x128 tiles, 256 threads, UPAR, SINGLE_BUF only"
+#endif
+#ifdef GLU
+#define ROWB(row) (((row) < BM / 2 ? p.batch_stride_a : p.batch_stride_b) + (mg0 + (row) % (BM / 2)) * nsb * 210u)
+#else
+#define ROWB(row) ((m0 + (row)) * nsb * 210u)
+#endif
+    // staging items: chunk f = tid + i * NT of the 128 x 7 tile (row f / 7, piece f % 7) and extra dword
+    // e = tid + i * NT of 3 x 128; loads clamped and unconditional, out-of-range stores (waves 2-3) skipped.
+    // window dword of a piece = floor(row byte base + sb * 210) / 4 + off + hf * hmul
+#define SCH 4
+#define SXH 2
+    uint sbase[SCH], soff[SCH], xbase[SXH], xoff[SXH];
+    [[unroll]] for (uint i = 0; i < SCH; ++i) {
+        const uint f = min(tid + i * NT, BM * SRS - 1), pc = f % SRS;
+        sbase[i] = ROWB(f / SRS);
+        soff[i] = pc < 4 ? (4 * pc) | (16u << 8) : pc < 6 ? (32 + 4 * (pc - 4)) | (8u << 8) : 48u;
+    }
+    [[unroll]] for (uint i = 0; i < SXH; ++i) {
+        const uint e = min(tid + i * NT, 3 * BM - 1), wh = e / BM;
+        xbase[i] = ROWB(e % BM);
+        xoff[i] = wh == 0 ? 16u | (16u << 8) : wh == 1 ? 40u | (8u << 8) : 52u;
+    }
+    // dequant item: row tid % 128, 16-value group tid / 128, derived from the subgroup id so the compiler sees
+    // dg as uniform (a tid-derived dg turns the dg selects into divergent branches around LDS loads)
+    const uint dg = gl_SubgroupID >> 1, drow = ((gl_SubgroupID & 1u) << 6) | gl_SubgroupInvocationID;
+    uvec4 rs[SCH];
+    uint rx[SXH];
+    uvec4 rl, rh, rsc4;
+    uint rl4, rh4, rd2;
+#define SGLOAD(h) { const uint so_ = ((h) >> 1) * 210u, hf_ = (h) & 1u; \
+    [[unroll]] for (uint i = 0; i < SCH; ++i) { \
+        const uint w = ((sbase[i] + so_) >> 2) + (soff[i] & 0xFFu) + hf_ * (soff[i] >> 8); \
+        rs[i] = uvec4(data_au[w], data_au[w + 1], data_au[w + 2], data_au[w + 3]); } \
+    [[unroll]] for (uint i = 0; i < SXH; ++i) \
+        rx[i] = data_au[((xbase[i] + so_) >> 2) + (xoff[i] & 0xFFu) + hf_ * (xoff[i] >> 8)]; }
+#define SSTORER() { \
+    [[unroll]] for (uint i = 0; i < SCH; ++i) if (tid + i * NT < BM * SRS) shR[tid + i * NT] = rs[i]; \
+    [[unroll]] for (uint i = 0; i < SXH; ++i) if (tid + i * NT < 3 * BM) shX[tid + i * NT] = rx[i]; }
+    // raw LDS -> registers for quadrant QD (compile-time: the loop is unrolled by 4)
+#define SRLOAD(QD) { \
+    const uint rr = drow * SRS, li = ((QD) & 1) * 2 + dg; \
+    rl = shR[rr + li]; \
+    rl4 = (((QD) & 1) != 0 && dg != 0) ? shX[drow] : shR[rr + li + 1].x; \
+    rh = shR[rr + 4 + dg]; \
+    rh4 = dg != 0 ? shX[BM + drow] : shR[rr + 5].x; \
+    rsc4 = shR[rr + 6]; \
+    rd2 = shX[2 * BM + drow]; }
+#define SDEQ(kt, QD) { \
+    const uint c_ = (kt) & 7, oh = (((kt) >> 3) & 1u) * 16u; \
+    const uint sl = oh + 4 * ((QD) >> 1), sh = oh + 2 * (QD); \
+    /* scale byte: window byte 192 + 2c + 2par + g -> dword 48 + ci (ci = 4: dword 52, odd block, c = 7) */ \
+    const uint e = 2 * c_ + (oh >> 3), ci = e >> 2; \
+    const uint scw = ci == 0 ? rsc4.x : ci == 1 ? rsc4.y : ci == 2 ? rsc4.z : ci == 3 ? rsc4.w : rd2; \
+    const float dsc = unpackHalf2x16(rd2 >> oh).x * float(bitfieldExtract(int(scw), int(8 * ((e & 3) + dg)), 8)); \
+    const f16vec2 s = f16vec2(float16_t(dsc)); \
+    const uint ql5[5] = uint[5](rl.x, rl.y, rl.z, rl.w, rl4); \
+    const uint qh5[5] = uint[5](rh.x, rh.y, rh.z, rh.w, rh4); \
+    [[unroll]] for (uint w = 0; w < 4; ++w) { \
+        const uint l = fsh(ql5[w], ql5[w + 1], sl); \
+        const uint h = fsh(qh5[w], qh5[w + 1], sh); \
+        const uint q = (l & 0x0F0F0F0Fu) | ((h << 4) & 0x30303030u); \
+        uint o0, o1; deq4p(q, s, o0, o1); \
+        shW[0][drow * STR + dg * 8 + 2 * w] = o0; \
+        shW[0][drow * STR + dg * 8 + 2 * w + 1] = o1; \
+    } }
+#define SYLOAD(kt) [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+    const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
+    ry[i] = data_b[min(n0 + r, p.N - 1) * kv + (kt) * Y_VR + q]; }
+#define SYSTORE() [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+    const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; STORE_Y(0, r, q, ry[i]) }
+
+    // pipeline over halves h = kt / 4: raw half H+1 is loaded to registers at the step whose kn starts half H
+    // (3 steps of latency), written to LDS between the two barriers of the step kn = 4H + 3 (after every wave
+    // has read its step-(4H+3) raw data), and read from the next step on. The raw read precedes the WMMAs.
+    const uint hl = (nk - 1) >> 2;
+    SGLOAD(kt0 >> 2)
+    SYLOAD(kt0)
+    SSTORER()
+    barrier();
+    SRLOAD(0)
+    SDEQ(kt0, 0)
+    SYSTORE()
+    SGLOAD(min((kt0 >> 2) + 1, hl))
+    barrier();
+    for (uint k4 = kt0; k4 < nk; k4 += 4) {   // kt0, nk are multiples of 8
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            const uint kn = min(k4 + j + 1, nk - 1);
+            SRLOAD((j + 1) & 3)
+            SYLOAD(kn)
+            if (j == 3) SGLOAD(min((k4 >> 2) + 2, hl))
+            [[unroll]] for (uint kk = 0; kk < BK / 16; ++kk) {
+                MAT(float16_t, gl_MatrixUseA) ma[TM];
+                [[unroll]] for (uint i = 0; i < TM; ++i)
+                    coopMatLoad(ma[i], shW[0], (wm * WTM + i * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint jn = 0; jn < TN; ++jn) {
+                    MAT(float16_t, gl_MatrixUseB) mb;
+                    coopMatLoad(mb, shY[0], (wn * WTN + jn * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutColumnMajor);
+                    [[unroll]] for (uint i = 0; i < TM; ++i) acc[jn * TM + i] = coopMatMulAdd(ma[i], mb, acc[jn * TM + i]);
+                }
+            }
+            barrier();
+            if (j == 2) SSTORER()
+            SDEQ(kn, (j + 1) & 3)
+            SYSTORE()
+            barrier();
+        }
+    }
+#elif defined(LEANQ)
     GLOADQ(kt0, 0)
     SSTOREQ(0, kt0, 0)
     barrier();
