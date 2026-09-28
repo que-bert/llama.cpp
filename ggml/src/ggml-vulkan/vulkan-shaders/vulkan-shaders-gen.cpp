@@ -931,6 +931,7 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_prefill_rdna4", "flash_attn_prefill_rdna4.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_prefill_rdna4_vt", "flash_attn_prefill_rdna4_vt.comp", {}, true, true, false, false);
+    string_to_spv("flash_attn_prefill_rdna4_rs", "flash_attn_prefill_rdna4_rs.comp", {}, true, true, false, false);
 #endif
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
