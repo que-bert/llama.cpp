@@ -100,6 +100,9 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// evaluate a multi-token MTP draft ubatch as a device-side chain of 1-token steps (see llama_cparams::mtp_chain)
+LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

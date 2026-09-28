@@ -1263,6 +1263,26 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_prefix(const slot_info & sinfo, uint32_t n) const {
+    uint32_t result = 0;
+
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+        const auto & idxs  = sinfo.idxs[s];
+
+        std::vector<uint32_t> ex;
+        if (n < idxs.size()) {
+            ex.assign(idxs.begin() + n, idxs.end());
+        }
+
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1_excl(ex), n_pad_cur))), result);
+    }
+
+    return result;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -2892,6 +2912,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_cur];
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_prefix(uint32_t n) const {
+    return kv->get_n_kv_prefix(sinfos[i_cur], n);
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {

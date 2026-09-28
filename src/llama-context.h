@@ -120,6 +120,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_chain(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -390,6 +391,7 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    bool last_graph_mtp_chain = false; // the cached graph was built in MTP chain mode
 
     // perf
     mutable int64_t t_start_us  = 0;

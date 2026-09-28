@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <atomic>
 #include <bitset>
 #include <cassert>
@@ -109,6 +110,16 @@ public:
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
         return used.empty() ? 0 : *used.rbegin() + 1;
+    }
+
+    // used_max_p1() as if the cells in `ex` were not used
+    uint32_t used_max_p1_excl(const std::vector<uint32_t> & ex) const {
+        for (auto it = used.rbegin(); it != used.rend(); ++it) {
+            if (std::find(ex.begin(), ex.end(), *it) == ex.end()) {
+                return *it + 1;
+            }
+        }
+        return 0;
     }
 
     bool get_has_shift() const {
