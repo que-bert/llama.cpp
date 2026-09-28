@@ -1633,10 +1633,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // device-side draft chain: all n_max draft steps in one graph/submit, step k+1 fed from step k's
         // argmax on the GPU (the draft token is cur_p->data[0], i.e. the top-1 logit). Identical drafts
-        // to the loop below; LLAMA_NO_MTP_GPU_CHAIN=1 disables.
+        // to the loop below. Opt-in (LLAMA_MTP_GPU_CHAIN=1): with the token embeddings on the host the
+        // argmax -> get_rows(tok_embd) hop splits the graph into GPU/CPU/GPU segments with a sync at each
+        // boundary, measured slower than the host loop at 176k (R7). Needs a device copy of tok_embd.
         static const bool no_gpu_chain = [] {
-            const char * e = getenv("LLAMA_NO_MTP_GPU_CHAIN");
-            return e && atoi(e) != 0;
+            const char * e = getenv("LLAMA_MTP_GPU_CHAIN");
+            return !(e && atoi(e) != 0);
         }();
         if (!no_gpu_chain && !chain_heads && !is_mem_shared && n_drafting == 1 && params.n_max > 1 && params.p_min <= 0.0f) {
             llama_seq_id seq_id = 0;
@@ -2558,8 +2560,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     {
         const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-        const char * e = getenv("LLAMA_NO_MTP_GPU_CHAIN");
-        if (has_mtp && !(e && atoi(e) != 0) && params_spec.n_max > 1) {
+        const char * e = getenv("LLAMA_MTP_GPU_CHAIN");
+        if (has_mtp && (e && atoi(e) != 0) && params_spec.n_max > 1) {
             result.n_outputs_max = params.n_parallel * params_spec.n_max;
             result.n_outputs_max_per_seq = params_spec.n_max;
         }
