@@ -1013,6 +1013,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     // RDNA4 GQA-packed prefill FA (flash_attn_prefill_rdna4.comp), indexed by gqa ratio 1..6
     vk_pipeline pipeline_fa_prefill_rdna4[7];
+    // same, V staged transposed in LDS (flash_attn_prefill_rdna4_vt.comp); GGML_VK_NO_FA_PREFILL_RDNA4_VT=1 disables
+    vk_pipeline pipeline_fa_prefill_rdna4_vt[7];
     vk_pipeline pipeline_count_experts;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
