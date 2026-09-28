@@ -212,6 +212,9 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    // same as get_text_tokens(), but reuses the capacity of `out` (no per-call allocation / page faults)
+    void get_text_tokens(llama_tokens & out) const;
+
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 
