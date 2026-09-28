@@ -1,4 +1,6 @@
 #include "ggml-vulkan-common.h"
+#include <chrono>
+#include <map>
 
 namespace {
 inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
@@ -334,6 +336,44 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
                                         VkDeviceSize{ctx->device->properties.limits.maxStorageBufferRange});
     return range;
 }
+
+// GGML_VK_STEP_TIMING=1: host-side timeline of graph_compute / synchronize, aggregated
+// per graph size (n_nodes) and printed to stderr every GGML_VK_STEP_TIMING_N graphs.
+// Diagnostic only; zero cost when unset.
+struct vk_step_timing {
+    struct agg { uint64_t cnt = 0; double gap = 0, pre = 0, rec = 0, wait = 0, sync = 0, nsub = 0; uint64_t late = 0; };
+    bool enabled = false;
+    int  every   = 2000;
+    int  n       = 0;
+    int64_t t_last_exit = 0;   // last time the host left a blocking backend call
+    int64_t t_enter = 0, t_first_submit = 0, t_exit = 0;
+    int     cur_nodes = -1;
+    int     cur_nsub = 0;
+    std::map<int, agg> by_nodes;
+    uint64_t n_rd = 0; double t_rd = 0;  // synchronous buffer reads
+    vk_step_timing() {
+        const char * e = getenv("GGML_VK_STEP_TIMING");
+        enabled = e && atoi(e) != 0;
+        const char * n_e = getenv("GGML_VK_STEP_TIMING_N");
+        if (n_e) { every = std::max(1, atoi(n_e)); }
+    }
+    static int64_t now() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void print() {
+        fprintf(stderr, "VK_STEP_TIMING (%d graphs, us/graph): nodes cnt gap(host before) pre(rec before 1st submit) rec(total) wait(fence) sync(total) nsub late%%\n", n);
+        for (auto & kv : by_nodes) {
+            const agg & a = kv.second;
+            const double c = (double) a.cnt;
+            fprintf(stderr, "VK_STEP_TIMING %6d %6llu %8.1f %8.1f %8.1f %8.1f %8.1f %5.1f %5.1f\n", kv.first, (unsigned long long) a.cnt,
+                a.gap/c/1e3, a.pre/c/1e3, a.rec/c/1e3, a.wait/c/1e3, a.sync/c/1e3, a.nsub/c, 100.0*a.late/c);
+        }
+        if (n_rd) { fprintf(stderr, "VK_STEP_TIMING buffer_read cnt %llu mean %.1f us\n", (unsigned long long) n_rd, t_rd/n_rd/1e3); }
+        fflush(stderr);
+        by_nodes.clear(); n = 0; n_rd = 0; t_rd = 0;
+    }
+};
+static vk_step_timing vk_st;
 
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
@@ -13220,6 +13260,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    ggml_vk_destroy_buffer(ctx->input_staging);
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -13552,6 +13593,39 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
+    // non-pinned source: copy it into the bump staging buffer now and record the device copy,
+    // instead of a blocking sync-staging write + full synchronize per call.
+    // Opt-in (GGML_VK_INPUT_STAGING=1): not a measured win yet (see R5 notes).
+    static const bool no_input_staging = !(getenv("GGML_VK_INPUT_STAGING") && atoi(getenv("GGML_VK_INPUT_STAGING")));
+    static constexpr size_t input_staging_cap = 32u << 20;
+    if (!ret && !no_input_staging) {
+        const size_t staging_size = size * n_copies;
+        const size_t off = (ctx->input_staging_off + 255) & ~(size_t) 255;
+        if (off + staging_size <= input_staging_cap) {
+            if (ctx->input_staging == nullptr) {
+                ctx->input_staging = ggml_vk_create_buffer_check(ctx->device, input_staging_cap,
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            }
+            uint8_t * dst_ptr = (uint8_t *) ctx->input_staging->ptr + off;
+            std::vector<vk::BufferCopy> slices(1);
+            if (size == stride_tensor && size == stride_data) {
+                memcpy(dst_ptr, data, staging_size);
+                slices[0] = vk::BufferCopy{ off, dst_offset, staging_size };
+            } else {
+                slices.resize(n_copies);
+                for (size_t i = 0; i < n_copies; i++) {
+                    memcpy(dst_ptr + i * size, (const uint8_t *) data + i * stride_data, size);
+                    slices[i] = vk::BufferCopy{ off + i * size, dst_offset + i * stride_tensor, size };
+                }
+            }
+            ggml_vk_sync_buffers(nullptr, cpy_ctx);
+            cpy_ctx->s->buffer->buf.copyBuffer(ctx->input_staging->buffer, buf->buffer, slices);
+            ctx->input_staging_off = off + staging_size;
+            return;
+        }
+    }
+
     if (!ret) {
         const size_t staging_size = size * n_copies;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
@@ -13718,6 +13792,8 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
 void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+    const int64_t st_t0 = vk_st.enabled ? vk_step_timing::now() : 0;
+    int64_t st_wait = 0;
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
@@ -13770,7 +13846,9 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
         if (!ctx->device->serialize_submissions) {
+            const int64_t tw0 = vk_st.enabled ? vk_step_timing::now() : 0;
             ggml_vk_wait_for_fence(ctx);
+            if (vk_st.enabled) { st_wait = vk_step_timing::now() - tw0; }
         }
         ctx->submit_pending = false;
         if (cmd_buf) {
@@ -13784,6 +13862,27 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
         ctx->compute_ctx.reset();
+    }
+
+    // everything submitted so far has completed: the input staging can be recycled
+    ctx->input_staging_off = 0;
+
+    if (vk_st.enabled) {
+        const int64_t t1 = vk_step_timing::now();
+        if (vk_st.cur_nodes >= 0) {
+            auto & a = vk_st.by_nodes[vk_st.cur_nodes];
+            a.cnt++;
+            a.gap  += vk_st.t_last_exit ? (double) (vk_st.t_enter - vk_st.t_last_exit) : 0.0;
+            a.pre  += vk_st.t_first_submit ? (double) (vk_st.t_first_submit - vk_st.t_enter) : (double) (vk_st.t_exit - vk_st.t_enter);
+            a.rec  += (double) (vk_st.t_exit - vk_st.t_enter);
+            a.wait += (double) st_wait;
+            a.sync += (double) (t1 - st_t0);
+            a.nsub += vk_st.cur_nsub;
+            a.late += st_wait < 20000 ? 1 : 0;
+            vk_st.cur_nodes = -1;
+            if (++vk_st.n >= vk_st.every) { vk_st.print(); }
+        }
+        vk_st.t_last_exit = t1;
     }
 }
 
@@ -14544,6 +14643,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
+    if (vk_st.enabled) {
+        const int64_t t = vk_step_timing::now();
+        if (vk_st.cur_nodes >= 0) {
+            // previous graph was never synchronized: record it under -n_nodes
+            auto & a = vk_st.by_nodes[-vk_st.cur_nodes];
+            a.cnt++;
+            a.gap += vk_st.t_last_exit ? (double) (vk_st.t_enter - vk_st.t_last_exit) : 0.0;
+            a.rec += (double) (vk_st.t_exit - vk_st.t_enter);
+            a.nsub += vk_st.cur_nsub;
+            vk_st.t_last_exit = vk_st.t_exit;
+        }
+        vk_st.t_enter = t;
+        vk_st.t_first_submit = 0;
+        vk_st.cur_nodes = cgraph->n_nodes;
+        vk_st.cur_nsub = 0;
+    }
+
     int last_node = cgraph->n_nodes - 1;
 
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
@@ -14642,6 +14758,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->device->diag_cgraph = cgraph;
             ctx->device->diag_prev_start = start;
             ctx->device->diag_prev_end = end;
+        }
+        if (vk_st.enabled) {
+            if (vk_st.cur_nsub == 0) { vk_st.t_first_submit = vk_step_timing::now(); }
+            vk_st.cur_nsub++;
         }
         first_node_in_batch = true;
         submitted_nodes = 0;
@@ -15008,6 +15128,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    if (vk_st.enabled) {
+        vk_st.t_exit = vk_step_timing::now();
     }
 
     if (!ctx->device->support_async) {

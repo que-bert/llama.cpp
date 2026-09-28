@@ -1741,6 +1741,140 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+template<typename T, typename C>
+static void kq_mask_cached_fill(const llama_kv_cells & cells, llama_seq_id seq_id, const llama_ubatch * ubatch,
+        int64_t n_kv, C & c, bool reuse, T * dst) {
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+
+    const bool is_2d = ubatch->is_pos_2d();
+    const int64_t n_tok = ubatch->n_tokens;
+
+    // M-RoPE: at equal positions the 2D coordinates decide (same rule as set_input_kq_mask_impl)
+    auto px_of = [&](int64_t i) -> llama_pos { return is_2d ? ubatch->pos[i + n_tok*2] : 0; };
+    auto py_of = [&](int64_t i) -> llama_pos { return is_2d ? ubatch->pos[i + n_tok]   : 0; };
+
+    const llama_pos p1   = ubatch->pos[0];
+    const llama_pos p1_x = px_of(0);
+    const llama_pos p1_y = py_of(0);
+
+    auto eval = [&](uint32_t j, llama_pos pp, llama_pos pp_x, llama_pos pp_y) -> T {
+        if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+            return mask_drop;
+        }
+        const llama_pos p0 = cells.pos_get(j);
+        if (p0 > pp) {
+            return mask_drop;
+        }
+        if (is_2d && p0 == pp && cells.ext_get(j).is_2d_gt(pp_x, pp_y)) {
+            return mask_drop;
+        }
+        return mask_keep;
+    };
+
+    const int64_t n_old = reuse ? (int64_t) (c.row.size() / sizeof(T)) : 0;
+    c.row.resize((size_t) n_kv * sizeof(T));
+    T * row = (T *) c.row.data();
+
+    if (!reuse) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            row[j] = eval((uint32_t) j, p1, p1_x, p1_y);
+        }
+    } else {
+        // newly exposed columns
+        for (int64_t j = n_old; j < n_kv; ++j) {
+            row[j] = eval((uint32_t) j, p1, p1_x, p1_y);
+        }
+        // cells modified since the cache was filled
+        const int64_t lo = cells.dirty_lo_get();
+        const int64_t hi = std::min<int64_t>(cells.dirty_hi_get(), std::min<int64_t>(n_kv, n_old));
+        for (int64_t j = lo; j < hi; ++j) {
+            row[j] = eval((uint32_t) j, p1, p1_x, p1_y);
+        }
+        // unmodified cells whose visibility can differ between the cached and the new query
+        // position: positions in [min, max] (inclusive: equal positions depend on the 2D coords)
+        cells.seq_pos_range(seq_id, std::min(c.p1, p1) - 1, std::max(c.p1, p1), [&](uint32_t j) {
+            if ((int64_t) j < n_kv) {
+                row[j] = eval(j, p1, p1_x, p1_y);
+            }
+        });
+    }
+
+    c.p1 = p1;
+    cells.dirty_clear();
+
+    // rows: row 0 as cached, then patch the (p1_0, p1_i] / (p1_i, p1_0] position window
+    const int64_t n_tokens = ubatch->n_tokens;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        T * out = dst + i*n_kv;
+        std::memcpy(out, row, (size_t) n_kv * sizeof(T));
+        if (i == 0) {
+            continue;
+        }
+        const llama_pos pi   = ubatch->pos[i];
+        const llama_pos pi_x = px_of(i);
+        const llama_pos pi_y = py_of(i);
+        cells.seq_pos_range(seq_id, std::min(p1, pi) - 1, std::max(p1, pi), [&](uint32_t j) {
+            if ((int64_t) j < n_kv) {
+                out[j] = eval(j, pi, pi_x, pi_y);
+            }
+        });
+    }
+}
+
+bool llama_kv_cache::set_input_kq_mask_cached(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    static const bool disabled = [] {
+        const char * e = getenv("LLAMA_NO_KQ_MASK_CACHE");
+        return e && atoi(e) != 0;
+    }();
+    if (disabled) {
+        return false;
+    }
+    if (swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi || ubatch->n_tokens == 0) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // cells shared with another cache: another consumer could clear the dirty range
+    if (v_cells_impl.use_count() > 1 || other != nullptr) {
+        return false;
+    }
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tokens = ubatch->n_tokens;
+    if (dst->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[1] != n_tokens) {
+        return false;
+    }
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        if (ubatch->n_seq_id[i] != 1 || ubatch->seq_id[i][0] != seq_id) {
+            return false;
+        }
+    }
+    const uint32_t stream = seq_to_stream[seq_id];
+    const auto & cells = v_cells[stream];
+    if ((int64_t) cells.size() < n_kv) {
+        return false;
+    }
+
+    auto & c = kqm_cache;
+    const bool reuse = c.valid && c.cells_uid == cells.uid_get() && c.stream == stream && c.seq_id == seq_id && c.type == dst->type;
+
+    if (dst->type == GGML_TYPE_F16) {
+        kq_mask_cached_fill<ggml_fp16_t>(cells, seq_id, ubatch, n_kv, c, reuse, (ggml_fp16_t *) dst->data);
+    } else {
+        kq_mask_cached_fill<float>(cells, seq_id, ubatch, n_kv, c, reuse, (float *) dst->data);
+    }
+
+    c.valid     = true;
+    c.cells_uid = cells.uid_get();
+    c.stream    = stream;
+    c.seq_id    = seq_id;
+    c.type      = dst->type;
+
+    return true;
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -1773,6 +1907,28 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
     };
+
+    if (causal_attn && set_input_kq_mask_cached(dst, ubatch)) {
+        // LLAMA_KQ_MASK_VERIFY=1: recompute with the full fill and require bit-identity
+        static const bool verify = getenv("LLAMA_KQ_MASK_VERIFY") && atoi(getenv("LLAMA_KQ_MASK_VERIFY"));
+        if (verify) {
+            static uint64_t n_checked = 0;
+            std::vector<uint8_t> ref(ggml_nbytes(dst));
+            if (dst->type == GGML_TYPE_F16) {
+                set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) ref.data(), causal_attn);
+            } else {
+                set_input_kq_mask_impl<float>(args, (float *) ref.data(), causal_attn);
+            }
+            if (memcmp(ref.data(), dst->data, ref.size()) != 0) {
+                GGML_ABORT("KQ mask cache mismatch (n_kv=%lld n_tokens=%u pos0=%d)", (long long) n_kv, n_tokens, ubatch->pos[0]);
+            }
+            if (++n_checked % 100 == 1) {
+                fprintf(stderr, "%s: KQ mask cache verified %llu fills (n_kv=%lld n_tokens=%u)\n", __func__, (unsigned long long) n_checked, (long long) n_kv, n_tokens);
+            }
+        }
+        return;
+    }
+    kqm_cache.valid = false;
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);

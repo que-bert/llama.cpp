@@ -18,6 +18,9 @@
 
 #include <cassert>
 #include <cmath>
+#include <chrono>
+#include <map>
+#include <typeinfo>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1353,9 +1356,36 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// LLAMA_INPUT_TIMING=1: per-input-type set_input cost (diagnostic), printed every 2000 graphs
+namespace {
+struct llm_input_timing {
+    bool enabled = false; int n = 0;
+    std::map<std::string, std::pair<uint64_t, double>> by;
+    llm_input_timing() { const char * e = getenv("LLAMA_INPUT_TIMING"); enabled = e && atoi(e) != 0; }
+};
+llm_input_timing g_lit;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (!g_lit.enabled) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
+    }
     for (auto & input : inputs) {
+        const auto t0 = std::chrono::steady_clock::now();
         input->set_input(ubatch);
+        const double dt = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        auto & e = g_lit.by[std::string(typeid(*input).name()) + " n=" + std::to_string(ubatch->n_tokens)];
+        e.first++; e.second += dt;
+    }
+    if (++g_lit.n >= 400) {
+        for (auto & kv : g_lit.by) {
+            fprintf(stderr, "LLAMA_INPUT_TIMING %-60s cnt %6llu mean %8.1f us\n", kv.first.c_str(), (unsigned long long) kv.second.first, kv.second.second/kv.second.first);
+        }
+        fflush(stderr);
+        g_lit.by.clear(); g_lit.n = 0;
     }
 }
 

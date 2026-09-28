@@ -305,6 +305,23 @@ private:
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
+    // incremental KQ mask: the last first-row mask computed for a single-sequence, causal,
+    // non-SWA, non-ALiBi, non-2D ubatch, patched on the next call for only the cells that
+    // changed (llama_kv_cells dirty range) or whose causal visibility flips between the two
+    // positions. Bit-identical to the full fill. Disable with LLAMA_NO_KQ_MASK_CACHE=1.
+    struct kq_mask_cache {
+        bool        valid = false;
+        uint64_t    cells_uid = 0;
+        uint32_t    stream = 0;
+        llama_seq_id seq_id = -1;
+        ggml_type   type = GGML_TYPE_COUNT;
+        llama_pos   p1 = -1;
+        std::vector<uint8_t> row; // n_kv elements of `type`
+    };
+    mutable kq_mask_cache kqm_cache;
+
+    bool set_input_kq_mask_cached(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 

@@ -1258,6 +1258,10 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // bump-allocated host staging for small async uploads from non-pinned memory (graph inputs);
+    // the data is copied in immediately, the region is recycled at the next ggml_vk_synchronize
+    vk_buffer input_staging;
+    size_t    input_staging_off = 0;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};

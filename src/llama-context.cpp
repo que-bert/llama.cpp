@@ -19,6 +19,55 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <chrono>
+#include <map>
+
+// LLAMA_DECODE_TIMING=1: per-decode host timing (diagnostic), printed every LLAMA_DECODE_TIMING_N decodes.
+namespace {
+struct llama_decode_timing {
+    struct agg { uint64_t cnt = 0, builds = 0; double total = 0, build = 0, inputs = 0, compute = 0, outside = 0; };
+    bool enabled = false; int every = 2000; int n = 0;
+    int64_t t_last_end = 0;
+    double cur_build = 0, cur_inputs = 0, cur_compute = 0; bool cur_built = false;
+    std::map<std::pair<const void *, int>, agg> by;
+    llama_decode_timing() {
+        const char * e = getenv("LLAMA_DECODE_TIMING"); enabled = e && atoi(e) != 0;
+        const char * n_e = getenv("LLAMA_DECODE_TIMING_N"); if (n_e) { every = std::max(1, atoi(n_e)); }
+    }
+    static int64_t now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    void print() {
+        fprintf(stderr, "LLAMA_DECODE_TIMING (%d decodes, us/decode): ctx n_tok cnt built%% total build+alloc set_inputs graph_compute outside(before)\n", n);
+        std::map<const void *, int> ids;
+        for (auto & kv : by) { if (!ids.count(kv.first.first)) { int id = (int) ids.size(); ids[kv.first.first] = id; } }
+        for (auto & kv : by) {
+            const agg & a = kv.second; const double c = (double) a.cnt;
+            fprintf(stderr, "LLAMA_DECODE_TIMING c%d %5d %6llu %5.1f %8.1f %8.1f %8.1f %8.1f %8.1f\n", ids[kv.first.first], kv.first.second,
+                (unsigned long long) a.cnt, 100.0*a.builds/c, a.total/c/1e3, a.build/c/1e3, a.inputs/c/1e3, a.compute/c/1e3, a.outside/c/1e3);
+        }
+        fflush(stderr);
+        by.clear(); n = 0;
+    }
+};
+llama_decode_timing g_ldt;
+struct llama_decode_timing_guard {
+    const void * ctx; int n_tok; int64_t t0;
+    llama_decode_timing_guard(const void * c, int nt) : ctx(c), n_tok(nt), t0(0) {
+        if (!g_ldt.enabled) { return; }
+        t0 = llama_decode_timing::now();
+        g_ldt.cur_build = g_ldt.cur_inputs = g_ldt.cur_compute = 0; g_ldt.cur_built = false;
+    }
+    ~llama_decode_timing_guard() {
+        if (!g_ldt.enabled) { return; }
+        const int64_t t1 = llama_decode_timing::now();
+        auto & a = g_ldt.by[{ctx, n_tok}];
+        a.cnt++; a.builds += g_ldt.cur_built ? 1 : 0;
+        a.total += (double) (t1 - t0); a.build += g_ldt.cur_build; a.inputs += g_ldt.cur_inputs; a.compute += g_ldt.cur_compute;
+        a.outside += g_ldt.t_last_end ? (double) (t0 - g_ldt.t_last_end) : 0.0;
+        g_ldt.t_last_end = t1;
+        if (++g_ldt.n >= g_ldt.every) { g_ldt.print(); }
+    }
+};
+} // namespace
 
 //
 // llama_context
@@ -1354,16 +1403,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    const int64_t ldt_t0 = g_ldt.enabled ? llama_decode_timing::now() : 0;
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
-
+        // on the GPU: the synchronize before set_inputs below covers it.
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
@@ -1391,10 +1436,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        g_ldt.cur_built = true;
     }
+
+    const int64_t ldt_t1 = g_ldt.enabled ? llama_decode_timing::now() : 0;
+    if (g_ldt.enabled) { g_ldt.cur_build += (double) (ldt_t1 - ldt_t0); }
 
     // set the input data for the input tensors
     {
+        // the previous graph may still be running on the device and reading its host inputs
+        // (pipeline parallelism, or the opt-in async input uploads): wait before overwriting them
+        static const bool async_inputs = getenv("GGML_SCHED_ASYNC_INPUT_COPY") && atoi(getenv("GGML_SCHED_ASYNC_INPUT_COPY"));
+        if (cparams.pipeline_parallel || async_inputs) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
@@ -1403,7 +1459,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t ldt_t2 = g_ldt.enabled ? llama_decode_timing::now() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (g_ldt.enabled) {
+        g_ldt.cur_inputs  += (double) (ldt_t2 - ldt_t1);
+        g_ldt.cur_compute += (double) (llama_decode_timing::now() - ldt_t2);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1657,6 +1718,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+    llama_decode_timing_guard ldt_guard(this, batch_inp.n_tokens);
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
