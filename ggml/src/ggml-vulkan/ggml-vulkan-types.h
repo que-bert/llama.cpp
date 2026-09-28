@@ -75,6 +75,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <set>
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include <shared_mutex>
 
@@ -986,6 +987,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_cache[4][2];
+    vk_pipeline pipeline_gdn_conv_state_f32;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1320,6 +1323,19 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_q6k_swiglu {};
+
+    // recurrent-cache fusion (GGML_VK_NO_GDN_CACHE=1 disables): GET_ROWS/CPY nodes whose work is done by
+    // the GATED_DELTA_NET or CONCAT node that owns them. Rebuilt per graph.
+    struct vk_gdn_cache_fuse {
+        const ggml_tensor * cache;      // recurrent cache tensor (read through ids, snapshots written back)
+        const ggml_tensor * ids;        // s_copy_main
+        const ggml_tensor * cpy_dst[4]; // snapshot destinations (views of cache)
+        uint32_t t_off[4];              // concat time offset of each snapshot (CONCAT only)
+        uint32_t n_cpy;
+    };
+    std::unordered_set<const ggml_tensor *> gdn_skip_nodes;
+    std::unordered_map<const ggml_tensor *, vk_gdn_cache_fuse> gdn_cache_fuse;
+    const vk_gdn_cache_fuse * cur_gdn_cache_fuse {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

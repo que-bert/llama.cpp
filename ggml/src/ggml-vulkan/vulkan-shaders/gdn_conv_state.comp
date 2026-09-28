@@ -1,0 +1,72 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Recurrent conv-state update for the GDN layers, one pass:
+//   conv_states = cache[ids[seq]]            (GET_ROWS)
+//   cat         = concat(conv_states, x^T)   (CONCAT along time)
+//   cache[dst_k] = cat[t_off_k .. t_off_k+d) (the n_rs_seq+1 snapshot CPYs)
+// One thread per (channel, seq). A thread reads its channel's d old values of row ids[seq] into
+// registers before storing the same channel of the snapshot rows, and n_seqs == 1, so updating the
+// cache in place has no cross-thread hazard.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint d; uint C; uint n_tok; uint n_seqs;
+    uint s1_nb0; uint s1_nb1; uint s1_nb2;
+    uint in_row_stride;
+    uint cat_nb1; uint cat_nb2;
+    uint n_cpy; uint dst_seq_stride;
+    uvec4 t_off;
+    uvec4 dst_off;
+};
+
+layout(binding = 0)           buffer CacheBuf { float data_cache[]; };
+layout(binding = 1) readonly  buffer IdsBuf   { int   data_ids[];   };
+layout(binding = 2) readonly  buffer XBuf     { float data_x[];     };
+layout(binding = 3) writeonly buffer CatBuf   { float data_cat[];   };
+
+#define MAX_D 8
+
+void main() {
+    const uint c   = gl_GlobalInvocationID.x;
+    const uint seq = gl_WorkGroupID.y;
+    if (c >= C) {
+        return;
+    }
+
+    const uint in_base = uint(data_ids[seq]) * in_row_stride + c * d;
+    float old_v[MAX_D];
+    [[unroll]] for (uint j = 0; j < MAX_D; j++) {
+        // clamped unconditional load (d <= MAX_D, checked on the host)
+        old_v[j] = data_cache[in_base + min(j, d - 1)];
+    }
+
+    const uint cat_base = seq * cat_nb2 + c * cat_nb1;
+    const uint x_base   = seq * s1_nb2 + c * s1_nb1;
+    const uint T = d + n_tok;
+    for (uint t = 0; t < T; t++) {
+        float v;
+        if (t < d) {
+            v = old_v[min(t, MAX_D - 1)];
+        } else {
+            v = data_x[x_base + (t - d) * s1_nb0];
+        }
+        data_cat[cat_base + t] = v;
+    }
+
+    for (uint k = 0; k < n_cpy; k++) {
+        const uint dst_base = dst_off[k] + seq * dst_seq_stride + c * d;
+        for (uint j = 0; j < d; j++) {
+            const uint t = t_off[k] + j;
+            float v;
+            if (t < d) {
+                v = old_v[min(t, MAX_D - 1)];
+            } else {
+                v = data_x[x_base + (t - d) * s1_nb0];
+            }
+            data_cache[dst_base + j] = v;
+        }
+    }
+}

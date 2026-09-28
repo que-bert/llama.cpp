@@ -32,6 +32,13 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+#if GDN_CACHE
+    uint in_row_stride;
+    uint out_off;
+    uint out_seq_stride;
+    uint out_slot_stride;
+    uint n_slots;
+#endif
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -39,7 +46,15 @@ layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
 layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
 layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+#if GDN_CACHE
+// binding 5 is the whole recurrent cache tensor: the state is gathered from row ids[seq] and the
+// snapshots are stored back into it. Each workgroup reads its (head, column) shard before it writes
+// the same shard, and n_seqs == 1, so the in-place update has no cross-workgroup hazard.
+layout(binding = 5)           buffer StateBuf { FLOAT_TYPE data_state[]; };
+layout(binding = 7) readonly  buffer IdsBuf   { int data_ids[]; };
+#else
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+#endif
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
@@ -103,7 +118,11 @@ void main() {
 
     const uint state_size = S_V * S_V;
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
+#if GDN_CACHE
+    const uint state_in_base       = uint(data_ids[seq_id]) * in_row_stride + head_id * state_size;
+#else
     const uint state_in_base       = (seq_id * H + head_id) * state_size;
+#endif
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
@@ -170,6 +189,17 @@ void main() {
 
         attn_off += S_V * H;
 
+#if GDN_CACHE
+        {
+            const int target_slot = int(n_tokens) - 1 - int(t);
+            if (target_slot >= 0 && target_slot < int(n_slots)) {
+                const uint slot_base = out_off + uint(target_slot) * out_slot_stride + seq_id * out_seq_stride + head_id * state_size;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    data_state[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                }
+            }
+        }
+#else
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (target_slot >= 0 && target_slot < int(K)) {
@@ -179,11 +209,15 @@ void main() {
                 }
             }
         }
+#endif
     }
 
+#if !GDN_CACHE
     if (K == 1u) {
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
         }
     }
+
+#endif
 }

@@ -683,6 +683,27 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// GDN with the recurrent-cache gather and snapshot store fused in (gated_delta_net.comp, GDN_CACHE=1)
+struct vk_op_gated_delta_net_cache_push_constants {
+    vk_op_gated_delta_net_push_constants base;
+    uint32_t in_row_stride;   // floats per cache row
+    uint32_t out_off;         // float offset of snapshot slot 0 in the cache binding
+    uint32_t out_seq_stride;  // floats
+    uint32_t out_slot_stride; // floats
+    uint32_t n_slots;
+};
+
+// conv-state gather + concat + K snapshot stores in one pass (gdn_conv_state.comp)
+struct vk_op_gdn_conv_state_push_constants {
+    uint32_t d, C, n_tok, n_seqs;
+    uint32_t s1_nb0, s1_nb1, s1_nb2;
+    uint32_t in_row_stride;
+    uint32_t cat_nb1, cat_nb2;
+    uint32_t n_cpy, dst_seq_stride;
+    uint32_t t_off[4];
+    uint32_t dst_off[4];
+};
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;
