@@ -630,6 +630,7 @@ enum rms_norm_mode {
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
+    RMS_NORM_SCALE,
     RMS_NORM_COUNT,
 };
 
@@ -867,6 +868,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_f32;
     vk_pipeline pipeline_rms_norm_small_f32;      // BLOCK_SIZE 128, ne00 <= 128
     vk_pipeline pipeline_rms_norm_mul_small_f32;
+    vk_pipeline pipeline_rms_norm_scale_f32;        // rms_norm -> scale fused
+    vk_pipeline pipeline_rms_norm_scale_small_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;

@@ -136,7 +136,14 @@ void rms_norm(uint num_iters) {
             if (col >= ncols) {
                 continue;
             }
+#if RMS_NORM_SCALE_FUSION
+            // rms_norm followed by ggml_scale (bias 0): same two roundings as
+            // the separate ops, so the result is bit-identical.
+            const FLOAT_TYPE normed = scale * FLOAT_TYPE(data_a[a_offset + col]);
+            data_d[d_offset + col] = D_TYPE(normed * FLOAT_TYPE(p.param2));
+#else
             data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+#endif
         }
     }
 #if RMS_NORM_ROPE_FUSION

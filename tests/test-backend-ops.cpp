@@ -3730,6 +3730,45 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// GGML_OP_RMS_NORM -> GGML_OP_SCALE (the gated-delta-net l2 norm of q/k,
+// build_gdn_l2_norm), optionally over a strided view like the conv output.
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool view;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, view);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 16, 4, 1}, bool view = false)
+        : ne(ne), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const float n = ne[0];
+        ggml_tensor * a;
+        if (view) {
+            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * ne[1] * 3, ne[2], ne[3], 1);
+            ggml_set_param(big);
+            ggml_set_name(big, "big");
+            a = ggml_view_3d(ctx, big, ne[0], ne[1], ne[2], ne[0] * sizeof(float), big->nb[1], ne[0] * ne[1] * sizeof(float));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+        }
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, a, 1e-6f / n), 1.0f / sqrtf(n));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9758,6 +9797,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
     }
 
+    for (bool view : { false, true }) {
+        test_cases.emplace_back(new test_rms_norm_scale({ 128, 16, 4, 1 }, view));
+        test_cases.emplace_back(new test_rms_norm_scale({ 128, 16, 1, 1 }, view));
+        test_cases.emplace_back(new test_rms_norm_scale({ 600, 5, 3, 1 }, view));
+    }
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
