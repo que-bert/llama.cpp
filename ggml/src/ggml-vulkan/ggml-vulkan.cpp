@@ -3258,6 +3258,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_vt[g], "flash_attn_prefill_rdna4_vt_g" + std::to_string(g),
                                          flash_attn_prefill_rdna4_vt_cm1_len, flash_attn_prefill_rdna4_vt_cm1_data, "main", 5,
                                          sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                // softmax in registers on the S^T accumulator (gfx12 lane layout); GGML_VK_NO_FA_PREFILL_RDNA4_RS=1 disables
+                if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_RS") == nullptr) {
+                    ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_rs[g], "flash_attn_prefill_rdna4_rs_g" + std::to_string(g),
+                                             flash_attn_prefill_rdna4_rs_cm1_len, flash_attn_prefill_rdna4_rs_cm1_data, "main", 5,
+                                             sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                }
             }
         }
     }
@@ -8387,7 +8393,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             (nbq1 % 16) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
             ggml_is_contiguous(dst);
         if (use_prefill_rdna4) {
-            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_vt[G] != nullptr ? ctx->device->pipeline_fa_prefill_rdna4_vt[G]
+            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_rs[G] != nullptr ? ctx->device->pipeline_fa_prefill_rdna4_rs[G]
+                           : ctx->device->pipeline_fa_prefill_rdna4_vt[G] != nullptr ? ctx->device->pipeline_fa_prefill_rdna4_vt[G]
                                                                                     : ctx->device->pipeline_fa_prefill_rdna4[G];
             ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
 
