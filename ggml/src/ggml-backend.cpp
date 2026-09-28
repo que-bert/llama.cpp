@@ -1689,8 +1689,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // (one command stream with the graph) instead of a blocking staging write + fence
                 // per input. The caller must not overwrite the host inputs before the graph has
                 // completed (llama_context synchronizes before set_inputs).
-                // GGML_SCHED_SYNC_INPUT_COPY=1 restores the blocking copy.
-                static const bool sync_input_copy = getenv("GGML_SCHED_SYNC_INPUT_COPY") && atoi(getenv("GGML_SCHED_SYNC_INPUT_COPY"));
+                // Opt-in (GGML_SCHED_ASYNC_INPUT_COPY=1): measured slower than the blocking copy on
+                // Vulkan/RADV at 176k decode (+0.45 ms per graph), so the blocking copy stays the default.
+                static const bool sync_input_copy = !(getenv("GGML_SCHED_ASYNC_INPUT_COPY") && atoi(getenv("GGML_SCHED_ASYNC_INPUT_COPY")));
                 if (!sync_input_copy && split_backend->iface.set_tensor_async != NULL && input->buffer &&
                         ggml_backend_buffer_is_host(input->buffer) && input_cpy->buffer && !ggml_backend_buffer_is_host(input_cpy->buffer) &&
                         ggml_is_contiguous(input) && ggml_nbytes(input) == ggml_nbytes(input_cpy)) {

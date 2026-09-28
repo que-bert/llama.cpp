@@ -1408,8 +1408,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
+        // on the GPU: the synchronize before set_inputs below covers it.
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
@@ -1446,9 +1445,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // set the input data for the input tensors
     {
         // the previous graph may still be running on the device and reading its host inputs
-        // (pipeline parallelism, and the scheduler's async input uploads): wait before
-        // overwriting them. Free when the device is already idle.
-        ggml_backend_sched_synchronize(sched.get());
+        // (pipeline parallelism, or the opt-in async input uploads): wait before overwriting them
+        static const bool async_inputs = getenv("GGML_SCHED_ASYNC_INPUT_COPY") && atoi(getenv("GGML_SCHED_ASYNC_INPUT_COPY"));
+        if (cparams.pipeline_parallel || async_inputs) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
 
         //const auto t_start_us = ggml_time_us();
 

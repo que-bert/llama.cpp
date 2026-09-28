@@ -13489,8 +13489,8 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     // non-pinned source: copy it into the bump staging buffer now and record the device copy,
     // instead of a blocking sync-staging write + full synchronize per call.
-    // GGML_VK_NO_INPUT_STAGING=1 restores the blocking path.
-    static const bool no_input_staging = getenv("GGML_VK_NO_INPUT_STAGING") && atoi(getenv("GGML_VK_NO_INPUT_STAGING"));
+    // Opt-in (GGML_VK_INPUT_STAGING=1): not a measured win yet (see R5 notes).
+    static const bool no_input_staging = !(getenv("GGML_VK_INPUT_STAGING") && atoi(getenv("GGML_VK_INPUT_STAGING")));
     static constexpr size_t input_staging_cap = 32u << 20;
     if (!ret && !no_input_staging) {
         const size_t staging_size = size * n_copies;
