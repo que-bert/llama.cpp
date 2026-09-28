@@ -8219,10 +8219,13 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     const bool use_q8v = use_q8r && q8v_env_on && (k_buf.offset % 16) == 0 && (v_buf.offset % 4) == 0 &&
                          (v->nb[1] % 4) == 0 && (v->nb[2] % 4) == 0;
     // q8w: 8 x wave32 per WG, 32 d per wave, V loaded per PV step, LDS sized
-    // to the used rows (flash_attn_decode_q8w.comp). GGML_VK_DECODE_Q8W=0
-    // falls back to q8r/q8v.
-    static const bool q8w_env_off = getenv("GGML_VK_DECODE_Q8W") && atoi(getenv("GGML_VK_DECODE_Q8W")) == 0;
-    const bool use_q8w = use_q8r && !use_q8v && !q8w_env_off;
+    // to the used rows (flash_attn_decode_q8w.comp). Default for <= 16 rows
+    // per WG (drafts): kv=183296 nb=1 700 us vs q8r 708; at nb=4 (24 rows)
+    // q8r stays ahead, 722 vs 732. GGML_VK_DECODE_Q8W=1 forces it for all
+    // row counts, =0 disables it.
+    static const int q8w_env = getenv("GGML_VK_DECODE_Q8W") ? atoi(getenv("GGML_VK_DECODE_Q8W")) : -1;
+    const uint32_t q8r_rows = G * (uint32_t)std::min<int64_t>(N, 32 / G);
+    const bool use_q8w = use_q8r && !use_q8v && (q8w_env == 1 || (q8w_env < 0 && q8r_rows <= 16));
     const uint32_t KV = (uint32_t)k->ne[1];
     const uint32_t n_kv_head = (uint32_t)k->ne[2];
     const uint32_t n_head = (uint32_t)dst->ne[1];
