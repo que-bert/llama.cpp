@@ -957,6 +957,15 @@ void process_shaders() {
     string_to_spv("mul_mm_q6k_rdna4_f16_upsk", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"SPLITK", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_n256", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_n256sk", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"BN", "256"}, {"WARPS_N", "4"}, {"SPLITK", "1"}}, true, true);
+    // 256x128 tiles, 8 waves (4x2): same per-thread load/dequant shape as 128x256 but 24% less L2 traffic per output
+    string_to_spv("mul_mm_q6k_rdna4_f16_m256", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"BM", "256"}, {"WARPS_M", "4"}, {"WARPS_N", "2"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_m256sk", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"BM", "256"}, {"WARPS_M", "4"}, {"WARPS_N", "2"}, {"SPLITK", "1"}}, true, true);
+    // PAD=4 (LDS row stride 20 dwords): conflict-free WMMA fragment loads on 64 x 4 B banks (stride 18: 2-way)
+    string_to_spv("mul_mm_q6k_rdna4_f16_up_pad4", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"PAD", "4"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_upsk_pad4", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"SPLITK", "1"}, {"PAD", "4"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_n256_pad4", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"BN", "256"}, {"WARPS_N", "4"}, {"PAD", "4"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_n256sk_pad4", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"BN", "256"}, {"WARPS_N", "4"}, {"SPLITK", "1"}, {"PAD", "4"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_sk_pad4", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"SPLITK", "1"}, {"PAD", "4"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_p2", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_p2sk", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}, {"SPLITK", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_n256p2", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);

@@ -27,7 +27,9 @@
 #define WARPS_N (256 / SG / WARPS_M)
 #endif
 #define NT (WARPS_M * WARPS_N * SG)
+#ifndef BM
 #define BM 128
+#endif
 #ifndef BN
 #define BN 128
 #endif
