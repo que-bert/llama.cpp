@@ -551,6 +551,9 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
+            // D6: write any deferred MTP catch-up rows before the draft KV can be saved/reused
+            common_speculative_flush(spec, id);
+
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear();

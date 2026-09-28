@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <limits>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -174,6 +175,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) materialize any deferred draft-context work for seq_id (e.g. before the slot's state is saved)
+    virtual void flush(llama_seq_id /*seq_id*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1363,6 +1367,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // D6 merged catch-up (single-head, non-shared KV only; LLAMA_MTP_NO_MERGE=1 disables).
+    // A verify batch that follows draft() is not caught up in process(). Its (token, h) rows
+    // are stashed here, accept(k) keeps the first k+1 of them (the positions that survive the
+    // server's seq_rm), and the next draft() decodes them together with its first draft row
+    // (id_last, pending_h) in one batch. The draft KV thus holds exactly the same rows as the
+    // eager catch-up path; only the rejected rows are never computed. Any other consumer
+    // (next process(), flush()) materializes the stash first, keeping rows with pos < the
+    // position it starts writing at.
+    bool defer_enabled = false;
+    std::vector<bool>                     armed;      // draft() ran for this seq since the last process()
+    std::vector<std::vector<llama_token>> defer_tok;
+    std::vector<std::vector<llama_pos>>   defer_pos;  // ascending
+    std::vector<std::vector<float>>       defer_h;    // [n_rows][n_embd]
+
+    // append the stashed rows of seq_id with pos < pos_lim to `batch` (no logits); drop the whole stash
+    void take_deferred(llama_seq_id seq_id, llama_pos pos_lim) {
+        auto & tok = defer_tok[seq_id];
+        auto & pos = defer_pos[seq_id];
+        auto & h   = defer_h[seq_id];
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        for (size_t r = 0; r < tok.size() && pos[r] < pos_lim; ++r) {
+            common_batch_add(batch, tok[r], pos[r], { seq_id }, false);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h.data() + r * n_embd, row_bytes);
+        }
+        tok.clear();
+        pos.clear();
+        h.clear();
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1441,6 +1474,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        {
+            const char * env = getenv("LLAMA_MTP_NO_MERGE");
+            const bool no_merge = env != nullptr && atoi(env) != 0;
+            defer_enabled = !no_merge && !is_mem_shared && !chain_heads;
+        }
+        armed.assign(n_seq, false);
+        defer_tok.assign(n_seq, {});
+        defer_pos.assign(n_seq, {});
+        defer_h.assign(n_seq, {});
+        SPC_TRC("- merged catch-up (D6): %s\n", defer_enabled ? "on" : "off");
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1515,6 +1559,51 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        if (defer_enabled) {
+            // D6: same (token, h) pairing as the eager path below, built per sequence.
+            // A verify batch (armed by draft()) is stashed instead of decoded; everything
+            // else (prompt ubatches, undrafted single-token steps) is caught up now,
+            // preceded by any stashed rows that sit below this batch's first position.
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+            common_batch_clear(batch);
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const int32_t beg = i_batch_beg[seq_id];
+                if (beg < 0) {
+                    continue;
+                }
+                const int32_t end = i_batch_end[seq_id];
+
+                take_deferred(seq_id, batch_in.pos[beg]);
+
+                const bool defer = armed[seq_id] && (end - beg + 1) <= this->n_max + 1;
+                armed[seq_id] = false;
+
+                for (int32_t k = beg; k <= end; ++k) {
+                    if (batch_in.seq_id[k][0] != seq_id) {
+                        continue;
+                    }
+                    const float * h = (k == beg) ? pending_h[seq_id].data() : h_tgt + (size_t) (k - 1) * n_embd;
+                    if (defer) {
+                        defer_tok[seq_id].push_back(batch_in.token[k]);
+                        defer_pos[seq_id].push_back(batch_in.pos[k]);
+                        defer_h[seq_id].insert(defer_h[seq_id].end(), h, h + n_embd);
+                    } else {
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
+                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h, row_bytes);
+                    }
+                }
+            }
+
+            if (batch.n_tokens > 0) {
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    SPC_ERR("llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
+                    return false;
+                }
+            }
+        } else
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
@@ -1620,6 +1709,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+
+            if (defer_enabled) {
+                // D6: the accepted verify rows (pos < pos0) ride along in the first draft decode
+                take_deferred(seq_id, dp.pos0);
+                armed[seq_id] = true;
+            }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1763,6 +1858,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        if (defer_enabled && !defer_tok[seq_id].empty()) {
+            // keep the rows the server keeps: bonus token + n_accepted drafts
+            const size_t keep = std::min(defer_tok[seq_id].size(), (size_t) n_accepted + 1);
+            defer_tok[seq_id].resize(keep);
+            defer_pos[seq_id].resize(keep);
+            defer_h[seq_id].resize(keep * n_embd);
+        }
+    }
+
+    void flush(llama_seq_id seq_id) override {
+        if (!defer_enabled || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        armed[seq_id] = false;
+        if (defer_tok[seq_id].empty()) {
+            return;
+        }
+        common_batch_clear(batch);
+        take_deferred(seq_id, std::numeric_limits<llama_pos>::max());
+        if (llama_decode(params.ctx_dft, batch) != 0) {
+            SPC_ERR("flush: llama_decode(ctx_dft) failed (seq_id=%d)\n", (int) seq_id);
+        }
     }
 };
 
@@ -2947,6 +3065,16 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
+    }
+}
+
+void common_speculative_flush(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->flush(seq_id);
     }
 }
 

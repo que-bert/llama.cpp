@@ -2036,7 +2036,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (masked && t_h_nextn->ne[1] != n_rows) {
+                    // the graph left h_nextn unmasked (all ubatch rows, e.g. the MTP draft heads):
+                    // copy only the output rows, in output order
+                    GGML_ASSERT(t_h_nextn->ne[1] == (int64_t) ubatch.n_tokens);
+                    int64_t j = 0;
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                        if (!ubatch.output[i]) {
+                            continue;
+                        }
+                        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + j*n_embd,
+                                (size_t) i*t_h_nextn->nb[1], n_embd*sizeof(float));
+                        ++j;
+                    }
+                    GGML_ASSERT(j == n_rows);
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
             }
         }
 

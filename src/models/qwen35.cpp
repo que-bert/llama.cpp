@@ -547,6 +547,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(concat, "mtp_concat", il);
 
     ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    if (n_tokens > 1 && n_outputs == 1 && cparams.embeddings_nextn_masked) {
+        // merged MTP catch-up + first draft row (common/speculative.cpp D6): the output row is last.
+        // Recompute it as an n=1 GEMV so it takes the same kernel path (and bits) as the unmerged
+        // single-row draft decode; the other rows keep the batched path the old catch-up used.
+        ggml_tensor * x_last = ggml_view_2d(ctx0, concat, concat->ne[0], 1, concat->nb[1], (size_t) (n_tokens - 1) * concat->nb[1]);
+        ggml_tensor * y_last = build_lora_mm(layer.nextn.eh_proj, x_last, layer.nextn.eh_proj_s);
+        ggml_tensor * y_head = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens - 1, cur->nb[1], 0);
+        cur = ggml_concat(ctx0, y_head, y_last, /*dim=*/ 1);
+    }
     cb(cur, "mtp_eh_proj", il);
 
     ggml_tensor * inpSA = cur;
