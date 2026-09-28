@@ -871,6 +871,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.draft_vocab_full != other.cparams.draft_vocab_full) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -936,6 +940,11 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // reduced draft vocab: when set, t_logits rows are in permuted-row order (width t_logits->ne[0],
+    // possibly < n_vocab). logits_perm maps row -> token id; readback scatters raw logits into
+    // original order and backend-sampled ids are mapped on the host.
+    const int32_t * logits_perm  = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

@@ -218,6 +218,28 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
 
+    // reduced draft vocab: output.weight rows are permuted, so map the logits back to vocab order.
+    // Up to 16 output rows this is a device gather through the inverse permutation (one float per
+    // "row"; the id view broadcasts over tokens with a zero stride). Larger output counts (the
+    // prompt-sized reserve graph) are mapped on the host at readback instead, so the compute buffer
+    // does not grow by a second [n_vocab, n_outputs] tensor.
+    if (model.draft_vocab_n > 0) {
+        const int64_t n_vocab_out = cur->ne[0];
+        const int64_t n_out       = cur->ne[1];
+        if (n_out <= 16) {
+            ggml_tensor * rows = ggml_reshape_3d(ctx0, cur, 1, n_vocab_out, n_out);
+            // [n_vocab, n_out] id view with a zero token stride (ggml_view_2d rejects it, so widen a 1-row view)
+            ggml_tensor * ids  = ggml_view_2d(ctx0, model.draft_vocab_inv_t, n_vocab_out, 1, model.draft_vocab_inv_t->nb[1], 0);
+            ids->ne[1] = n_out;
+            ids->nb[1] = ids->nb[2] = ids->nb[3] = 0;
+            cur = ggml_get_rows(ctx0, rows, ids);
+            cur = ggml_reshape_2d(ctx0, cur, n_vocab_out, n_out);
+            cb(cur, "result_output_unperm", -1);
+        } else {
+            res->logits_perm  = model.draft_vocab_perm.data();
+        }
+    }
+
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -636,6 +658,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+    if (model.draft_vocab_n > 0 && !layer.nextn.shared_head_head) {
+        // reduced draft vocab: the first draft_vocab_n rows of the permuted output.weight (zero-copy);
+        // logits come out in permuted-row order and are mapped to token ids by the sampler / readback
+        // (adaptive draft vocab: cparams.draft_vocab_full selects all permuted rows for this step)
+        if (!cparams.draft_vocab_full) {
+            head_w = ggml_view_2d(ctx0, model.output, model.output->ne[0], model.draft_vocab_n, model.output->nb[1], 0);
+        }
+        res->logits_perm  = model.draft_vocab_perm.data();
+    }
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 

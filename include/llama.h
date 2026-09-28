@@ -594,6 +594,16 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+
+    // Reduced-vocabulary MTP draft head. Permutes the rows of output.weight in place so that n_draft
+    // tokens come first: every control/special token, then ranked_ids in order, then ascending ids.
+    // The MTP draft graph then computes only those n_draft logits; the main graph's logits are mapped
+    // back to original vocab order. Call once, right after loading, before creating any context.
+    // Returns false (and leaves the model untouched) if the model does not support it.
+    LLAMA_API bool llama_model_set_draft_vocab(struct llama_model * model, const int32_t * ranked_ids, size_t n_ranked, int32_t n_draft);
+    // n_draft set above (0 = off), and a token's permuted row (< n_draft: inside the draft subset; -1 = off)
+    LLAMA_API int32_t llama_model_draft_vocab_n  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_draft_vocab_row(const struct llama_model * model, llama_token token);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);

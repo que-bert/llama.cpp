@@ -639,6 +639,14 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // reduced-vocabulary draft head (--spec-draft-vocab): output rows are permuted in place so the
+    // n_draft most likely draft tokens come first; the MTP head is a view of those rows.
+    int32_t              draft_vocab_n    = 0;       // 0 = disabled (output in original order)
+    std::vector<int32_t> draft_vocab_perm;           // [n_vocab] permuted row -> original token id
+    std::vector<int32_t> draft_vocab_inv;            // [n_vocab] original token id -> permuted row (host copy)
+    struct ggml_tensor * draft_vocab_inv_t  = nullptr; // I32 [n_vocab] original token id -> permuted row
+    std::shared_ptr<void> draft_vocab_owner;         // owns the ggml context + buffer of the two id tensors
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;

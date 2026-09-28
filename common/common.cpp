@@ -1333,6 +1333,30 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->model.reset(model);
 
+    // reduced MTP draft-head vocab: permute output.weight before any context exists
+    if (params.speculative.draft.vocab_n > 0) {
+        std::vector<int32_t> ranked;
+        if (!params.speculative.draft.vocab_file.empty()) {
+            std::ifstream f(params.speculative.draft.vocab_file);
+            if (!f) {
+                LOG_ERR("%s: cannot open --spec-draft-vocab-file '%s'\n", __func__, params.speculative.draft.vocab_file.c_str());
+                return;
+            }
+            std::string line;
+            while (std::getline(f, line)) {
+                const auto hash = line.find('#');
+                std::istringstream ss(hash == std::string::npos ? line : line.substr(0, hash));
+                int32_t id;
+                while (ss >> id) {
+                    ranked.push_back(id);
+                }
+            }
+        } else {
+            LOG_WRN("%s: --spec-draft-vocab without --spec-draft-vocab-file: using specials + lowest token ids\n", __func__);
+        }
+        llama_model_set_draft_vocab(model, ranked.data(), ranked.size(), params.speculative.draft.vocab_n);
+    }
+
     if (model_only) {
         return;
     }

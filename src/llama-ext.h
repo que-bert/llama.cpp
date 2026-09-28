@@ -100,6 +100,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Reduced draft vocab (llama_model_set_draft_vocab): when full == true the DECODER_MTP graph computes
+// every row of the permuted output.weight instead of the first n_draft (adaptive draft vocab).
+// Changing it rebuilds the draft graph. Default false.
+LLAMA_API void llama_set_draft_vocab_full(struct llama_context * ctx, bool full);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
