@@ -2514,6 +2514,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const std::string mode = sel ? std::string(sel) : std::string("f16");
             const char * ord = getenv("GGML_VK_MMQ_Q6K_ORDER");
             const uint32_t order_n = ord ? (uint32_t)atoi(ord) : 1u;
+            const char * dg = getenv("GGML_VK_Q6K_DIAG");  // profiling-only ablation, wrong results when set
+            const uint32_t q6k_diag = dg ? (uint32_t)atoi(dg) : 0u;
             const char * wv = getenv("GGML_VK_MMQ_Q6K_WAVE");
             if (mode == "int8" && device->coopmat_int_support) {
                 if (wv && atoi(wv) == 64) {
@@ -2525,33 +2527,36 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 }
             } else if (mode == "f32y") {
                 ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f32y, "mul_mm_q6k_rdna4_f32y", mul_mm_q6k_rdna4_f32y_cm1_len, mul_mm_q6k_rdna4_f32y_cm1_data, "main", 3,
-                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
             } else if (mode == "f16" || mode == "1") {
                 // single-buffered LDS (18 KB, 120 VGPRs): 81 TF at 17408x5120 vs 75 for the double-buffered "f16db"
                 ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16, "mul_mm_q6k_rdna4_f16", mul_mm_q6k_rdna4_f16_sb_cm1_len, mul_mm_q6k_rdna4_f16_sb_cm1_data, "main", 3,
-                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+                                        sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
+                // GGML_VK_Q6K_PIPE2=1: 2-phase pipelined modules (double-buffered LDS, prefetch distance 2) in the
+                // UPAR/N256 slots. Opt-in: 144 VGPRs (vs 120) and 2-6% slower on the model shapes, see R2 notes.
+                const bool p2 = getenv("GGML_VK_Q6K_PIPE2") != nullptr && atoi(getenv("GGML_VK_Q6K_PIPE2")) != 0;
                 // uniform-parity variants for K/256 even (block parity is sb & 1); GGML_VK_NO_Q6K_UPAR=1 disables
                 if (getenv("GGML_VK_NO_Q6K_UPAR") == nullptr) {
-                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_up, "mul_mm_q6k_rdna4_f16_up", mul_mm_q6k_rdna4_f16_up_cm1_len, mul_mm_q6k_rdna4_f16_up_cm1_data, "main", 3,
-                                            sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_up, "mul_mm_q6k_rdna4_f16_up", p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_len : mul_mm_q6k_rdna4_f16_up_cm1_len, p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_data : mul_mm_q6k_rdna4_f16_up_cm1_data, "main", 3,
+                                            sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
-                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_upsk, "mul_mm_q6k_rdna4_f16_upsk", mul_mm_q6k_rdna4_f16_upsk_cm1_len, mul_mm_q6k_rdna4_f16_upsk_cm1_data, "main", 3,
-                                                sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_upsk, "mul_mm_q6k_rdna4_f16_upsk", p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_len : mul_mm_q6k_rdna4_f16_upsk_cm1_len, p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_data : mul_mm_q6k_rdna4_f16_upsk_cm1_data, "main", 3,
+                                                sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
                 }
                 // 128x256 tiles (8 waves, 64x64 per wave): halves the dequant VALU per WMMA; GGML_VK_NO_Q6K_N256=1 disables
                 if (getenv("GGML_VK_NO_Q6K_N256") == nullptr && getenv("GGML_VK_NO_Q6K_UPAR") == nullptr) {
-                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256, "mul_mm_q6k_rdna4_f16_n256", mul_mm_q6k_rdna4_f16_n256_cm1_len, mul_mm_q6k_rdna4_f16_n256_cm1_data, "main", 3,
-                                            sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n}, 1, true, true, 64);
+                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256, "mul_mm_q6k_rdna4_f16_n256", p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_len : mul_mm_q6k_rdna4_f16_n256_cm1_len, p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_data : mul_mm_q6k_rdna4_f16_n256_cm1_data, "main", 3,
+                                            sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
-                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256sk, "mul_mm_q6k_rdna4_f16_n256sk", mul_mm_q6k_rdna4_f16_n256sk_cm1_len, mul_mm_q6k_rdna4_f16_n256sk_cm1_data, "main", 3,
-                                                sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n}, 1, true, true, 64);
+                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256sk, "mul_mm_q6k_rdna4_f16_n256sk", p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_len : mul_mm_q6k_rdna4_f16_n256sk_cm1_len, p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_data : mul_mm_q6k_rdna4_f16_n256sk_cm1_data, "main", 3,
+                                                sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
                 }
                 // split-K for shapes with too few 128x128 tiles for 64 CUs (e.g. ffn_down 5120 x 17408); GGML_VK_NO_Q6K_SPLITK=1 disables
                 if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_sk, "mul_mm_q6k_rdna4_f16_sk", mul_mm_q6k_rdna4_f16_sk_cm1_len, mul_mm_q6k_rdna4_f16_sk_cm1_data, "main", 3,
-                                            sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+                                            sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                 }
             } else if (mode == "f16db") {
                 if (wv && atoi(wv) == 32) {
@@ -2559,7 +2564,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                             sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 32);
                 } else {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16, "mul_mm_q6k_rdna4_f16", mul_mm_q6k_rdna4_f16_cm1_len, mul_mm_q6k_rdna4_f16_cm1_data, "main", 3,
-                                            sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n}, 1, true, true, 64);
+                                            sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                 }
             }
         }
@@ -6502,7 +6507,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         if (q6k_split_env != 0) {
             q6k_split = q6k_split_env;
         } else {
-            while (q6k_split < 8 && tiles * q6k_split < 256 && nsb / (q6k_split * 2) >= 8) {
+            while (q6k_split < 8 && tiles * q6k_split < 192 && nsb / (q6k_split * 2) >= 8) {
                 q6k_split *= 2;
             }
         }

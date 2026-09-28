@@ -56,8 +56,11 @@ layout(push_constant) uniform parameter {
 } p;
 
 layout(constant_id = 0) const uint ORDER_N = 1;
+// profiling-only ablation (GGML_VK_Q6K_DIAG, results are wrong when != 0):
+//   1 = skip the WMMA block, 2 = skip in-loop global loads, 4 = skip the dequant (raw bits to LDS)
+layout(constant_id = 1) const uint DIAG = 0;
 
-#ifdef SINGLE_BUF
+#if defined(SINGLE_BUF) && !defined(PIPE2)
 #define NBUF 1
 #else
 #define NBUF 2
@@ -129,9 +132,9 @@ void main() {
 // nsb even (host-checked): block parity (row * nsb + sb) & 1 == sb & 1 is workgroup-uniform, so the
 // 2-byte-misaligned select is a uniform branch and even blocks load 4 aligned dwords instead of 5
 #define ODDQ(kt) ((((kt) >> 3) & 1u) != 0)
-#define LOADQ(wl, wh, sb) \
-    if (((sb) & 1u) != 0) { [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } } \
-    else { [[unroll]] for (uint w = 0; w < GW; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } }
+// loads stay unconditional (GW + 1 dwords, the extra one is inside the block): a branch on the load
+// makes ACO wait for the loads right away (s_wait_loadcnt 0 after the odd-path loads)
+#define LOADQ(wl, wh, sb) [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; }
 #else
 #define ODDQ(kt) ((rodd[i] & 2) != 0)
 #define LOADQ(wl, wh, sb) [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; }
@@ -167,7 +170,7 @@ void main() {
             const uint l = odd ? ((rql[i][w] >> 16) | (rql[i][w + 1] << 16)) : rql[i][w]; \
             const uint h = odd ? ((rqh[i][w] >> 16) | (rqh[i][w + 1] << 16)) : rqh[i][w]; \
             const uint q = ((l >> lsh) & 0x0F0F0F0Fu) | (((h >> hsh) & 0x03030303u) << 4); \
-            uint o0, o1; deq4(q, s, o0, o1); \
+            uint o0, o1; if ((DIAG & 4) != 0) { o0 = q; o1 = q ^ uint(dsc); } else deq4(q, s, o0, o1); \
             shW[buf][row * STR + g * 2 * GW + 2 * w] = o0; \
             shW[buf][row * STR + g * 2 * GW + 2 * w + 1] = o1; \
         } \
@@ -190,6 +193,30 @@ void main() {
 #endif
     GLOAD(kt0)
     SSTORE(0, kt0)
+#ifdef PIPE2
+    // 2-phase software pipeline, one barrier per step: step kt dequantises/stores tile kt+1 (loaded
+    // one full step earlier) into the other buffer, then issues the loads for tile kt+2 into the
+    // same registers, then runs the WMMAs of tile kt
+    GLOAD(min(kt0 + 1, nk - 1))
+    barrier();
+    for (uint kt = kt0; kt < nk; ++kt) {
+        const uint cur = (kt - kt0) & 1;
+        SSTORE(cur ^ 1, min(kt + 1, nk - 1))
+        if ((DIAG & 2) == 0) GLOAD(min(kt + 2, nk - 1))
+        if ((DIAG & 1) == 0)
+        [[unroll]] for (uint kk = 0; kk < BK / 16; ++kk) {
+            MAT(float16_t, gl_MatrixUseA) ma[TM];
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                coopMatLoad(ma[i], shW[cur], (wm * WTM + i * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                MAT(float16_t, gl_MatrixUseB) mb;
+                coopMatLoad(mb, shY[cur], (wn * WTN + j * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0; i < TM; ++i) acc[j * TM + i] = coopMatMulAdd(ma[i], mb, acc[j * TM + i]);
+            }
+        }
+        barrier();
+    }
+#else
     barrier();
 
     for (uint kt = kt0; kt < nk; ++kt) {
@@ -197,7 +224,8 @@ void main() {
         // unconditional (clamped) prefetch and store keep the loop branch-free so the global loads
         // stay in flight across the WMMA block
         const uint kn = min(kt + 1, nk - 1);
-        GLOAD(kn)
+        if ((DIAG & 2) == 0) GLOAD(kn)
+        if ((DIAG & 1) == 0)
         [[unroll]] for (uint kk = 0; kk < BK / 16; ++kk) {
             MAT(float16_t, gl_MatrixUseA) ma[TM];
             [[unroll]] for (uint i = 0; i < TM; ++i)
@@ -216,6 +244,7 @@ void main() {
 #endif
         barrier();
     }
+#endif
 
     // acc[j*TM+i]: rows = weight rows m, cols = tokens n; D is [n][m] with row stride stride_d.
     if (n0 + BN <= p.N) {
