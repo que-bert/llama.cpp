@@ -168,6 +168,9 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+
+    // token-major layout pos[i*n_pos_per_embd + d] (MTP chain: per-token contiguous views)
+    bool tok_major = false;
 };
 
 // temperature tuning, used by llama4

@@ -185,6 +185,9 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // n_kv that a decode of only the first n tokens of this slot would have used
+    uint32_t get_n_kv_prefix(const slot_info & sinfo, uint32_t n) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -407,6 +410,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_prefix(uint32_t n) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

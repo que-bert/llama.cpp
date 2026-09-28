@@ -1631,6 +1631,60 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // device-side draft chain: all n_max draft steps in one graph/submit, step k+1 fed from step k's
+        // argmax on the GPU (the draft token is cur_p->data[0], i.e. the top-1 logit). Identical drafts
+        // to the loop below; LLAMA_NO_MTP_GPU_CHAIN=1 disables.
+        static const bool no_gpu_chain = [] {
+            const char * e = getenv("LLAMA_NO_MTP_GPU_CHAIN");
+            return e && atoi(e) != 0;
+        }();
+        if (!no_gpu_chain && !chain_heads && !is_mem_shared && n_drafting == 1 && params.n_max > 1 && params.p_min <= 0.0f) {
+            llama_seq_id seq_id = 0;
+            while (!drafting[seq_id]) {
+                ++seq_id;
+            }
+            auto & dp = dparams.at(seq_id);
+
+            for (int t = 1; t < params.n_max; ++t) {
+                // placeholder token/h: replaced on the device by the previous step's argmax / h_nextn
+                common_batch_add(batch, dp.id_last, dp.pos0 + t, { seq_id }, true);
+                std::memset(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, 0, row_bytes);
+            }
+
+            llama_set_mtp_chain(ctx_dft, true);
+            const int ret = llama_decode(ctx_dft, batch);
+            llama_set_mtp_chain(ctx_dft, false);
+
+            if (ret != 0) {
+                SPC_ERR("llama_decode(chain) returned %d\n", ret);
+            } else {
+                auto * smpl = smpls[seq_id].get();
+                auto & result = *dp.result;
+
+                for (int t = 0; t < params.n_max; ++t) {
+                    common_sampler_sample(smpl, ctx_dft, t, true);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, t, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    const llama_token id = cur_p->data[0].id;
+
+                    common_sampler_accept(smpl, id, true);
+                    result.push_back(id);
+                }
+            }
+
+            if (dp.result->size() < (size_t) params.n_min) {
+                dp.result->clear();
+            }
+            return;
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -2499,6 +2553,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
+
+    // MTP device-side draft chain outputs every draft step of a sequence in one decode
+    {
+        const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        const char * e = getenv("LLAMA_NO_MTP_GPU_CHAIN");
+        if (has_mtp && !(e && atoi(e) != 0) && params_spec.n_max > 1) {
+            result.n_outputs_max = params.n_parallel * params_spec.n_max;
+            result.n_outputs_max_per_seq = params_spec.n_max;
+        }
+    }
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

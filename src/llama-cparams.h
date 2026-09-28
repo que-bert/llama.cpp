@@ -21,6 +21,10 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // MTP draft chain: a multi-token DECODER_MTP ubatch is evaluated as n sequential 1-token
+    // draft steps in one graph, step k+1 fed from step k's argmax + h_nextn on the device
+    bool     mtp_chain = false;
+
     float rope_freq_base;
     float rope_freq_scale;
 

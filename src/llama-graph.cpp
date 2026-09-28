@@ -131,7 +131,21 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
 
-        if (ubatch->token && n_pos_per_embd == 4) {
+        if (tok_major && n_pos_per_embd > 1) {
+            std::vector<llama_pos> pos_data(n_tokens*n_pos_per_embd);
+            for (int i = 0; i < n_tokens; ++i) {
+                for (uint32_t d = 0; d < n_pos_per_embd; ++d) {
+                    llama_pos v;
+                    if (ubatch->token && n_pos_per_embd == 4) {
+                        v = d < 3 ? ubatch->pos[i] : 0;
+                    } else {
+                        v = ubatch->pos[d*n_tokens + i];
+                    }
+                    pos_data[i*n_pos_per_embd + d] = v;
+                }
+            }
+            ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
+        } else if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
             // the 3 first dims are the same, and 4th dim is all 0
             std::vector<llama_pos> pos_data(n_tokens*n_pos_per_embd);
