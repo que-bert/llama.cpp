@@ -18,6 +18,9 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
+
+extern int64_t common_spec_timing_ns[5]; // common/speculative.cpp, diagnostic
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -2790,7 +2793,37 @@ private:
     };
 #endif
 
+    // LLAMA_SERVER_STEP_TIMING=1: per-step host timing of the server loop (diagnostic),
+    // printed every LLAMA_SERVER_STEP_TIMING_N speculative steps, us/step.
+    struct step_timing {
+        enum seg { LOOP_GAP, GEN_ITER, TEXT_TOK, DRAFT, CKPT, PRE_REST, VERIFY_DEC, VERIFY_SYNC, METRICS,
+                   PROCESS_HOOK, SAMPLE_ACC, ACCEPT, SEQ_RM, TOKENS, POST_REST, N_SEG };
+        bool enabled = false; bool step_pending = false; int every = 60; int n = 0; int depth = 0;
+        int64_t acc[N_SEG] = {}; int64_t t_end = 0;
+        step_timing() {
+            const char * e = getenv("LLAMA_SERVER_STEP_TIMING"); enabled = e && atoi(e) != 0;
+            const char * n_e = getenv("LLAMA_SERVER_STEP_TIMING_N"); if (n_e) { every = std::max(1, atoi(n_e)); }
+        }
+        static int64_t now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+        void add(seg s, int64_t t0) { acc[s] += now() - t0; }
+        void step_done() {
+            if (++n < every) { return; }
+            static const char * names[N_SEG] = { "loop_gap", "gen_iter", "text_tok", "draft", "ckpt", "pre_rest", "verify_dec", "verify_sync", "metrics",
+                                                 "process_hook", "sample_acc", "accept", "seq_rm", "tokens", "post_rest" };
+            fprintf(stderr, "SRV_STEP_TIMING depth %d steps %d us/step:", depth, n);
+            for (int i = 0; i < N_SEG; ++i) { fprintf(stderr, " %s %.1f", names[i], acc[i] / 1e3 / n); acc[i] = 0; }
+            static const char * snames[5] = { "dr_dec", "dr_sample", "dr_wait", "ph_dec", "ph_copy" };
+            for (int i = 0; i < 5; ++i) { fprintf(stderr, " %s %.1f", snames[i], common_spec_timing_ns[i] / 1e3 / n); common_spec_timing_ns[i] = 0; }
+            fprintf(stderr, "\n"); fflush(stderr);
+            n = 0;
+        }
+    } sst;
+#define SST_T0() (sst.enabled ? step_timing::now() : 0)
+#define SST_ADD(s, t0) do { if (sst.enabled) { sst.add(step_timing::s, t0); } } while (0)
+
     void update_slots() {
+        if (sst.enabled && sst.t_end) { if (step_timing::now() - sst.t_end < 1000000000) { sst.add(step_timing::LOOP_GAP, sst.t_end); } sst.t_end = 0; }
+        struct sst_end_guard { step_timing & s; ~sst_end_guard() { if (s.enabled) { s.t_end = step_timing::now(); } } } sst_eg{sst};
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2833,8 +2866,14 @@ private:
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
+            const int64_t sst_t_pre = SST_T0();
+            const int64_t sst_before = sst.enabled ? sst.acc[step_timing::GEN_ITER] + sst.acc[step_timing::DRAFT] + sst.acc[step_timing::CKPT] : 0;
             pre_decode();
             batch.render();
+            if (sst.enabled) {
+                const int64_t inner = sst.acc[step_timing::GEN_ITER] + sst.acc[step_timing::DRAFT] + sst.acc[step_timing::CKPT] - sst_before;
+                sst.acc[step_timing::PRE_REST] += step_timing::now() - sst_t_pre - inner;
+            }
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -2897,7 +2936,14 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                const int64_t sst_t_post = SST_T0();
+                auto sst_sum = [&]() { return sst.acc[step_timing::SAMPLE_ACC] + sst.acc[step_timing::ACCEPT] + sst.acc[step_timing::SEQ_RM] + sst.acc[step_timing::TOKENS]; };
+                const int64_t sst_before = sst.enabled ? sst_sum() : 0;
                 post_decode(n_tokens, off, batch_view);
+                if (sst.enabled) {
+                    sst.acc[step_timing::POST_REST] += step_timing::now() - sst_t_post - (sst_sum() - sst_before);
+                    if (sst.step_pending) { sst.step_pending = false; sst.step_done(); }
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -2981,6 +3027,7 @@ private:
         std::vector<server_slot *> drafting;
 
         // determine which slots are generating and drafting
+        const int64_t sst_t_gen = SST_T0();
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -3023,7 +3070,10 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        const int64_t sst_t_tt = SST_T0();
+                        slot.prompt.tokens.get_text_tokens(slot.spec_prompt);
+                        SST_ADD(TEXT_TOK, sst_t_tt);
+                        sst.depth = slot.prompt.n_tokens();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
@@ -3040,14 +3090,19 @@ private:
             }
         });
 
+        SST_ADD(GEN_ITER, sst_t_gen);
+
         // generate the actual drafts (if any)
+        const int64_t sst_t_draft = SST_T0();
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
         }
+        SST_ADD(DRAFT, sst_t_draft);
 
         // make checkpoints if needed
+        const int64_t sst_t_ckpt = SST_T0();
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3094,6 +3149,8 @@ private:
                 }
             }
         });
+
+        SST_ADD(CKPT, sst_t_ckpt);
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -3679,9 +3736,13 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            const int64_t sst_t_dec = SST_T0();
             ret = llama_decode(ctx_tgt, batch_view);
+            SST_ADD(VERIFY_DEC, sst_t_dec);
             if (ret == 0 && has_output) {
+                const int64_t sst_t_sync = SST_T0();
                 llama_synchronize(ctx_tgt);
+                SST_ADD(VERIFY_SYNC, sst_t_sync);
             }
         });
 
@@ -3735,7 +3796,9 @@ private:
             return false; // retry with the updated n_batch
         } else {
             // success, apply batch metrics
+            const int64_t sst_t_met = SST_T0();
             metrics_post_decode(off, batch_view.n_tokens, has_output);
+            SST_ADD(METRICS, sst_t_met);
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -3743,9 +3806,11 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t sst_t_ph = SST_T0();
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            SST_ADD(PROCESS_HOOK, sst_t_ph);
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3908,6 +3973,7 @@ private:
 
             // verify and try to accept the draft
             {
+                const int64_t sst_t_sa = SST_T0();
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -3918,6 +3984,7 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 slot.spec_i_batch.clear();
+                SST_ADD(SAMPLE_ACC, sst_t_sa);
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -3961,7 +4028,9 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                const int64_t sst_t_acc = SST_T0();
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                SST_ADD(ACCEPT, sst_t_acc);
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -3989,13 +4058,19 @@ private:
             }
 
             // add accepted tokens to the prompt
+            const int64_t sst_t_kf = SST_T0();
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+            SST_ADD(ACCEPT, sst_t_kf);
 
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            const int64_t sst_t_rm = SST_T0();
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            SST_ADD(SEQ_RM, sst_t_rm);
+            const int64_t sst_t_tok = SST_T0();
+            struct sst_tok_guard { step_timing & s; int64_t t0; ~sst_tok_guard() { if (s.enabled) { s.add(step_timing::TOKENS, t0); s.step_pending = true; } } } sst_tg{sst, sst_t_tok};
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

@@ -19,6 +19,14 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <chrono>
+
+// diagnostic: host time split of the MTP draft/process paths (ns), read by the server's LLAMA_SERVER_STEP_TIMING
+int64_t common_spec_timing_ns[5] = {}; // 0 draft decode calls, 1 draft sample (incl. wait), 2 draft seq_rm, 3 process decode, 4 process copies (incl. wait)
+static int64_t spec_tim_now() {
+    static const bool en = [] { const char * e = getenv("LLAMA_SERVER_STEP_TIMING"); return e && atoi(e) != 0; }();
+    return en ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+}
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1561,7 +1569,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const int64_t tim0 = spec_tim_now();
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                common_spec_timing_ns[3] += spec_tim_now() - tim0;
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1578,6 +1588,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const int64_t tim_cp = spec_tim_now();
+        struct tim_guard { int64_t t0; ~tim_guard() { common_spec_timing_ns[4] += spec_tim_now() - t0; } } tim_g{tim_cp};
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1650,11 +1662,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t tim0 = spec_tim_now();
             int ret = llama_decode(ctx_dft, batch);
+            const int64_t tim1 = spec_tim_now();
+            common_spec_timing_ns[0] += tim1 - tim0;
+            if (tim1) {
+                llama_synchronize(ctx_dft); // timing only: separate the GPU wait from the sampling
+                common_spec_timing_ns[2] += spec_tim_now() - tim1;
+            }
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
+            const int64_t tim2 = spec_tim_now();
+            struct tim_guard { int64_t t0; ~tim_guard() { common_spec_timing_ns[1] += spec_tim_now() - t0; } } tim_g{tim2};
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
