@@ -1046,6 +1046,30 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     return embd_layer_inp[lid].data;
 }
 
+void llama_context::sampled_apply_ids_perm(int64_t row) {
+    if (row < 0 || (size_t) row >= sampling.ids_perm.size() || !sampling.ids_perm[row]) {
+        return;
+    }
+    const int32_t * perm = sampling.ids_perm[row];
+    sampling.ids_perm[row] = nullptr;
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (sampling.sampled.has_data() && (size_t) row < sampling.sampled.size) {
+        llama_token & t = sampling.sampled.data[row];
+        if (t >= 0 && t < n_vocab) {
+            t = perm[t];
+        }
+    }
+    if (sampling.candidates.has_data() && (size_t) row < sampling.candidates_count.size()) {
+        llama_token * c = sampling.candidates.data + row*n_vocab;
+        for (uint32_t i = 0; i < sampling.candidates_count[row]; ++i) {
+            if (c[i] >= 0 && c[i] < n_vocab) {
+                c[i] = perm[c[i]];
+            }
+        }
+    }
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1056,6 +1080,7 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     try {
         const int64_t row = output_resolve_row(idx);
         GGML_ASSERT(row < (int64_t) sampling.sampled.size);
+        sampled_apply_ids_perm(row);
         return sampling.sampled.data[row];
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled token id %d, reason: %s\n", __func__, idx, err.what());
@@ -1106,6 +1131,7 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
 
     try {
         const int64_t row = output_resolve_row(idx);
+        sampled_apply_ids_perm(row);
         if (sampling.candidates.has_data() &&
             (size_t) row < sampling.candidates_count.size() &&
             sampling.candidates_count[row] > 0) {
@@ -1952,7 +1978,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
-            if (n_outputs) {
+            if (n_outputs && res->logits_perm) {
+                // reduced draft vocab: logits are in permuted-row order, width w <= n_vocab.
+                // Scatter into original vocab order; tokens outside the computed rows get -inf.
+                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                const int64_t w = t_logits->ne[0];
+                GGML_ASSERT(w <= n_vocab);
+                std::vector<float> tmp(n_outputs*w);
+                ggml_backend_tensor_get_async(backend_res, t_logits, tmp.data(), 0, tmp.size()*sizeof(float));
+                ggml_backend_sched_synchronize(sched.get());
+                const int32_t * perm = res->logits_perm;
+                for (int64_t i = 0; i < n_outputs; ++i) {
+                    float * dst = logits_out + i*n_vocab;
+                    if (w < n_vocab) {
+                        std::fill(dst, dst + n_vocab, -INFINITY);
+                    }
+                    const float * src = tmp.data() + i*w;
+                    for (int64_t r = 0; r < w; ++r) {
+                        dst[perm[r]] = src[r];
+                    }
+                }
+            } else if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
@@ -2048,6 +2095,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+
+            // reduced draft vocab: backend samplers index permuted logit rows; map to token ids on the host
+            // after synchronization (in the sampled-token / candidates getters)
+            if (res->logits_perm) {
+                for (uint32_t i = 0; i < (uint32_t) n_outputs && n_outputs_prev + i < sampling.ids_perm.size(); ++i) {
+                    sampling.ids_perm[n_outputs_prev + i] = res->logits_perm;
+                }
+            }
         }
 
         n_outputs_prev += n_outputs;
@@ -2254,6 +2309,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
 
+        sampling.ids_perm.assign(n_outputs_max, nullptr);
+
         std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
     } else {
         sampling.logits     = {nullptr, 0};
@@ -2264,6 +2321,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         sampling.logits_count.clear();
         sampling.probs_count.clear();
         sampling.candidates_count.clear();
+        sampling.ids_perm.clear();
     }
 
     // set all ids as invalid (negative)
@@ -2366,6 +2424,9 @@ void llama_context::output_reorder() {
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+            if (i0 < sampling.ids_perm.size() && i1 < sampling.ids_perm.size()) {
+                std::swap(sampling.ids_perm[i0], sampling.ids_perm[i1]);
+            }
         }
     }
 

@@ -937,6 +937,11 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
+    // reduced draft vocab: when set, t_logits rows are in permuted-row order (width t_logits->ne[0],
+    // possibly < n_vocab). logits_perm maps row -> token id; readback scatters raw logits into
+    // original order and backend-sampled ids are mapped on the host.
+    const int32_t * logits_perm  = nullptr;
+
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_sampled;

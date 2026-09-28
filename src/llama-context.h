@@ -103,6 +103,9 @@ struct llama_context {
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
 
+    // reduced draft vocab: map a row's backend-sampled ids from permuted logit rows to token ids (once)
+    void sampled_apply_ids_perm(int64_t row);
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -319,6 +322,10 @@ private:
         std::vector<uint32_t> logits_count;
         std::vector<uint32_t> probs_count;
         std::vector<uint32_t> candidates_count;
+
+        // reduced draft vocab: per output row, the row -> token id map still to be applied to the
+        // copied candidates / sampled token (nullptr = none or already applied)
+        std::vector<const int32_t *> ids_perm;
 
         // optimization
         std::vector<llama_token> token_ids_full_vocab;

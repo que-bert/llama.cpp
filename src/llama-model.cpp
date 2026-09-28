@@ -2844,6 +2844,93 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }
 
+bool llama_model_set_draft_vocab(llama_model * model, const int32_t * ranked_ids, size_t n_ranked, int32_t n_draft) {
+    const auto & vocab = model->vocab;
+    const int64_t n_vocab = vocab.n_tokens();
+
+    ggml_tensor * w = model->output;
+    auto fail = [](const char * why) {
+        LLAMA_LOG_WARN("%s: reduced draft vocab disabled: %s\n", "llama_model_set_draft_vocab", why);
+        return false;
+    };
+    if (n_draft <= 0)                           { return fail("n_draft <= 0"); }
+    if (model->draft_vocab_n > 0)               { return fail("already applied"); }
+    if (n_draft >= n_vocab)                     { return fail("n_draft >= n_vocab"); }
+    if (model->arch != LLM_ARCH_QWEN35)         { return fail("only implemented for the qwen35 MTP graph"); }
+    if (!w || w == model->tok_embd)             { return fail("no separate output.weight (tied embeddings)"); }
+    if (strcmp(ggml_get_name(w), "output.weight") != 0) { return fail("output tensor is not output.weight"); }
+    if (model->output_s || model->output_b)     { return fail("output has scale/bias"); }
+    if (w->ne[1] != n_vocab || !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1) { return fail("unexpected output shape"); }
+    if (!w->buffer || ggml_backend_buffer_is_host(w->buffer)) { return fail("output.weight is not in a device buffer"); }
+    for (const auto & layer : model->layers) {
+        if (layer.nextn.shared_head_head || layer.nextn.embed_tokens == w) {
+            return fail("model has its own nextn head");
+        }
+    }
+
+    // token selection: specials first, then the ranked list, then ascending ids
+    std::vector<uint8_t> sel(n_vocab, 0);
+    int64_t n_sel = 0;
+    auto take = [&](int64_t id) {
+        if (id >= 0 && id < n_vocab && !sel[id] && n_sel < n_draft) { sel[id] = 1; ++n_sel; }
+    };
+    int64_t n_special = 0;
+    for (int64_t id = 0; id < n_vocab; ++id) {
+        const auto attr = vocab.token_get_attr((llama_token) id);
+        if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN)) ||
+                vocab.is_eog((llama_token) id)) {
+            ++n_special;
+            take(id);
+        }
+    }
+    if (n_special >= n_draft) { return fail("n_draft does not exceed the number of special tokens"); }
+    for (size_t i = 0; i < n_ranked && n_sel < n_draft; ++i) { take(ranked_ids[i]); }
+    for (int64_t id = 0; id < n_vocab && n_sel < n_draft; ++id) { take(id); }
+
+    std::vector<int32_t> perm; perm.reserve(n_vocab);
+    for (int64_t id = 0; id < n_vocab; ++id) { if ( sel[id]) { perm.push_back((int32_t) id); } }
+    for (int64_t id = 0; id < n_vocab; ++id) { if (!sel[id]) { perm.push_back((int32_t) id); } }
+    std::vector<int32_t> inv(n_vocab);
+    for (int64_t r = 0; r < n_vocab; ++r) { inv[perm[r]] = (int32_t) r; }
+
+    // inverse id tensor (token id -> permuted row, 4*n_vocab bytes) on the output's buffer type
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * t_inv  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_vocab);
+    ggml_set_name(t_inv,  "draft_vocab_inv");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(w->buffer));
+    if (!buf) { ggml_free(ctx); return fail("failed to allocate the id tensors"); }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(t_inv,  inv.data(),  0, ggml_nbytes(t_inv));
+
+    // permute output.weight rows in place, through host memory, in chunks
+    const size_t row_size = ggml_row_size(w->type, w->ne[0]);
+    GGML_ASSERT(row_size == w->nb[1]);
+    std::vector<uint8_t> src(ggml_nbytes(w));
+    ggml_backend_tensor_get(w, src.data(), 0, src.size());
+    const int64_t chunk_rows = std::max<int64_t>(1, (int64_t) ((64u << 20) / row_size));
+    std::vector<uint8_t> dst(chunk_rows*row_size);
+    for (int64_t r0 = 0; r0 < n_vocab; r0 += chunk_rows) {
+        const int64_t nr = std::min(chunk_rows, n_vocab - r0);
+        for (int64_t r = 0; r < nr; ++r) {
+            memcpy(dst.data() + r*row_size, src.data() + (size_t) perm[r0 + r]*row_size, row_size);
+        }
+        ggml_backend_tensor_set(w, dst.data(), (size_t) r0*row_size, nr*row_size);
+    }
+
+    model->draft_vocab_owner  = std::shared_ptr<void>(buf, [ctx](void * b) {
+        ggml_backend_buffer_free((ggml_backend_buffer_t) b);
+        ggml_free(ctx);
+    });
+    model->draft_vocab_perm   = std::move(perm);
+    model->draft_vocab_inv_t  = t_inv;
+    model->draft_vocab_n      = n_draft;
+
+    LLAMA_LOG_INFO("%s: reduced draft vocab: %d of %lld rows (%lld special, %zu ranked ids given), id tensors %.2f MiB\n",
+            __func__, n_draft, (long long) n_vocab, (long long) n_special, n_ranked, ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    return true;
+}
+
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }
