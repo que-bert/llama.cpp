@@ -1345,6 +1345,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //   neither (qwen35 / qwen35moe): a single trained MTP head.
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
+
+    struct { int64_t n_phase = 0, n_fallback = 0, n_checked = 0, n_hit = 0; } chain_stats; // MTP device chain
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
@@ -1636,6 +1638,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // to the loop below. Opt-in (LLAMA_MTP_GPU_CHAIN=1): with the token embeddings on the host the
         // argmax -> get_rows(tok_embd) hop splits the graph into GPU/CPU/GPU segments with a sync at each
         // boundary, measured slower than the host loop at 176k (R7). Needs a device copy of tok_embd.
+        int i_start = 0;
+
         static const bool no_gpu_chain = [] {
             const char * e = getenv("LLAMA_MTP_GPU_CHAIN");
             return !(e && atoi(e) != 0);
@@ -1653,9 +1657,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memset(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, 0, row_bytes);
             }
 
+            // with the device embedding cache, a drafted token outside the cached subset was embedded wrongly
+            // (slot 0) for the next step: keep the drafts up to it and redo the later steps on the host path
+            auto * model_dft = llama_get_model(ctx_dft);
+            static const bool has_cache = llama_model_draft_embd_n(model_dft) > 0;
+
             llama_set_mtp_chain(ctx_dft, true);
             const int ret = llama_decode(ctx_dft, batch);
             llama_set_mtp_chain(ctx_dft, false);
+
+            int t_miss = -1;
+            llama_token id_miss = LLAMA_TOKEN_NULL;
 
             if (ret != 0) {
                 SPC_ERR("llama_decode(chain) returned %d\n", ret);
@@ -1678,16 +1690,47 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                     common_sampler_accept(smpl, id, true);
                     result.push_back(id);
+
+                    if (has_cache && t + 1 < params.n_max) {
+                        const bool hit = llama_model_draft_embd_hit(model_dft, id);
+                        chain_stats.n_checked++;
+                        chain_stats.n_hit += hit;
+                        if (!hit) {
+                            t_miss  = t;
+                            id_miss = id;
+                            break;
+                        }
+                    }
                 }
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
-                dp.result->clear();
+            if (has_cache && ++chain_stats.n_phase % 500 == 0) {
+                SPC_WRN("MTP chain: %lld phases, %lld host fallbacks, embedding cache hit rate %.4f (%lld/%lld)\n",
+                        (long long) chain_stats.n_phase, (long long) chain_stats.n_fallback,
+                        chain_stats.n_checked ? (double) chain_stats.n_hit/chain_stats.n_checked : 0.0,
+                        (long long) chain_stats.n_hit, (long long) chain_stats.n_checked);
             }
-            return;
+
+            if (t_miss < 0) {
+                if (dp.result->size() < (size_t) params.n_min) {
+                    dp.result->clear();
+                }
+                return;
+            }
+
+            chain_stats.n_fallback++;
+
+            // host path from step t_miss+1: drop the KV the chain wrote there, feed (id_miss, h_nextn[t_miss])
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.pos0 + t_miss + 1, -1);
+            std::vector<float> h_miss(llama_get_embeddings_nextn_ith(ctx_dft, t_miss), llama_get_embeddings_nextn_ith(ctx_dft, t_miss) + n_embd);
+            common_batch_clear(batch);
+            common_batch_add(batch, id_miss, dp.pos0 + t_miss + 1, { seq_id }, true);
+            std::memcpy(batch.embd, h_miss.data(), row_bytes);
+            i_last[seq_id] = 0;
+            i_start = t_miss + 1;
         }
 
-        int i = 0;
+        int i = i_start;
 
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and

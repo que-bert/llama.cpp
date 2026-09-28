@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "../src/llama-ext.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1334,8 +1335,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl->model.reset(model);
 
     // reduced MTP draft-head vocab: permute output.weight before any context exists
-    if (params.speculative.draft.vocab_n > 0) {
-        std::vector<int32_t> ranked;
+    const char * mtp_chain_env = getenv("LLAMA_MTP_GPU_CHAIN");
+    const bool   mtp_chain     = mtp_chain_env && atoi(mtp_chain_env) != 0;
+    std::vector<int32_t> ranked;
+    if (params.speculative.draft.vocab_n > 0 || mtp_chain) {
         if (!params.speculative.draft.vocab_file.empty()) {
             std::ifstream f(params.speculative.draft.vocab_file);
             if (!f) {
@@ -1354,7 +1357,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         } else {
             LOG_WRN("%s: --spec-draft-vocab without --spec-draft-vocab-file: using specials + lowest token ids\n", __func__);
         }
+    }
+    if (params.speculative.draft.vocab_n > 0) {
         llama_model_set_draft_vocab(model, ranked.data(), ranked.size(), params.speculative.draft.vocab_n);
+    }
+    // MTP device draft chain (LLAMA_MTP_GPU_CHAIN=1): device embedding cache for the ranked ids;
+    // LLAMA_MTP_CHAIN_EMBD_N sets the row count, else LLAMA_MTP_CHAIN_EMBD_MIB (default 234) the budget
+    if (mtp_chain) {
+        const char * en = getenv("LLAMA_MTP_CHAIN_EMBD_N");
+        const char * em = getenv("LLAMA_MTP_CHAIN_EMBD_MIB");
+        const size_t budget = (size_t) (em ? atof(em) : 234.0) * 1024 * 1024;
+        llama_model_init_draft_embd_cache(model, ranked.data(), ranked.size(), en ? atoi(en) : 0, budget);
     }
 
     if (model_only) {

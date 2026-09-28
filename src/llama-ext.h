@@ -103,6 +103,13 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // evaluate a multi-token MTP draft ubatch as a device-side chain of 1-token steps (see llama_cparams::mtp_chain)
 LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
 
+// MTP device draft chain embedding cache: device copies of the token embeddings of a fixed id subset (specials,
+// ranked_ids, then ascending ids), n_cache rows (<= 0: as many as fit budget_bytes incl. the id -> slot map).
+// Call after llama_model_set_draft_vocab (if used), before creating contexts. Returns the number of cached ids.
+LLAMA_API int32_t llama_model_init_draft_embd_cache(struct llama_model * model, const int32_t * ranked_ids, size_t n_ranked, int32_t n_cache, size_t budget_bytes);
+LLAMA_API bool    llama_model_draft_embd_hit(const struct llama_model * model, llama_token id);
+LLAMA_API int32_t llama_model_draft_embd_n(const struct llama_model * model);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

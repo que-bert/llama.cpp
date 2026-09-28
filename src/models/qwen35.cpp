@@ -568,6 +568,19 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
         GGML_ASSERT(head_norm_w && head_w);
 
+        // reduced draft vocab (D1): the head is a view of the first draft_vocab_n permuted rows
+        if (model.draft_vocab_n > 0 && !layer.nextn.shared_head_head) {
+            head_w = ggml_view_2d(ctx0, model.output, model.output->ne[0], model.draft_vocab_n, model.output->nb[1], 0);
+            res->logits_perm = model.draft_vocab_perm.data();
+        }
+        // embedding cache (llama_model_init_draft_embd_cache): step k+1 embeds top1(logits_k) on the device via
+        // the logit-index -> cache-slot map. A miss maps to slot 0; the host detects it and redoes the later steps.
+        ggml_tensor * embd_cache = model.draft_embd_cache;
+        ggml_tensor * embd_map   = model.draft_embd_map;
+        if (model.draft_vocab_n > 0 && !embd_cache) {
+            GGML_ABORT("MTP chain with a reduced draft vocab needs the device embedding cache");
+        }
+
         ggml_tensor * tok_k = ggml_view_1d(ctx0, inp_tokens, 1, 0);
         ggml_tensor * h_k   = ggml_view_2d(ctx0, inp_h, hparams.n_embd, 1, inp_h->nb[1], 0);
 
@@ -575,7 +588,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * all_logits = nullptr;
 
         for (int64_t k = 0; k < n_tokens; ++k) {
-            ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, tok_k);
+            ggml_tensor * tok_embd = nullptr;
+            if (k > 0 && embd_cache) {
+                ggml_tensor * slot = ggml_get_rows(ctx0, embd_map, tok_k);        // I32 [1, 1]
+                tok_embd = ggml_get_rows(ctx0, embd_cache, ggml_reshape_1d(ctx0, slot, 1));
+            } else {
+                tok_embd = ggml_get_rows(ctx0, tok_embd_w, tok_k);
+            }
 
             ggml_tensor * h_norm = build_norm(h_k,      layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
             ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
@@ -682,7 +701,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             all_logits = all_logits ? ggml_concat(ctx0, all_logits, logits, 1) : logits;
 
             if (k + 1 < n_tokens) {
-                tok_k = ggml_argmax(ctx0, logits);
+                // top_k(1) instead of argmax: the Vulkan argmax is one workgroup per row (~0.83 ms at 64k logits)
+                tok_k = embd_cache ? ggml_reshape_1d(ctx0, ggml_top_k(ctx0, logits, 1), 1) : ggml_argmax(ctx0, logits);
                 h_k   = h_out;
             }
         }

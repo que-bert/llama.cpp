@@ -2931,6 +2931,101 @@ bool llama_model_set_draft_vocab(llama_model * model, const int32_t * ranked_ids
     return true;
 }
 
+int32_t llama_model_init_draft_embd_cache(llama_model * model, const int32_t * ranked_ids, size_t n_ranked, int32_t n_cache, size_t budget_bytes) {
+    const auto & vocab = model->vocab;
+    const int64_t n_vocab = vocab.n_tokens();
+    auto fail = [](const char * why) {
+        LLAMA_LOG_WARN("%s: MTP chain embedding cache disabled: %s\n", "llama_model_init_draft_embd_cache", why);
+        return 0;
+    };
+    if (model->draft_embd_cache)                  { return fail("already applied"); }
+    if (model->arch != LLM_ARCH_QWEN35)           { return fail("only implemented for the qwen35 MTP graph"); }
+    ggml_tensor * te = model->tok_embd;
+    for (const auto & layer : model->layers) {
+        if (layer.nextn.embed_tokens) { te = layer.nextn.embed_tokens; }
+    }
+    ggml_tensor * w = model->output;
+    if (!te || te->ne[1] != n_vocab || !ggml_is_contiguous(te)) { return fail("unexpected token_embd shape"); }
+    if (!w || !w->buffer || ggml_backend_buffer_is_host(w->buffer)) { return fail("output.weight is not in a device buffer"); }
+
+    // number of draft-head logit indices: permuted rows with a reduced draft vocab, else token ids
+    const int64_t n_idx = model->draft_vocab_n > 0 ? model->draft_vocab_n : n_vocab;
+    const size_t  row   = ggml_row_size(te->type, te->ne[0]);
+    const size_t  map_b = GGML_PAD((size_t) n_idx*sizeof(int32_t), 256);
+    if (n_cache <= 0) {
+        n_cache = budget_bytes > map_b + 4096 ? (int32_t) ((budget_bytes - map_b - 4096) / row) : 0;
+    }
+    n_cache = (int32_t) std::min<int64_t>(n_cache, n_vocab);
+    if (n_cache <= 0) { return fail("no budget"); }
+
+    // subset: specials, then ranked ids, then ascending ids (the D1 draft-vocab order)
+    std::vector<int32_t> ids; ids.reserve(n_cache);
+    std::vector<uint8_t> hit(n_vocab, 0);
+    auto take = [&](int64_t id) {
+        if (id >= 0 && id < n_vocab && !hit[id] && (int32_t) ids.size() < n_cache) { hit[id] = 1; ids.push_back((int32_t) id); }
+    };
+    for (int64_t id = 0; id < n_vocab; ++id) {
+        const auto attr = vocab.token_get_attr((llama_token) id);
+        if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN)) || vocab.is_eog((llama_token) id)) {
+            take(id);
+        }
+    }
+    for (size_t i = 0; i < n_ranked; ++i) { take(ranked_ids[i]); }
+    for (int64_t id = 0; id < n_vocab; ++id) { take(id); }
+
+    std::vector<int32_t> slot_of(n_vocab, -1);
+    for (size_t s = 0; s < ids.size(); ++s) { slot_of[ids[s]] = (int32_t) s; }
+    std::vector<int32_t> map(n_idx);
+    for (int64_t i = 0; i < n_idx; ++i) {
+        const int32_t id = model->draft_vocab_n > 0 ? model->draft_vocab_perm[i] : (int32_t) i;
+        map[i] = std::max(0, slot_of[id]);
+    }
+
+    ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * t_cache = ggml_new_tensor_2d(ctx, te->type, te->ne[0], (int64_t) ids.size());
+    ggml_tensor * t_map   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_idx);
+    ggml_set_name(t_cache, "draft_embd_cache");
+    ggml_set_name(t_map,   "draft_embd_map");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(w->buffer));
+    if (!buf) { ggml_free(ctx); return fail("allocation failed"); }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(t_map, map.data(), 0, ggml_nbytes(t_map));
+
+    GGML_ASSERT(row == te->nb[1] && row == t_cache->nb[1]);
+    const int64_t cr = std::max<int64_t>(1, (int64_t) ((64u << 20) / row));
+    std::vector<uint8_t> tmp(cr*row);
+    for (int64_t r0 = 0; r0 < (int64_t) ids.size(); r0 += cr) {
+        const int64_t nr = std::min<int64_t>(cr, (int64_t) ids.size() - r0);
+        for (int64_t r = 0; r < nr; ++r) {
+            ggml_backend_tensor_get(te, tmp.data() + r*row, (size_t) ids[r0 + r]*row, row);
+        }
+        ggml_backend_tensor_set(t_cache, tmp.data(), (size_t) r0*row, nr*row);
+    }
+
+    model->draft_embd_owner = std::shared_ptr<void>(buf, [ctx](void * b) {
+        ggml_backend_buffer_free((ggml_backend_buffer_t) b);
+        ggml_free(ctx);
+    });
+    model->draft_embd_cache = t_cache;
+    model->draft_embd_map   = t_map;
+    model->draft_embd_n     = (int32_t) ids.size();
+    model->draft_embd_hit   = std::move(hit);
+
+    LLAMA_LOG_WARN("%s: MTP chain embedding cache: %d of %lld ids of %s (%s), %.2f MiB on device (map %.2f MiB)\n", __func__,
+            model->draft_embd_n, (long long) n_vocab, ggml_get_name(te), ggml_type_name(te->type),
+            ggml_backend_buffer_get_size(buf)/1024.0/1024.0, ggml_nbytes(t_map)/1024.0/1024.0);
+    return model->draft_embd_n;
+}
+
+bool llama_model_draft_embd_hit(const llama_model * model, llama_token id) {
+    return id >= 0 && (size_t) id < model->draft_embd_hit.size() && model->draft_embd_hit[id];
+}
+
+int32_t llama_model_draft_embd_n(const llama_model * model) {
+    return model->draft_embd_n;
+}
+
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }

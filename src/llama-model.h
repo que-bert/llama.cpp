@@ -646,6 +646,16 @@ struct llama_model {
     struct ggml_tensor * draft_vocab_inv_t  = nullptr; // I32 [n_vocab] original token id -> permuted row
     std::shared_ptr<void> draft_vocab_owner;         // owns the ggml context + buffer of the two id tensors
 
+    // MTP device draft chain embedding cache (llama_model_init_draft_embd_cache): device copies of the token
+    // embeddings of a fixed subset of ids. draft_embd_map maps a draft-head logit index (a token id, or a
+    // permuted row with a reduced draft vocab) to its cache slot (0 on a miss; the host checks hits with
+    // draft_embd_hit, indexed by token id).
+    struct ggml_tensor * draft_embd_cache = nullptr; // [n_embd, n_cache], type of token_embd
+    struct ggml_tensor * draft_embd_map   = nullptr; // I32 [1, n_logit_idx]
+    int32_t              draft_embd_n     = 0;
+    std::vector<uint8_t> draft_embd_hit;             // [n_vocab]
+    std::shared_ptr<void> draft_embd_owner;
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
