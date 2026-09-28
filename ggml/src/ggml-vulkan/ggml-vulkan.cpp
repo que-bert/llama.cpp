@@ -3346,6 +3346,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
                                                  flash_attn_prefill_rdna4_v64_cm1_len, flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
                                                  sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                        // opt-in, slower (P2 design 2: G=2 split 70 TF, G=6 79 TF vs _v64 84): K fragments from the K scratch, no sK; GGML_VK_FA_PREFILL_RDNA4_KG=1 enables
+                        // GGML_VK_FA_PREFILL_KG_G: q heads per workgroup (even, divides g; default 2 -> 4-wave WGs, 2 WGs per CU)
+                        const char * kg_env = getenv("GGML_VK_FA_PREFILL_KG_G");
+                        const uint32_t kg_g = kg_env ? (uint32_t)atoi(kg_env) : 2u;
+                        if (getenv("GGML_VK_FA_PREFILL_RDNA4_KG") != nullptr && kg_g >= 2 && (kg_g % 2) == 0 && (g % kg_g) == 0) {
+                            device->fa_prefill_rdna4_kg_split[g] = g / kg_g;
+                            ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_kg[g], "flash_attn_prefill_rdna4_kg_g" + std::to_string(g),
+                                                     flash_attn_prefill_rdna4_kg_cm1_len, flash_attn_prefill_rdna4_kg_cm1_data, "main", 5,
+                                                     sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * kg_g, kg_g, diag, g / kg_g}, 1, true, true, 32);
+                        }
                     }
                 }
             }
@@ -8625,7 +8635,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                              (nbk1 % 16) == 0 && (nbv1 % 16) == 0;
         if (use_v64) {
             // _v64: one dequant pass writes K rows [ns][h][kv][d] and V tiles [ns][h][kv/32][d][32 kv] (zero-padded)
-            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_v64[G];
+            // _kg (same scratch layouts and push constants) reads K fragments from the scratch directly
+            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_kg[G] != nullptr ? ctx->device->pipeline_fa_prefill_rdna4_kg[G]
+                                                                                   : ctx->device->pipeline_fa_prefill_rdna4_v64[G];
             vk_pipeline dq = ctx->device->pipeline_fa_dequant_q8_0_rdna4;
             ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
             ggml_pipeline_request_descriptor_sets(ctx, dq, 2);
@@ -8671,8 +8683,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 mask ? std::max<uint32_t>(1u, nem3) : 1u,
                 pf_scale,
             };
+            const uint32_t split = pl == ctx->device->pipeline_fa_prefill_rdna4_kg[G] ? ctx->device->fa_prefill_rdna4_kg_split[G] : 1u;
             ggml_vk_dispatch_pipeline(ctx, subctx, pl, { q_buf, k_dst, v_dst, mask_buf, dst_buf }, ppc,
-                                      { (uint32_t)CEIL_DIV(neq1, 16), (uint32_t)nek2, (uint32_t)neq3 });
+                                      { (uint32_t)CEIL_DIV(neq1, 16), (uint32_t)nek2 * split, (uint32_t)neq3 });
             ctx->prealloc_x_need_sync = true;
             return;
         }
@@ -8724,8 +8737,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 mask ? std::max<uint32_t>(1u, nem3) : 1u,
                 pf_scale,
             };
+            const uint32_t split = pl == ctx->device->pipeline_fa_prefill_rdna4_kg[G] ? ctx->device->fa_prefill_rdna4_kg_split[G] : 1u;
             ggml_vk_dispatch_pipeline(ctx, subctx, pl, { q_buf, k_dst, v_dst, mask_buf, dst_buf }, ppc,
-                                      { (uint32_t)CEIL_DIV(neq1, 16), (uint32_t)nek2, (uint32_t)neq3 });
+                                      { (uint32_t)CEIL_DIV(neq1, 16), (uint32_t)nek2 * split, (uint32_t)neq3 });
             ctx->prealloc_x_need_sync = true;
             return;
         }

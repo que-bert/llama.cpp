@@ -1026,6 +1026,9 @@ struct vk_device_struct {
     // same, softmax in registers (flash_attn_prefill_rdna4_rs.comp); GGML_VK_NO_FA_PREFILL_RDNA4_RS=1 disables
     vk_pipeline pipeline_fa_prefill_rdna4_rs[7];
     vk_pipeline pipeline_fa_prefill_rdna4_v64[7];
+    // K fragments read straight from the f16 K scratch (no sK); opt-in: GGML_VK_FA_PREFILL_RDNA4_KG=1 (slower than _v64)
+    vk_pipeline pipeline_fa_prefill_rdna4_kg[7];
+    uint32_t fa_prefill_rdna4_kg_split[7] = {};  // workgroups per KV head for _kg (each takes G / split q heads)
     vk_pipeline pipeline_fa_dequant_q8_0_rdna4;
     vk_pipeline pipeline_count_experts;
 
