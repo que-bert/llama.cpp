@@ -3251,7 +3251,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4[g], "flash_attn_prefill_rdna4_g" + std::to_string(g),
                                      flash_attn_prefill_rdna4_cm1_len, flash_attn_prefill_rdna4_cm1_data, "main", 5,
                                      sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g}, 1, true, true, 32);
-            if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_VT") == nullptr) {
+            if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_VT") == nullptr && (g % 2) == 0) {  // PV pairs row tiles
                 // GGML_VK_FA_PREFILL_DIAG: profiling-only bitmask that removes work (results are wrong)
                 const char * diag_env = getenv("GGML_VK_FA_PREFILL_DIAG");
                 const uint32_t diag = diag_env ? (uint32_t)atoi(diag_env) : 0u;

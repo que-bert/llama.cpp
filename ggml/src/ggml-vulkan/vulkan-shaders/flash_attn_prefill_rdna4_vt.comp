@@ -64,7 +64,6 @@ shared vec4  sS[16 * G * SSTR];                // S = Q K^T, f32
 shared uvec4 sP[16 * G * PSTR];                // P, f16
 shared vec4  sA[G * 64];                       // per row tile 16x16 broadcast of row factor
 shared float16_t sM[PQ * BC];                  // mask tile
-shared uint  sMF[NW];                          // per-wave "tile has a finite mask entry"
 shared uint  sR[NW];                           // per-wave "row max changed"
 
 #define MATA  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -76,7 +75,9 @@ void main() {
     const uint wave = gl_SubgroupID;
     const uint lane = gl_SubgroupInvocationID;
     const uint t    = wave >> 1;               // row tile = q head within the group
-    const uint half_ = wave & 1;               // QK: column tile; PV: hsv half
+    const uint half_ = wave & 1;               // QK: column tile
+    const uint pt0  = (wave >> 2) * 2;         // PV: row-tile pair (needs G even)
+    const uint pq   = wave & 3;                // PV: hsv quarter (64 columns)
 
     const uint p0   = gl_WorkGroupID.x * PQ;
     const uint kvh  = gl_WorkGroupID.y;
@@ -145,23 +146,6 @@ void main() {
         } \
     }
 
-#define PREFETCH_VM(j) { \
-        const uint kv0_ = (j) * BC; \
-        [[unroll]] for (uint i = 0; i < NLV; ++i) { \
-            const uint e = min(tid + i * WG, BC / 2 * 32 - 1); \
-            const uint r2 = kv0_ + (e >> 5) * 2, c = e & 31; \
-            prv[i][0] = data_v[v_base + min(r2,     KV - 1) * p.v_s1 + c]; \
-            prv[i][1] = data_v[v_base + min(r2 + 1, KV - 1) * p.v_s1 + c]; \
-        } \
-        [[unroll]] for (uint i = 0; i < NML; ++i) { \
-            const uint e = min(tid + i * WG, PQ * BC / 2 - 1); \
-            const uint pos = min(p0 + (e >> 4), N - 1), c = kv0_ + (e & 15) * 2; \
-            const uint mb = m_base + pos * p.m_s1; \
-            pm[i][0] = data_m[has_mask ? mb + min(c,     KV - 1) : 0]; \
-            pm[i][1] = data_m[has_mask ? mb + min(c + 1, KV - 1) : 0]; \
-        } \
-    }
-
 #define STAGE_K { \
         [[unroll]] for (uint i = 0; i < NLK; ++i) { \
             const uint e = tid + i * WG; \
@@ -172,153 +156,190 @@ void main() {
         } \
     }
 
-    // Barrier schedule per KV tile j (3 instead of 4): QK(j) | B | K(j+1) -> sK, softmax(j) | B |
-    // PV(j) | B. V(j), mask(j) are staged at the top of iteration j (sVt/sM free after the last
-    // barrier) and become visible at the first barrier; QK(j) reads only sK.
+
+#define PREFETCH_V(j) { \
+        const uint kv0_ = (j) * BC; \
+        [[unroll]] for (uint i = 0; i < NLV; ++i) { \
+            const uint e = min(tid + i * WG, BC / 2 * 32 - 1); \
+            const uint r2 = kv0_ + (e >> 5) * 2, c = e & 31; \
+            prv[i][0] = data_v[v_base + min(r2,     KV - 1) * p.v_s1 + c]; \
+            prv[i][1] = data_v[v_base + min(r2 + 1, KV - 1) * p.v_s1 + c]; \
+        } \
+    }
+
+#define PREFETCH_M(j) { \
+        const uint kv0_ = (j) * BC; \
+        [[unroll]] for (uint i = 0; i < NML; ++i) { \
+            const uint e = min(tid + i * WG, PQ * BC / 2 - 1); \
+            const uint pos = min(p0 + (e >> 4), N - 1), c = kv0_ + (e & 15) * 2; \
+            const uint mb = m_base + pos * p.m_s1; \
+            pm[i][0] = data_m[has_mask ? mb + min(c,     KV - 1) : 0]; \
+            pm[i][1] = data_m[has_mask ? mb + min(c + 1, KV - 1) : 0]; \
+        } \
+    }
+
+#define STAGE_V { \
+        [[unroll]] for (uint i = 0; i < NLV; ++i) { \
+            const uint e = tid + i * WG; \
+            if (e < BC / 2 * 32) { \
+                const uint r = e >> 5, c = e & 31; \
+                const uvec4 a = prv[i][0], b = prv[i][1]; \
+                /* d = 8c + 2w + h: low half from kv row 2r, high half from row 2r + 1 */ \
+                [[unroll]] for (uint w = 0; w < 4; ++w) { \
+                    sVt[(c * 8 + 2 * w)     * VSTR + r] = (a[w] & 0xFFFFu) | (b[w] << 16); \
+                    sVt[(c * 8 + 2 * w + 1) * VSTR + r] = (a[w] >> 16) | (b[w] & 0xFFFF0000u); \
+                } \
+            } \
+        } \
+    }
+
+#define STAGE_M(j) { \
+        [[unroll]] for (uint i = 0; i < NML; ++i) { \
+            const uint e = tid + i * WG; \
+            if (e < PQ * BC / 2) { \
+                const uint c = (j) * BC + (e & 15) * 2; \
+                const bool prow = p0 + (e >> 4) < N; \
+                const float16_t ninf = float16_t(-1.0/0.0); \
+                sM[e * 2]     = (prow && c     < KV) ? (has_mask ? pm[i][0] : float16_t(0.0)) : ninf; \
+                sM[e * 2 + 1] = (prow && c + 1 < KV) ? (has_mask ? pm[i][1] : float16_t(0.0)) : ninf; \
+            } \
+        } \
+    }
+
+    // Software-pipelined schedule, 2 barriers per KV tile:
+    //   A(j): softmax(j) [sS, sM -> sP, sA, sR]; stage K(j+1) -> sK, V(j) -> sVt
+    //   B(j): O = diag(alpha) O + P V(j), interleaved with S(j+1) = Q K(j+1)^T -> sS;
+    //         stage mask(j+1) -> sM
+    // QK is one 16-deep dependent WMMA chain per wave; sharing a phase with the 16 independent
+    // PV WMMAs hides its latency. No fully-masked-tile skip: a -inf tile gives P = 0, alpha = 1.
+    // At the last tile, B computes a discarded S from stale sK (all indices stay in range).
     PREFETCH_K(0)
-    PREFETCH_VM(0)
+    PREFETCH_M(0)
     STAGE_K
-    if (1 < nj) PREFETCH_K(1)
+    STAGE_M(0)
+    PREFETCH_K(1)
+    PREFETCH_V(0)
+    PREFETCH_M(1)
+    barrier();
+    {
+        MATC Sacc = MATC(0.0);
+        [[unroll]] for (uint k = 0; k < 16; ++k) {
+            MATB Kf;
+            coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
+            Sacc = coopMatMulAdd(Qf[k], Kf, Sacc);
+        }
+        coopMatStore(Sacc, sS, (t * 16) * SSTR + half_ * 4, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+    }
     barrier();
 
     for (uint j = 0; j < nj; ++j) {
-        // ---- stage V/mask tile j
-        [[unroll]] for (uint i = 0; i < NLV; ++i) {
-            const uint e = tid + i * WG;
-            if (e < BC / 2 * 32) {
-                const uint r = e >> 5, c = e & 31;
-                const uvec4 a = prv[i][0], b = prv[i][1];
-                // d = 8c + 2w + h: low half from kv row 2r, high half from row 2r + 1
-                [[unroll]] for (uint w = 0; w < 4; ++w) {
-                    sVt[(c * 8 + 2 * w)     * VSTR + r] = (a[w] & 0xFFFFu) | (b[w] << 16);
-                    sVt[(c * 8 + 2 * w + 1) * VSTR + r] = (a[w] >> 16) | (b[w] & 0xFFFF0000u);
-                }
+        // ---- A(j): online softmax, f32
+        {
+            const vec4 a = sS[sr * SSTR + sq * 2];
+            const vec4 b = sS[sr * SSTR + sq * 2 + 1];
+            float s[8] = float[8](a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+            float mx = -1.0/0.0;
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                s[e] = s[e] * p.scale + float(sM[slr * BC + sq * 8 + e]);
+                mx = max(mx, s[e]);
             }
-        }
-        bool anyf = false;
-        [[unroll]] for (uint i = 0; i < NML; ++i) {
-            const uint e = tid + i * WG;
-            if (e < PQ * BC / 2) {
-                const uint c = j * BC + (e & 15) * 2;
-                const bool prow = p0 + (e >> 4) < N;
-                const float16_t ninf = float16_t(-1.0/0.0);
-                const float16_t m0 = (prow && c     < KV) ? (has_mask ? pm[i][0] : float16_t(0.0)) : ninf;
-                const float16_t m1 = (prow && c + 1 < KV) ? (has_mask ? pm[i][1] : float16_t(0.0)) : ninf;
-                sM[e * 2]     = m0;
-                sM[e * 2 + 1] = m1;
-                anyf = anyf || !isinf(float(m0)) || !isinf(float(m1));
+            mx = max(mx, subgroupShuffleXor(mx, 1));
+            mx = max(mx, subgroupShuffleXor(mx, 2));
+            const float m_new = max(m_i, mx);
+            float rs = 0.0;
+            f16vec2 ph[4];
+            [[unroll]] for (uint e = 0; e < 4; ++e) {
+                const float e0 = exp(s[2 * e] - m_new);
+                const float e1 = exp(s[2 * e + 1] - m_new);
+                rs += e0 + e1;
+                ph[e] = f16vec2(e0, e1);
             }
+            rs += subgroupShuffleXor(rs, 1);
+            rs += subgroupShuffleXor(rs, 2);
+            const float alpha = exp(m_i - m_new);
+            l_i = l_i * alpha + rs;
+            m_i = m_new;
+            sP[sr * PSTR + sq] = uvec4(packFloat2x16(ph[0]), packFloat2x16(ph[1]),
+                                       packFloat2x16(ph[2]), packFloat2x16(ph[3]));
+            sA[st * 64 + slr * 4 + sq] = vec4(alpha);
+            const bool resc = subgroupAny(alpha != 1.0);
+            if (lane == 0) sR[wave] = resc ? 1u : 0u;
         }
-        anyf = subgroupAny(anyf);
-        if (lane == 0) sMF[wave] = anyf ? 1u : 0u;
-        if ((DIAG & 4) == 0 && j + 1 < nj) PREFETCH_VM(j + 1)
+        STAGE_K
+        STAGE_V
+        if ((DIAG & 4) == 0) {
+            PREFETCH_K(j + 2)
+            PREFETCH_V(j + 1)
+        }
+        barrier();
 
-        // ---- S = Q K^T for (row tile t, column tile half_); computed even for a fully masked
-        // tile (the liveness flags are only visible after the next barrier)
+        // ---- B(j): rescale, PV(j) for row tiles (pt0, pt0+1) x hsv quarter pq, and QK(j+1)
+        [[unroll]] for (uint r = 0; r < 2; ++r) {
+            const uint tr = pt0 + r;
+            if ((sR[2 * tr] | sR[2 * tr + 1]) != 0) {
+                MATC Am;
+                coopMatLoad(Am, sA, tr * 64, 4, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint i = 0; i < 4; ++i) Oacc[r * 4 + i] = Oacc[r * 4 + i] * Am;
+            }
+        }
         {
             MATC Sacc = MATC(0.0);
-            [[unroll]] for (uint k = 0; k < 16; ++k) {
-                MATB Kf;
-                coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
-                if ((DIAG & 1) == 0) Sacc = coopMatMulAdd(Qf[k], Kf, Sacc);
+            [[unroll]] for (uint kk = 0; kk < 2; ++kk) {
+                MATA Pf0, Pf1;
+                coopMatLoad(Pf0, sP, (pt0 * 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(Pf1, sP, (pt0 * 16 + 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    MATB Vf;
+                    coopMatLoad(Vf, sVt, (pq * 64 + i * 16) * VSTR + kk * 8, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
+                    if ((DIAG & 2) == 0) {
+                        Oacc[i]     = coopMatMulAdd(Pf0, Vf, Oacc[i]);
+                        Oacc[4 + i] = coopMatMulAdd(Pf1, Vf, Oacc[4 + i]);
+                    }
+                    [[unroll]] for (uint h = 0; h < 2; ++h) {
+                        const uint k = kk * 8 + i * 2 + h;
+                        MATB Kf;
+                        coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
+                        if ((DIAG & 1) == 0) Sacc = coopMatMulAdd(Qf[k], Kf, Sacc);
+                    }
+                }
             }
             coopMatStore(Sacc, sS, (t * 16) * SSTR + half_ * 4, SSTR, gl_CooperativeMatrixLayoutRowMajor);
         }
-        barrier();
-
-        bool tile_live = false;
-        [[unroll]] for (uint w = 0; w < NW; ++w) tile_live = tile_live || (sMF[w] != 0);
-
-        // ---- all QK(j) done: stage K(j+1)
-        if (j + 1 < nj) {
-            STAGE_K
-            if ((DIAG & 4) == 0 && j + 2 < nj) PREFETCH_K(j + 2)
-        }
-
-        if (tile_live) {
-            // ---- online softmax, f32
-            {
-                const vec4 a = sS[sr * SSTR + sq * 2];
-                const vec4 b = sS[sr * SSTR + sq * 2 + 1];
-                float s[8] = float[8](a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
-                float mx = -1.0/0.0;
-                [[unroll]] for (uint e = 0; e < 8; ++e) {
-                    s[e] = s[e] * p.scale + float(sM[slr * BC + sq * 8 + e]);
-                    mx = max(mx, s[e]);
-                }
-                mx = max(mx, subgroupShuffleXor(mx, 1));
-                mx = max(mx, subgroupShuffleXor(mx, 2));
-                const float m_new = max(m_i, mx);
-                float rs = 0.0;
-                f16vec2 ph[4];
-                [[unroll]] for (uint e = 0; e < 4; ++e) {
-                    const float e0 = exp(s[2 * e] - m_new);
-                    const float e1 = exp(s[2 * e + 1] - m_new);
-                    rs += e0 + e1;
-                    ph[e] = f16vec2(e0, e1);
-                }
-                rs += subgroupShuffleXor(rs, 1);
-                rs += subgroupShuffleXor(rs, 2);
-                const float alpha = exp(m_i - m_new);
-                l_i = l_i * alpha + rs;
-                m_i = m_new;
-                sP[sr * PSTR + sq] = uvec4(packFloat2x16(ph[0]), packFloat2x16(ph[1]),
-                                           packFloat2x16(ph[2]), packFloat2x16(ph[3]));
-                sA[st * 64 + slr * 4 + sq] = vec4(alpha);
-                const bool resc = subgroupAny(alpha != 1.0);
-                if (lane == 0) sR[wave] = resc ? 1u : 0u;
-            }
-        }
-        barrier();
-
-        if (tile_live) {
-            // ---- O = diag(alpha) O + P V for (row tile t, hsv half half_)
-            if ((sR[2 * t] | sR[2 * t + 1]) != 0) {
-                MATC Am;
-                coopMatLoad(Am, sA, t * 64, 4, gl_CooperativeMatrixLayoutRowMajor);
-                [[unroll]] for (uint i = 0; i < 8; ++i) Oacc[i] = Oacc[i] * Am;
-            }
-            [[unroll]] for (uint kk = 0; kk < 2; ++kk) {
-                MATA Pf;
-                coopMatLoad(Pf, sP, (t * 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
-                [[unroll]] for (uint i = 0; i < 8; ++i) {
-                    MATB Vf;
-                    coopMatLoad(Vf, sVt, (half_ * 128 + i * 16) * VSTR + kk * 8, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
-                    if ((DIAG & 2) == 0) Oacc[i] = coopMatMulAdd(Pf, Vf, Oacc[i]);
-                }
-            }
-        }
+        STAGE_M(j + 1)
+        if ((DIAG & 4) == 0) PREFETCH_M(j + 2)
         barrier();
     }
 
     // ---- normalize by l and store
     sA[st * 64 + slr * 4 + sq] = vec4(l_i > 0.0 ? 1.0 / l_i : 0.0);
     barrier();
-    MATC Lm;
-    coopMatLoad(Lm, sA, t * 64, 4, gl_CooperativeMatrixLayoutRowMajor);
-    const uint head = kvh * G + t;
     const uint o_row = p.nhq * D;
-    const uint o_base = (iq3 * N + p0) * o_row + head * D + half_ * 128;
+    [[unroll]] for (uint r = 0; r < 2; ++r) {
+    MATC Lm;
+    coopMatLoad(Lm, sA, (pt0 + r) * 64, 4, gl_CooperativeMatrixLayoutRowMajor);
+    const uint head = kvh * G + pt0 + r;
+    const uint o_base = (iq3 * N + p0) * o_row + head * D + pq * 64;
     if (p0 + PQ <= N) {
-        [[unroll]] for (uint i = 0; i < 8; ++i) {
+        [[unroll]] for (uint i = r * 4; i < r * 4 + 4; ++i) {
             Oacc[i] = Oacc[i] * Lm;
-            coopMatStore(Oacc[i], data_o, o_base + i * 16, o_row, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(Oacc[i], data_o, o_base + (i & 3) * 16, o_row, gl_CooperativeMatrixLayoutRowMajor);
         }
     } else {
         // partial position block: stage each 16x16 through a per-wave LDS slot
         const uint slot = wave * 64;           // 64 vec4 = 256 floats per wave (sS is free now)
-        [[unroll]] for (uint i = 0; i < 8; ++i) {
+        [[unroll]] for (uint i = r * 4; i < r * 4 + 4; ++i) {
             Oacc[i] = Oacc[i] * Lm;
             coopMatStore(Oacc[i], sS, slot, 4, gl_CooperativeMatrixLayoutRowMajor);
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             for (uint e = lane; e < 256; e += 32) {
-                const uint r = e >> 4, c = e & 15;
-                if (p0 + r < N) {
-                    data_o[o_base + r * o_row + i * 16 + c] = sS[slot + r * 4 + (c >> 2)][c & 3];
+                const uint rr = e >> 4, c = e & 15;
+                if (p0 + rr < N) {
+                    data_o[o_base + rr * o_row + (i & 3) * 16 + c] = sS[slot + rr * 4 + (c >> 2)][c & 3];
                 }
             }
             subgroupBarrier();
         }
+    }
     }
 }
