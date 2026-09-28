@@ -2553,6 +2553,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                                 sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
                 }
+                // fused FFN gate+up GEMM + swiglu epilogue (graph fusion MUL_MAT, MUL_MAT, GLU); GGML_VK_NO_Q6K_SWIGLU=1 disables
+                if (getenv("GGML_VK_NO_Q6K_SWIGLU") == nullptr) {
+                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_glu, "mul_mm_q6k_rdna4_f16_glu", mul_mm_q6k_rdna4_f16_glu_cm1_len, mul_mm_q6k_rdna4_f16_glu_cm1_data, "main", 3,
+                                            sizeof(vk_mat_mat_push_constants), {64, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
+                    // 256-token tiles, 8 waves (GGML_VK_NO_Q6K_SWIGLU_N256=1 keeps the 128-token one)
+                    if (getenv("GGML_VK_NO_Q6K_SWIGLU_N256") == nullptr) {
+                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_glun256, "mul_mm_q6k_rdna4_f16_glun256", mul_mm_q6k_rdna4_f16_glun256_cm1_len, mul_mm_q6k_rdna4_f16_glun256_cm1_data, "main", 3,
+                                                sizeof(vk_mat_mat_push_constants), {64, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
+                    }
+                }
                 // split-K for shapes with too few 128x128 tiles for 64 CUs (e.g. ffn_down 5120 x 17408); GGML_VK_NO_Q6K_SPLITK=1 disables
                 if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_sk, "mul_mm_q6k_rdna4_f16_sk", mul_mm_q6k_rdna4_f16_sk_cm1_len, mul_mm_q6k_rdna4_f16_sk_cm1_data, "main", 3,
@@ -6349,7 +6359,8 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
     return pipeline;
 }
 
-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
+// glu_up != nullptr: fused FFN gate (src0) + up (glu_up) + swiglu into dst (the GLU node), RDNA4 Q6_K path only
+static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, const ggml_tensor * glu_up = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -6408,7 +6419,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                                  ne01 % 128 == 0 && ne10 % 256 == 0 && ne11 >= 64 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
                                  ggml_vk_dim01_contiguous(src0);
     // f32y variant: reads the f32 activations directly (converted to f16 on the global->LDS path), no pre-pass.
-    if (q6k_rdna4_shape && ctx->device->pipeline_mm_q6k_rdna4_f32y != nullptr && !ctx->device->uma && ggml_is_contiguous(src1)) {
+    if (glu_up == nullptr && q6k_rdna4_shape && ctx->device->pipeline_mm_q6k_rdna4_f32y != nullptr && !ctx->device->uma && ggml_is_contiguous(src1)) {
         vk_pipeline & qp = ctx->device->pipeline_mm_q6k_rdna4_f32y;
         ggml_pipeline_request_descriptor_sets(ctx, qp, 1);
         const vk_mat_mat_push_constants pc = { (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, stride_d,
@@ -6482,7 +6493,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     uint32_t q6k_split = 1;
     const bool q6k_n256 = want_q6k_f16 && (ne10 / 256) % 2 == 0 && ne11 >= 256 && ctx->device->pipeline_mm_q6k_rdna4_f16_n256 != nullptr &&
                           (ne01 / 128) * CEIL_DIV(ne11, 256) >= 128;  // small grids lose more to occupancy than they gain
-    if (want_q6k_f16 && ctx->device->pipeline_mm_q6k_rdna4_f16_sk != nullptr && dst->nb[1] == ne01 * sizeof(float)) {
+    if (glu_up == nullptr && want_q6k_f16 && ctx->device->pipeline_mm_q6k_rdna4_f16_sk != nullptr && dst->nb[1] == ne01 * sizeof(float)) {
         static const uint32_t q6k_split_env = []() { const char * e = getenv("GGML_VK_Q6K_SPLITK"); return e ? (uint32_t)atoi(e) : 0u; }();
         const uint32_t tiles = (uint32_t)(ne01 / 128) * (uint32_t)CEIL_DIV(ne11, q6k_n256 ? 256 : 128);
         const uint32_t nsb   = (uint32_t)(ne10 / 256);
@@ -6650,7 +6661,28 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool use_q6k_f16   = want_q6k_f16 && !qx_needs_dequant && d_Y == ctx->prealloc_y && y_buf_offset == 0;
     const bool use_q6k_rdna4 = use_q6k_f16 || (quantize_y && q6k_rdna4_shape && ctx->device->pipeline_mmq_q6k_rdna4 != nullptr);
-    if (use_q6k_rdna4) {
+    GGML_ASSERT(glu_up == nullptr || use_q6k_f16);
+    if (glu_up != nullptr) {
+        // one binding spanning both weight tensors (same device buffer, checked at fusion time)
+        vk_buffer d_U = ((ggml_backend_vk_buffer_context *)glu_up->buffer->context)->dev_buffer;
+        GGML_ASSERT(d_U == d_X);
+        const uint64_t og = x_buf_offset, ou = vk_tensor_offset(glu_up) + glu_up->view_offs;
+        const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+        const uint64_t base = (std::min(og, ou) / align) * align;
+        const uint64_t range = std::max(og, ou) + x_sz - base;
+        GGML_ASSERT((og - base) % 4 == 0 && (ou - base) % 4 == 0 && range <= ctx->device->properties.limits.maxStorageBufferRange);
+        static const bool glu_log = getenv("GGML_VK_MMQ_Q6K_LOG") != nullptr;
+        if (glu_log) {
+            fprintf(stderr, "q6k_rdna4(swiglu): m=%u n=%u k=%u gate=%s up=%s dst=%s\n", (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, src0->name, glu_up->name, dst->name);
+        }
+        vk_pipeline & gp = (ne11 % 256 == 0 && ctx->device->pipeline_mm_q6k_rdna4_f16_glun256 != nullptr) ? ctx->device->pipeline_mm_q6k_rdna4_f16_glun256
+                                                                                                            : ctx->device->pipeline_mm_q6k_rdna4_f16_glu;
+        ggml_pipeline_request_descriptor_sets(ctx, gp, 1);
+        const vk_mat_mat_push_constants pc = { (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, stride_d,
+                                               (uint32_t)(og - base), (uint32_t)(ou - base), stride_batch_d, 0, 1, (uint32_t)ne10, 1, 1, 1, 1, padded_n };
+        ggml_vk_dispatch_pipeline(ctx, subctx, gp, { vk_subbuffer{ d_X, base, range }, vk_subbuffer{ d_Y, y_buf_offset, y_sz }, ggml_vk_subbuffer(ctx, d_D, d_buf_offset) },
+                                  pc, { (uint32_t)ne01, (uint32_t)ne11, 1 });
+    } else if (use_q6k_rdna4) {
         static const bool q6k_log = getenv("GGML_VK_MMQ_Q6K_LOG") != nullptr;
         if (q6k_log) {
             fprintf(stderr, "q6k_rdna4(%s): m=%u n=%u k=%u stride_d=%u xoff=%zu yoff=%zu doff=%zu src0=%s dst=%s\n", use_q6k_f16 ? "f16" : "int8", (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, stride_d,
@@ -7387,7 +7419,44 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+// RDNA4 Q6_K: nodes i, i+1 = MUL_MAT(up|gate, x), i+2 = GLU swiglu split(gate, up) -> one fused GEMM
+static bool ggml_vk_can_fuse_q6k_swiglu(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (ctx->device->pipeline_mm_q6k_rdna4_f16_glu == nullptr || ctx->device->pipeline_mm_q6k_rdna4_f16 == nullptr || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * m0 = cgraph->nodes[i], * m1 = cgraph->nodes[i + 1], * glu = cgraph->nodes[i + 2];
+    if (m0->op != GGML_OP_MUL_MAT || m1->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    const ggml_tensor * g = glu->src[0], * u = glu->src[1];
+    if (!((g == m0 && u == m1) || (g == m1 && u == m0))) {
+        return false;
+    }
+    static constexpr std::initializer_list<ggml_op> pat = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+    if (!ggml_can_fuse_subgraph(cgraph, i, pat, { i + 2 })) {
+        return false;
+    }
+    const ggml_tensor * wg = g->src[0], * wu = u->src[0], * x = g->src[1];
+    if (u->src[1] != x || wg->type != GGML_TYPE_Q6_K || wu->type != GGML_TYPE_Q6_K || x->type != GGML_TYPE_F32 ||
+        g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(wg, wu) || !ggml_is_contiguous(wg) || !ggml_is_contiguous(wu) || !ggml_is_contiguous(x) || !ggml_is_contiguous(glu) ||
+        wg->ne[2] != 1 || wg->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
+        wg->ne[1] % 128 != 0 || wg->ne[0] % 512 != 0 || x->ne[1] < 128 || x->ne[1] % 128 != 0 ||
+        wg->view_src != nullptr || wu->view_src != nullptr || wg->buffer == nullptr || wg->buffer != wu->buffer) {
+        return false;
+    }
+    const uint64_t og = vk_tensor_offset(wg), ou = vk_tensor_offset(wu);
+    const uint64_t span = std::max(og, ou) + ggml_nbytes(wg) - std::min(og, ou) + ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    return og % 4 == 0 && ou % 4 == 0 && span <= ctx->device->properties.limits.maxStorageBufferRange;
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->fused_q6k_swiglu) {
+        const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+        ggml_vk_mul_mat_q_f16(ctx, subctx, glu->src[0]->src[0], glu->src[0]->src[1], cgraph->nodes[node_idx + 2], true, glu->src[1]->src[0]);
+        return;
+    }
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
@@ -14646,6 +14715,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
+        ctx->fused_q6k_swiglu = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14654,6 +14724,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_q6k_swiglu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_q6k_swiglu = true;
+                fusion_string = "Q6K_MUL_MAT_MUL_MAT_SWIGLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -14880,6 +14957,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
+                ctx->fused_q6k_swiglu = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }

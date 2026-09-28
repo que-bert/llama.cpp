@@ -799,6 +799,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mm_q6k_rdna4_f16_sk; // split-K variant of the f16 one (m=5120-class shapes with large K)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_up, pipeline_mm_q6k_rdna4_f16_upsk; // uniform-parity variants (K/256 even)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_n256, pipeline_mm_q6k_rdna4_f16_n256sk; // 128x256 tiles, 8 waves (K/256 even, N >= 256)
+    vk_pipeline pipeline_mm_q6k_rdna4_f16_glu, pipeline_mm_q6k_rdna4_f16_glun256; // fused FFN gate+up GEMM with swiglu epilogue (64 gate + 64 up rows per tile)
     vk_pipeline pipeline_mm_q6k_rdna4_f32y; // same, activations read as f32 and converted in-kernel (no f32->f16 pre-pass)
     vk_pipeline pipeline_mm_q6k_rdna4_f16;  // RDNA4 Q6_K x f16 prefill GEMM, f16 WMMA (default; GGML_VK_NO_MMQ_Q6K_RDNA4=1 disables)
     vk_pipeline pipeline_quantize_q8_1_x4;
@@ -1303,6 +1304,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    bool fused_q6k_swiglu {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

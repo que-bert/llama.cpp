@@ -112,6 +112,11 @@ void main() {
         nt = gl_WorkGroupID.y;
     }
     const uint m0 = mt * BM, n0 = nt * BN;
+#ifdef GLU
+    // fused FFN gate+up+swiglu: tile rows [0, BM/2) are gate rows mg0.., [BM/2, BM) the same up rows; the
+    // binding covers both weight tensors, byte offsets in batch_stride_a (gate) / batch_stride_b (up)
+    const uint mg0 = mt * (BM / 2);
+#endif
     const uint nsb = p.K / 256;
 #ifdef Y_F32
     const uint kv  = p.stride_b / 4;   // uvec4 per activation row
@@ -139,11 +144,16 @@ void main() {
 #define ODDQ(kt) ((rodd[i] & 2) != 0)
 #define LOADQ(wl, wh, sb) [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rql[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; }
 #endif
+#ifdef GLU
+#define BBASE(bb, row, sb) const uint bb = ((row) < BM / 2 ? p.batch_stride_a : p.batch_stride_b) + ((mg0 + (row) % (BM / 2)) * nsb + (sb)) * 210u;
+#else
+#define BBASE(bb, row, sb) const uint bb = ((m0 + (row)) * nsb + (sb)) * 210u;
+#endif
 #define GLOAD(kt) { \
     const uint sb = (kt) >> 3, c = (kt) & 7, hf = c >> 2, qd = c & 3; \
     [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
         const uint v = tid + i * NT, row = v / GPR, g = v % GPR, go = g * 4 * GW; \
-        const uint bb = ((m0 + row) * nsb + sb) * 210u; \
+        BBASE(bb, row, sb) \
         const uint wl = (bb + hf * 64 + (qd & 1) * 32 + go) >> 2; \
         const uint wh = (bb + 128 + hf * 32 + go) >> 2; \
         LOADQ(wl, wh, sb) \
@@ -247,6 +257,33 @@ void main() {
 #endif
 
     // acc[j*TM+i]: rows = weight rows m, cols = tokens n; D is [n][m] with row stride stride_d.
+#ifdef GLU
+    // wm == 0 waves hold gate, wm == 1 the matching up accumulators (same element layout): the up waves
+    // stage one token column block through LDS, the gate waves combine silu(g) * u and store. Full N tiles
+    // only (host-checked).
+    [[unroll]] for (uint j = 0; j < TN; ++j) {
+        barrier();
+        if (wm == 1) {
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                coopMatStore(acc[j * TM + i], shY[0], (wn * TM + i) * 256, 16, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+        barrier();
+        if (wm == 0) {
+            [[unroll]] for (uint i = 0; i < TM; ++i) {
+                MAT(float, gl_MatrixUseAccumulator) u;
+                coopMatLoad(u, shY[0], (wn * TM + i) * 256, 16, gl_CooperativeMatrixLayoutColumnMajor);
+                MAT(float, gl_MatrixUseAccumulator) g = acc[j * TM + i];
+                for (int e = 0; e < g.length(); ++e) {
+                    const float x = g[e];
+                    g[e] = x / (1.0f + exp(-x)) * u[e];
+                }
+                coopMatStore(g, data_d, (n0 + wn * WTN + j * 16) * p.stride_d + mg0 + i * 16, p.stride_d,
+                             gl_CooperativeMatrixLayoutColumnMajor);
+            }
+        }
+    }
+    return;
+#endif
     if (n0 + BN <= p.N) {
         [[unroll]] for (uint j = 0; j < TN; ++j)
             [[unroll]] for (uint i = 0; i < TM; ++i)
