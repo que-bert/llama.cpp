@@ -661,7 +661,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     if (model.draft_vocab_n > 0 && !layer.nextn.shared_head_head) {
         // reduced draft vocab: the first draft_vocab_n rows of the permuted output.weight (zero-copy);
         // logits come out in permuted-row order and are mapped to token ids by the sampler / readback
-        head_w = ggml_view_2d(ctx0, model.output, model.output->ne[0], model.draft_vocab_n, model.output->nb[1], 0);
+        // (adaptive draft vocab: cparams.draft_vocab_full selects all permuted rows for this step)
+        if (!cparams.draft_vocab_full) {
+            head_w = ggml_view_2d(ctx0, model.output, model.output->ne[0], model.draft_vocab_n, model.output->nb[1], 0);
+        }
         res->logits_perm  = model.draft_vocab_perm.data();
     }
     cur = build_lora_mm(head_w, cur, head_s);

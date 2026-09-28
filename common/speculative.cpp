@@ -1363,6 +1363,82 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // adaptive reduced draft vocab (--spec-draft-vocab N --spec-draft-vocab-adaptive): per sequence, a
+    // rolling window over the last W context tokens counts those outside the draft subset (permuted
+    // row >= N). The subset head is used only while that count is <= max_out. Updated incrementally
+    // from the tokens appended since the previous draft; reset (last W tokens only) on a new prompt.
+    struct dvocab_track {
+        std::vector<uint8_t> ring;
+        int32_t     head   = 0;
+        int32_t     n      = 0;
+        int32_t     n_out  = 0;
+        size_t      n_seen = 0;
+        llama_token last   = LLAMA_TOKEN_NULL;
+        bool        full   = true;
+    };
+    bool    dvocab_adaptive = false;
+    int32_t dvocab_n        = 0;
+    int32_t dvocab_w        = 256;
+    int32_t dvocab_max_out  = 2;
+    bool    dvocab_full_cur = false; // what ctx_dft is currently set to
+    std::vector<dvocab_track> dvocab;
+    int64_t dvocab_steps_sub  = 0;
+    int64_t dvocab_steps_full = 0;
+    int64_t dvocab_switches   = 0;
+
+    bool dvocab_outside(llama_token t) const {
+        if (t < 0) {
+            return false; // media placeholder
+        }
+        return llama_model_draft_vocab_row(llama_get_model(params.ctx_dft), t) >= dvocab_n;
+    }
+
+    void dvocab_push(dvocab_track & tr, bool out) {
+        if (tr.n == dvocab_w) {
+            tr.n_out -= tr.ring[tr.head];
+        } else {
+            tr.n++;
+        }
+        tr.ring[tr.head] = out ? 1 : 0;
+        tr.n_out += out ? 1 : 0;
+        tr.head = (tr.head + 1) % dvocab_w;
+    }
+
+    void dvocab_reset(dvocab_track & tr) {
+        tr.ring.assign(dvocab_w, 0);
+        tr.head = tr.n = tr.n_out = 0;
+        tr.n_seen = 0;
+        tr.last   = LLAMA_TOKEN_NULL;
+    }
+
+    // true -> this sequence needs the full head for the next draft
+    bool dvocab_update(llama_seq_id seq_id, const llama_tokens & prompt, llama_token id_last) {
+        auto & tr = dvocab[seq_id];
+        if (tr.n_seen > prompt.size() || (tr.n_seen > 0 && prompt[tr.n_seen - 1] != tr.last)) {
+            dvocab_reset(tr); // context replaced or truncated
+        }
+        if (tr.n_seen == 0 && prompt.size() > (size_t) dvocab_w) {
+            tr.n_seen = prompt.size() - dvocab_w; // only the window matters
+        }
+        for (size_t k = tr.n_seen; k < prompt.size(); ++k) {
+            dvocab_push(tr, dvocab_outside(prompt[k]));
+        }
+        tr.n_seen = prompt.size();
+        tr.last   = prompt.empty() ? LLAMA_TOKEN_NULL : prompt.back();
+
+        // id_last is not in the prompt yet; count it without pushing (it is pushed next step)
+        // The limit scales with the filled part of the window (max_out * n / W), so a short prompt
+        // cannot pass on an absolute count before the window fills.
+        const int32_t n_out = tr.n_out + (dvocab_outside(id_last) ? 1 : 0);
+        const int32_t n_win = tr.n + 1;
+        const bool full = (int64_t) n_out * dvocab_w > (int64_t) dvocab_max_out * n_win;
+        if (full != tr.full) {
+            SPC_DBG("seq %d: draft vocab -> %s (%d of last %d outside, n_ctx %zu)\n", seq_id, full ? "full" : "subset", n_out, tr.n + 1, prompt.size());
+        }
+        tr.full = full;
+        return full;
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1441,6 +1517,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        dvocab_n = llama_model_draft_vocab_n(llama_get_model(ctx_dft));
+        dvocab_adaptive = this->params.vocab_adaptive && dvocab_n > 0;
+        if (this->params.vocab_adaptive && dvocab_n <= 0) {
+            SPC_WRN("%s", "--spec-draft-vocab-adaptive ignored: no reduced draft vocab on the model\n");
+        }
+        if (dvocab_adaptive) {
+            dvocab_w       = std::max(1, this->params.vocab_adapt_w);
+            dvocab_max_out = std::max(0, this->params.vocab_adapt_max_out);
+            dvocab.resize(n_seq);
+            for (auto & tr : dvocab) {
+                dvocab_reset(tr);
+            }
+            dvocab_full_cur = true;
+            llama_set_draft_vocab_full(ctx_dft, true);
+            SPC_INF("adaptive draft vocab: subset %d rows while <= %d per %d recent context tokens fall outside it\n",
+                    dvocab_n, dvocab_max_out, dvocab_w);
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1464,6 +1558,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (dvocab_adaptive && seq_id >= 0 && seq_id < (llama_seq_id) dvocab.size()) {
+            dvocab_reset(dvocab[seq_id]);
+            const int64_t tot = dvocab_steps_sub + dvocab_steps_full;
+            SPC_INF("adaptive draft vocab: cumulative draft steps subset %lld / %lld (%.4f), switches %lld\n",
+                    (long long) dvocab_steps_sub, (long long) tot, tot ? (double) dvocab_steps_sub / tot : 0.0,
+                    (long long) dvocab_switches);
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1631,6 +1733,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // adaptive draft vocab: the subset head only if every drafting sequence stays inside it
+        bool dvocab_full_step = false;
+        if (dvocab_adaptive && n_drafting > 0) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id] && dparams[seq_id].prompt) {
+                    dvocab_full_step |= dvocab_update(seq_id, *dparams[seq_id].prompt, dparams[seq_id].id_last);
+                } else if (drafting[seq_id]) {
+                    dvocab_full_step = true;
+                }
+            }
+            if (dvocab_full_step != dvocab_full_cur) {
+                llama_set_draft_vocab_full(ctx_dft, dvocab_full_step);
+                dvocab_full_cur = dvocab_full_step;
+                dvocab_switches++;
+            }
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1654,6 +1773,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
+            }
+            if (dvocab_adaptive) {
+                (dvocab_full_step ? dvocab_steps_full : dvocab_steps_sub)++;
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the

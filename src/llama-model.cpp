@@ -2923,12 +2923,24 @@ bool llama_model_set_draft_vocab(llama_model * model, const int32_t * ranked_ids
         ggml_free(ctx);
     });
     model->draft_vocab_perm   = std::move(perm);
+    model->draft_vocab_inv    = std::move(inv);
     model->draft_vocab_inv_t  = t_inv;
     model->draft_vocab_n      = n_draft;
 
     LLAMA_LOG_INFO("%s: reduced draft vocab: %d of %lld rows (%lld special, %zu ranked ids given), id tensors %.2f MiB\n",
             __func__, n_draft, (long long) n_vocab, (long long) n_special, n_ranked, ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
     return true;
+}
+
+int32_t llama_model_draft_vocab_n(const llama_model * model) {
+    return model->draft_vocab_n;
+}
+
+int32_t llama_model_draft_vocab_row(const llama_model * model, llama_token token) {
+    if (model->draft_vocab_n <= 0 || token < 0 || (size_t) token >= model->draft_vocab_inv.size()) {
+        return -1;
+    }
+    return model->draft_vocab_inv[token];
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {

@@ -333,6 +333,9 @@ struct common_params_speculative_draft {
 
     int32_t     vocab_n = 0;  // reduced MTP draft-head vocab size (0 = full vocab)
     std::string vocab_file;   // ranked token ids for vocab_n (whitespace separated, '#' comments)
+    bool        vocab_adaptive = false; // per sequence: subset head only while the recent context is inside it
+    int32_t     vocab_adapt_w  = 256;   // rolling window of recent context tokens
+    int32_t     vocab_adapt_max_out = 3; // max window tokens outside the subset per W (permuted row >= vocab_n)
 
     common_params_model mparams;
 

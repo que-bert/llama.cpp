@@ -871,6 +871,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.draft_vocab_full != other.cparams.draft_vocab_full) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

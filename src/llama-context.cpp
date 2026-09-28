@@ -1274,6 +1274,10 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_draft_vocab_full(bool full) {
+    cparams.draft_vocab_full = full;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -4051,6 +4055,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_draft_vocab_full(llama_context * ctx, bool full) {
+    ctx->set_draft_vocab_full(full);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
