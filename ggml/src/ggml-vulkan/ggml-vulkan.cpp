@@ -3351,6 +3351,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_small_f32, "rms_norm_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_small_f32, "rms_norm_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_scale_f32, "rms_norm_scale_f32", rms_norm_scale_f32_len, rms_norm_scale_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_scale_small_f32, "rms_norm_scale_small_f32", rms_norm_scale_small_f32_len, rms_norm_scale_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -5689,6 +5691,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+    }
+    // RDNA4: f32 weights with very few rows (Qwen3.5 ssm_alpha/ssm_beta,
+    // m = 48, k = 5120) get one 64-lane workgroup per row from the default;
+    // 4x wider workgroups spread the k loop. GGML_VK_NO_DMMV_F32_WIDE=1 disables.
+    static const bool no_f32_wide = getenv("GGML_VK_NO_DMMV_F32_WIDE") != nullptr;
+    if (!no_f32_wide && ctx->device->architecture == vk_device_architecture::AMD_RDNA4 &&
+        a_type == GGML_TYPE_F32 && m <= 256 && k >= 1024) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
@@ -9200,6 +9210,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
             }
+            if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
+                return src0->ne[0] <= 128 ? ctx->device->pipeline_rms_norm_scale_small_f32 : ctx->device->pipeline_rms_norm_scale_f32;
+            }
             if (src0->ne[0] <= 128) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_small_f32 : ctx->device->pipeline_rms_norm_small_f32;
             }
@@ -11189,7 +11202,10 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * dst;
     const ggml_tensor * src1;
 
-    if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
+    if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
+        dst = cgraph->nodes[node_idx + 1];
+        src1 = src0;
+    } else if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
         ggml_tensor * mul = cgraph->nodes[node_idx + 1];
         dst = mul;
         src1 = mul->src[0] == rms ? mul->src[1] : mul->src[0];
@@ -11200,6 +11216,9 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
 
     const uint32_t num_partials = ctx->do_add_rms_partials ? ggml_vk_rms_num_partials(ctx, dst) : 0;
     vk_op_binary_push_constants bin = ggml_vk_rms_norm_push_constants(src0, src1, dst, op_params[0], num_partials);
+    if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
+        bin.param2 = ggml_get_op_params_f32(dst, 0);
+    }
 
     if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE ||
         ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE_VIEW_SET_ROWS) {
@@ -11280,7 +11299,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
     } else {
-        GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
+        GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_SCALE || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
 
@@ -14028,6 +14047,20 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     return true;
 }
 
+// RMS_NORM -> SCALE (bias 0, f32, same shape, contiguous rows): gdn l2 norm of
+// q/k (build_gdn_l2_norm). GGML_VK_NO_RMS_NORM_SCALE=1 disables it.
+static bool ggml_vk_can_fuse_rms_norm_scale(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_NO_RMS_NORM_SCALE") != nullptr;
+    if (disabled || !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+        return false;
+    }
+    const ggml_tensor * rms = cgraph->nodes[node_idx];
+    const ggml_tensor * scl = cgraph->nodes[node_idx + 1];
+    return scl->src[0] == rms && rms->type == GGML_TYPE_F32 && scl->type == GGML_TYPE_F32 &&
+           rms->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(rms, scl) &&
+           ggml_is_contiguous(scl) && ggml_get_op_params_f32(scl, 1) == 0.0f;
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -14752,6 +14785,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (!ctx->do_add_rms_partials && ggml_vk_can_fuse_rms_norm_scale(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_rms_norm_mode = RMS_NORM_SCALE;
+                fusion_string = "RMS_NORM_SCALE";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL;
