@@ -8966,6 +8966,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, 512, 6144, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 512, 5120, {1, 1}, {1, 1}));  // output head
+    // RDNA4 Q6_K fused FFN gate+up+swiglu GEMM (m = tokens, n = rows): fusable (m % 128 == 0), token tail and
+    // odd K/256 (fall back to the unfused path)
+    for (int64_t m : { 128, 512, 77, 200 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, m, 256, 1024, false, 1, 1, false, false, true, false, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 256, 384, 768, false, 1, 1, false, false, true, false, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 512, 17408, 5120, false, 1, 1, false, false, true, false, {1, 1}));
     for (int64_t n : { 64, 77, 130, 255 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, n, 256, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 384, n, 1024, {1, 1}, {1, 1}));
@@ -11144,6 +11151,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, 512, 6144, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48, 512, 5120, {1, 1}, {1, 1}));
+    // R9700 fused FFN gate+up+swiglu at ubatch 512
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 512, 17408, 5120, false, 1, 1, false, false, true, false, {1, 1}));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
