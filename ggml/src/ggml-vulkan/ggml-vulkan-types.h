@@ -1293,6 +1293,13 @@ struct ggml_backend_vk_context {
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
 
+    // P3: FA mask_opt bitmask cached across the FA nodes of one graph_compute that share a mask
+    // (all 16 FA layers use the same KQ mask). Own buffer: prealloc_y is clobbered between layers.
+    // GGML_VK_NO_MASK_OPT_CACHE=1 disables.
+    vk_buffer fa_mask_opt_buf;
+    uint64_t  graph_seq {};
+    struct { uint64_t graph_seq; VkBuffer buf; uint64_t offset; uint32_t nem0, nem1, nem2, nem3, br, bc; bool valid; } fa_mask_opt_key {};
+
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;

@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1805,20 +1806,50 @@ static void kq_mask_cached_fill(const llama_kv_cells & cells, llama_seq_id seq_i
 
     // rows: row 0 as cached, then patch the (p1_0, p1_i] / (p1_i, p1_0] position window
     const int64_t n_tokens = ubatch->n_tokens;
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        T * out = dst + i*n_kv;
-        std::memcpy(out, row, (size_t) n_kv * sizeof(T));
-        if (i == 0) {
-            continue;
-        }
-        const llama_pos pi   = ubatch->pos[i];
-        const llama_pos pi_x = px_of(i);
-        const llama_pos pi_y = py_of(i);
-        cells.seq_pos_range(seq_id, std::min(p1, pi) - 1, std::max(p1, pi), [&](uint32_t j) {
-            if ((int64_t) j < n_kv) {
-                out[j] = eval(j, pi, pi_x, pi_y);
+    auto fill_rows = [&](int64_t i0, int64_t i1) {
+        for (int64_t i = i0; i < i1; ++i) {
+            T * out = dst + i*n_kv;
+            std::memcpy(out, row, (size_t) n_kv * sizeof(T));
+            if (i == 0) {
+                continue;
             }
-        });
+            const llama_pos pi   = ubatch->pos[i];
+            const llama_pos pi_x = px_of(i);
+            const llama_pos pi_y = py_of(i);
+            cells.seq_pos_range(seq_id, std::min(p1, pi) - 1, std::max(p1, pi), [&](uint32_t j) {
+                if ((int64_t) j < n_kv) {
+                    out[j] = eval(j, pi, pi_x, pi_y);
+                }
+            });
+        }
+    };
+
+    // P3: at depth the replicated mask is n_tokens*n_kv (135 MB at 131k x 512) and the single-thread
+    // memcpy sat on the critical path before every prefill ubatch. Split the rows over threads when
+    // the fill is large. LLAMA_KQ_MASK_THREADS=<n> overrides the thread count (1 = serial).
+    static const int n_thr_env = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_THREADS");
+        return e ? std::max(1, atoi(e)) : 0;
+    }();
+    const size_t fill_bytes = (size_t) n_tokens * n_kv * sizeof(T);
+    int n_thr = n_thr_env > 0 ? n_thr_env : (fill_bytes >= ((size_t) 16 << 20) ? 8 : 1);
+    n_thr = (int) std::min<int64_t>(n_thr, n_tokens);
+    if (n_thr <= 1) {
+        fill_rows(0, n_tokens);
+        return;
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(n_thr - 1);
+    const int64_t per = (n_tokens + n_thr - 1) / n_thr;
+    for (int t = 1; t < n_thr; ++t) {
+        const int64_t i0 = t*per, i1 = std::min<int64_t>(n_tokens, (t + 1)*per);
+        if (i0 < i1) {
+            workers.emplace_back(fill_rows, i0, i1);
+        }
+    }
+    fill_rows(0, std::min<int64_t>(n_tokens, per));
+    for (auto & w : workers) {
+        w.join();
     }
 }
 

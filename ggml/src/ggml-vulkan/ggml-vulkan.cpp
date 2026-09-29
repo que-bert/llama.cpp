@@ -8965,7 +8965,27 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint64_t mask_opt_size = sizeof(uint32_t) * mask_opt_num_dwords * CEIL_DIV(nem1, mask_opt_br) * nem2 * nem3;
 
     vk_pipeline pipeline_fa_mask_opt = nullptr;
-    if (use_mask_opt) {
+    // P3: reuse the mask_opt bitmask of an earlier FA node in the same graph_compute when it read
+    // the same mask with the same tiling (fixed 1 MiB buffer; larger bitmasks use prealloc_y).
+    static const bool no_mask_opt_cache = getenv("GGML_VK_NO_MASK_OPT_CACHE") != nullptr;
+    const uint64_t mask_opt_cache_cap = 1u << 20;
+    const bool mask_opt_cached = use_mask_opt && !no_mask_opt_cache && mask_opt_size <= mask_opt_cache_cap;
+    bool mask_opt_hit = false;
+    if (mask_opt_cached) {
+        if (!ctx->fa_mask_opt_buf) {
+            ctx->fa_mask_opt_buf = ggml_vk_create_buffer_device(ctx->device, mask_opt_cache_cap);
+        }
+        const vk_subbuffer mb = ggml_vk_tensor_subbuffer(ctx, mask);
+        const auto & mk = ctx->fa_mask_opt_key;
+        mask_opt_hit = mk.valid && mk.graph_seq == ctx->graph_seq && mk.buf == (VkBuffer) mb.buffer->buffer && mk.offset == mb.offset &&
+                       mk.nem0 == nem0 && mk.nem1 == nem1 && mk.nem2 == (uint32_t) mask->ne[2] && mk.nem3 == (uint32_t) mask->ne[3] &&
+                       mk.br == mask_opt_br && mk.bc == Bc;
+        if (!mask_opt_hit) {
+            ctx->fa_mask_opt_key = { ctx->graph_seq, (VkBuffer) mb.buffer->buffer, (uint64_t) mb.offset, nem0, nem1,
+                                     (uint32_t) mask->ne[2], (uint32_t) mask->ne[3], mask_opt_br, Bc, true };
+        }
+    }
+    if (use_mask_opt && !mask_opt_hit) {
         {
             std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
             auto &pipelines = ctx->device->pipeline_fa_mask_opt;
@@ -8979,12 +8999,17 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         assert(pipeline_fa_mask_opt);
         ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_mask_opt, 1);
 
-        if (ctx->prealloc_size_y < mask_opt_size) {
-            ctx->prealloc_size_y = mask_opt_size;
-            ggml_vk_preallocate_buffers(ctx, subctx);
-        }
-        if (ctx->prealloc_y_need_sync) {
+        if (mask_opt_cached) {
+            // WAR vs FA nodes of an earlier graph that read the cached bitmask
             ggml_vk_sync_buffers(ctx, subctx);
+        } else {
+            if (ctx->prealloc_size_y < mask_opt_size) {
+                ctx->prealloc_size_y = mask_opt_size;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
         }
     }
 
@@ -9017,7 +9042,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
-    vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    vk_subbuffer mask_opt_buf = !use_mask_opt ? q_buf : mask_opt_cached ? ggml_vk_subbuffer(ctx, ctx->fa_mask_opt_buf, 0) : ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
     vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
 
     if (use_dequant_kv) {
@@ -9057,7 +9082,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
-    if (use_mask_opt)
+    if (use_mask_opt && !mask_opt_hit)
     {
         const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
             nem0,
@@ -9149,7 +9174,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (use_mask_opt || use_sparse) {
+    if ((use_mask_opt && !mask_opt_cached) || use_sparse) {
         ctx->prealloc_y_need_sync = true;
     }
 }
@@ -13797,6 +13822,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
+    ggml_vk_destroy_buffer(ctx->fa_mask_opt_buf);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
@@ -14025,9 +14051,18 @@ static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_ty
     UNUSED(buft);
 }
 
+// P3: the pinned host buffer type is per device. It used to always pin on (and register with)
+// device 0, so with -dev Vulkan1 no graph input was found in the upload device's pinned map and
+// every host->device input copy (the 135 MB KQ mask at 131k x 512) took the staging path: a
+// single-thread memcpy into the staging buffer plus a blocking transfer. GGML_VK_HOST_BUFT_DEV0=1
+// restores the old device-0 behaviour.
+static size_t ggml_vk_host_buft_dev(ggml_backend_buffer_type_t buft) {
+    return (size_t) (uintptr_t) buft->context;
+}
+
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_vk_host_free(vk_instance.devices[ggml_vk_host_buft_dev(buffer->buft)], buffer->context);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -14036,7 +14071,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(vk_instance.devices[ggml_vk_host_buft_dev(buft)], size);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         // fallback to cpu buffer
@@ -14048,41 +14083,52 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
     return buffer;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
-
-    UNUSED(buft);
+    return vk_instance.devices[ggml_vk_host_buft_dev(buft)]->properties.limits.minMemoryMapAlignment;
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->suballocation_block_size;
+    return vk_instance.devices[ggml_vk_host_buft_dev(buft)]->suballocation_block_size;
+}
 
-    UNUSED(buft);
+static bool ggml_vk_is_host_buft(ggml_backend_buffer_type_t buft) {
+    return buft->iface.alloc_buffer == ggml_backend_vk_host_buffer_type_alloc_buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_dev(size_t dev_num) {
+    static const bool dev0_only = getenv("GGML_VK_HOST_BUFT_DEV0") != nullptr;
+    if (dev0_only) {
+        dev_num = 0;
+    }
+    GGML_ASSERT(dev_num < GGML_VK_MAX_DEVICES);
+    static struct ggml_backend_buffer_type bufts[GGML_VK_MAX_DEVICES];
+    static std::once_flag once[GGML_VK_MAX_DEVICES];
+
+    ggml_vk_instance_init();
+    ggml_vk_get_device(dev_num);
+
+    std::call_once(once[dev_num], [dev_num] {
+        bufts[dev_num] = {
+            /* .iface    = */ {
+                /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
+                /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
+                /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
+                /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
+                /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
+            /* .context  = */ (void *) (uintptr_t) dev_num,
+        };
+    });
+
+    return &bufts[dev_num];
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
-        /* .iface    = */ {
-            /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
-            /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
-            /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), 0),
-        /* .context  = */ nullptr,
-    };
-
-    // Make sure device 0 is initialized
-    ggml_vk_instance_init();
-    ggml_vk_get_device(0);
-
-    return &ggml_backend_vk_buffer_type_host;
+    return ggml_backend_vk_host_buffer_type_dev(0);
 }
 
 static const char * ggml_backend_vk_name(ggml_backend_t backend) {
@@ -14111,7 +14157,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || ggml_vk_is_host_buft(tensor->buffer->buft)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -14207,7 +14253,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || ggml_vk_is_host_buft(tensor->buffer->buft)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -15233,6 +15279,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_debug_label queue_dbg(ctx->device->compute_queue->handle.get(), "ggml_backend_vk_graph_compute");
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
+    ctx->graph_seq++;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
@@ -16428,8 +16475,8 @@ static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_ba
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    UNUSED(dev);
-    return ggml_backend_vk_host_buffer_type();
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    return ggml_backend_vk_host_buffer_type_dev(ctx->device);
 }
 
 static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_dev_t dev) {
