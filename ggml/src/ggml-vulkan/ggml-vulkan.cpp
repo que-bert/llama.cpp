@@ -3044,6 +3044,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Bench override: GGML_VK_RM_KQ_INT_Q6K.
     uint32_t rm_kq_int_q6k = (is_rdna4 && rm_kq_int == 1) ? 4u : rm_kq_int;
     if (const char * e = getenv("GGML_VK_RM_KQ_INT_Q6K")) rm_kq_int_q6k = (uint32_t) std::stoul(e);
+    // RDNA4: tried extending rm_int_n's MLP bump (4 rows/shader, fires at
+    // i>=4 i.e. NUM_COLS>=5) down to i>=3 (NUM_COLS==4, the verify shape) for
+    // q8_0's MMVQ pipeline (mul_mat_vec_q8_0_q8_1 -- the path
+    // ggml_vk_should_use_mmvq always selects once n>1). Measured a LOSS
+    // in-model on the R9700: m=5120 n=4 k=6144 GEMV went 2.960 -> 3.030 ms
+    // (+2.4%, sum/verify-step over 48 calls), against ~0.2% run-to-run noise
+    // on unrelated ops in the same locked window. q8_0's m=5120 here is far
+    // smaller than q6_K's m=17408 where the same theory won (rm_kq_q6k); 4
+    // rows/WG cuts workgroup count enough at this m to lose occupancy rather
+    // than gain memory-level parallelism. Stays off by default (0 = disabled).
+    // Opt-in for further benching: GGML_VK_RM_STDQ_INT_Q8_0=<n>.
+    uint32_t rm_stdq_int_q8_0 = 0;
+    if (const char * e = getenv("GGML_VK_RM_STDQ_INT_Q8_0")) rm_stdq_int_q8_0 = (uint32_t) std::stoul(e);
+    auto const &rm_stdq_int_q8_0_cols = [&](uint32_t i) { return (rm_stdq_int_q8_0 > 0 && i >= 3) ? rm_stdq_int_q8_0 : rm_int_n(1*rm_stdq_int, i); };
     // RDNA3: Static 4 rows for all types bench faster than the default
     auto const &rm_id = [&](uint32_t rows) { return is_rdna3_4 ? 4u : rows; };
     uint32_t rm_iq = 2 * rm_kq;
@@ -3153,7 +3167,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_q8_1_f32", arr_dmmv_q5_1_q8_1_f32_len[reduc], arr_dmmv_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_stdq_int_q8_0_cols(i), 1, 1}, {wg_size_subgroup_int, rm_stdq_int_q8_0_cols(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
 
