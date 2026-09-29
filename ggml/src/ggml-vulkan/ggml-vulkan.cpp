@@ -6873,7 +6873,17 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         const char * e = getenv("GGML_VK_Q6K_MMVQ");
         return e ? (int) std::stoi(e) : -1;
     }();
-    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL || q6k_mmvq == 1;
+    // RDNA4, n >= 5 columns (MTP verify with n_max >= 4): the f32 dmmv q6_K
+    // shader turns ALU/issue-bound above four columns (DRAM-streaming 139264x5120:
+    // n=4 958 us -> n=5 1042 -> n=6 1102, n=1 926), while MMVQ's int8 dot stays
+    // flat (n=5 965, n=6 979) and matches dmmv at n<=4. So MMVQ from 5 columns.
+    // GGML_VK_Q6K_MMVQ_MIN_N=<n> moves the threshold (0 disables).
+    static const uint32_t q6k_mmvq_min_n = []() {
+        const char * e = getenv("GGML_VK_Q6K_MMVQ_MIN_N");
+        return e ? (uint32_t) std::stoul(e) : 5u;
+    }();
+    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL || q6k_mmvq == 1 ||
+                   (device->architecture == vk_device_architecture::AMD_RDNA4 && q6k_mmvq_min_n > 0 && n >= q6k_mmvq_min_n);
     if (q6k_mmvq == 0) {
         mmvq_q6 = false;
     }

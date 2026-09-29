@@ -11531,6 +11531,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Q6_K multi-column mat-vec at Qwen3.x-27B shapes (MTP verify, n = 1..6)
+    // 139264 = 8 x 17408 and 40960 = 8 x 5120 rows: > 64 MB MALL, so the weights stream from DRAM as in the model
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {10240, 5120}, {12288, 5120}, {5120, 5120}, {248320, 5120},
+                                                            {139264, 5120}, {40960, 17408}}) {
+        for (int bs : {1, 2, 3, 4, 5, 6}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
