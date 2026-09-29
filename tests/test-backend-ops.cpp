@@ -7102,6 +7102,35 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// MUL_MAT + residual ADD (RDNA4 Q6_K/Q8_0 GEMM epilogue / split-K reduce fusion, n >= 64); res_first swaps the add operands
+struct test_mul_mat_add : public test_case {
+    const ggml_type type;
+    const int64_t m, n, k;
+    const bool res_first;
+    const bool via_reshape;  // MUL_MAT -> RESHAPE -> ADD (GDN linear_attn_out)
+
+    test_mul_mat_add(ggml_type type, int64_t m, int64_t n, int64_t k, bool res_first = false, bool via_reshape = false)
+        : type(type), m(m), n(n), k(k), res_first(res_first), via_reshape(via_reshape) {}
+
+    std::string vars() override { return VARS_TO_STR6(type, m, n, k, res_first, via_reshape); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_ADD_GEMM"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }  // f16 WMMA GEMM, same bound as test_mul_mat
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a   = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_tensor * mm  = ggml_mul_mat(ctx, a, b);
+        if (via_reshape) {
+            mm = ggml_reshape_2d(ctx, mm, m, n);
+        }
+        ggml_tensor * out = res_first ? ggml_add(ctx, res, mm) : ggml_add(ctx, mm, res);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -9153,6 +9182,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 256, 384, 768, false, 1, 1, false, false, true, false, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 512, 17408, 5120, false, 1, 1, false, false, true, false, {1, 1}));
+    // RDNA4 GEMM + residual ADD fusion: full tiles, token tails, split-K (5120 x 17408), swapped add operands
+    for (ggml_type t : { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+        for (int64_t n : { 64, 77, 128, 200, 512 }) {
+            test_cases.emplace_back(new test_mul_mat_add(t, 384, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_add(t, 128, n, 256, true));
+        }
+        test_cases.emplace_back(new test_mul_mat_add(t, 5120, 512, 6144));
+        test_cases.emplace_back(new test_mul_mat_add(t, 5120, 130, 6144, true));
+    }
+    test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q8_0, 5120, 512, 6144, false, true));
+    test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q8_0, 384, 77, 1024, true, true));
+    test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q6_K, 5120, 512, 17408));
+    test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q6_K, 5120, 200, 17408, true));
     for (int64_t n : { 64, 77, 130, 255 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, n, 256, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 384, n, 1024, {1, 1}, {1, 1}));

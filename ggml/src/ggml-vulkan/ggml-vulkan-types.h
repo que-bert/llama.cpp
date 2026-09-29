@@ -797,6 +797,7 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_id_tile_selector;
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    vk_pipeline pipeline_matmul_split_k_reduce_add;  // split_k_reduce + residual add (GEMM+ADD fusion)
     vk_pipeline pipeline_mmq_q6k_rdna4;     // RDNA4 Q6_K x q8_1 prefill GEMM, int8 WMMA (GGML_VK_MMQ_Q6K_RDNA4=int8)
     vk_pipeline pipeline_mm_q8_rdna4_f16;    // RDNA4 q8_0 prefill GEMM (f16 WMMA); GGML_VK_NO_Q8_GEMM_TUNE=1 disables
     vk_pipeline pipeline_mm_q8_rdna4_f16_sk; // split-K variant
@@ -1338,6 +1339,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_q6k_swiglu {};
+    bool fused_gemm_add {};
     bool fused_rms_gate {};
 
     // recurrent-cache fusion (GGML_VK_NO_GDN_CACHE=1 disables): GET_ROWS/CPY nodes whose work is done by

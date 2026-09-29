@@ -45,6 +45,11 @@ layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
 layout(binding = 0) readonly buffer A { uint data_au[]; };   // Q8_0 blocks, 34 B (2-byte aligned)
 layout(binding = 1) readonly buffer B { uvec4 data_b[]; };   // f16 activations, K-contiguous rows
 layout(binding = 2) writeonly buffer D { float data_d[]; };
+#if !defined(SPLITK) && !defined(GLU)
+// fused residual add (graph fusion MUL_MAT + ADD): D = A*B + R when push.base_work_group_z != 0. R has D's shape/stride.
+#define HAS_ADD 1
+layout(binding = 3) readonly buffer R { float data_r[]; };
+#endif
 
 layout(push_constant) uniform parameter {
     uint M; uint N; uint K;
@@ -180,8 +185,18 @@ void main() {
     if (n0 + BN <= p.N) {
         [[unroll]] for (uint j = 0; j < TN; ++j)
             [[unroll]] for (uint i = 0; i < TM; ++i)
-                coopMatStore(acc[j * TM + i], data_d, dbase + (n0 + wn * WTN + j * 16) * p.stride_d + m0 + wm * WTM + i * 16, p.stride_d,
-                             gl_CooperativeMatrixLayoutColumnMajor);
+            {
+                const uint eo = dbase + (n0 + wn * WTN + j * 16) * p.stride_d + m0 + wm * WTM + i * 16;
+                MAT(float, gl_MatrixUseAccumulator) t = acc[j * TM + i];
+#ifdef HAS_ADD
+                if (p.base_work_group_z != 0) {
+                    MAT(float, gl_MatrixUseAccumulator) r;
+                    coopMatLoad(r, data_r, eo, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                    t = t + r;
+                }
+#endif
+                coopMatStore(t, data_d, eo, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+            }
     } else {
         // token tail: stage each 16x16 tile through LDS (reusing shW) and store the in-range columns
         const uint scr = warp * 256;
@@ -194,7 +209,14 @@ void main() {
                     const uint cn = e / 16, rm = e % 16;
                     const uint tok = n0 + wn * WTN + j * 16 + cn;
                     if (tok < p.N) {
-                        data_d[dbase + tok * p.stride_d + m0 + wm * WTM + i * 16 + rm] = uintBitsToFloat(shW[scr + e]);
+                        {
+                            const uint eo = dbase + tok * p.stride_d + m0 + wm * WTM + i * 16 + rm;
+                            float v = uintBitsToFloat(shW[scr + e]);
+#ifdef HAS_ADD
+                            if (p.base_work_group_z != 0) v += data_r[eo];
+#endif
+                            data_d[eo] = v;
+                        }
                     }
                 }
                 subgroupMemoryBarrierShared();

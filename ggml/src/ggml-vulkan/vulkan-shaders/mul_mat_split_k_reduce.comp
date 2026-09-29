@@ -9,6 +9,12 @@ layout (binding = 0) readonly buffer A4 {vec4 data_a4[];};
 layout (binding = 1) writeonly buffer D {float data_d[];};
 layout (binding = 1) writeonly buffer D4 {vec4 data_d4[];};
 
+#ifdef ADD
+// fused residual add (MUL_MAT + ADD): D = sum(partials) + R, R has D's flat layout
+layout (binding = 2) readonly buffer R {float data_r[];};
+layout (binding = 2) readonly buffer R4 {vec4 data_r4[];};
+#endif
+
 layout (push_constant) uniform parameter {
     uint ne;
     uint k_num;
@@ -31,6 +37,9 @@ void main() {
             result += data_a4[(i * p.ne + idx) / 4];
         }
 
+#ifdef ADD
+        result += data_r4[idx / 4];
+#endif
         data_d4[idx / 4] = result;
     } else {
         [[unroll]] for (uint j = 0; j < 4; ++j) {
@@ -41,6 +50,9 @@ void main() {
                     result += data_a[i * p.ne + idx + j];
                 }
 
+#ifdef ADD
+                result += data_r[idx + j];
+#endif
                 data_d[idx + j] = result;
             }
         }
