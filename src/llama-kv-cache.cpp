@@ -1263,7 +1263,33 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_kv_off(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const {
+    // decode-sized ubatches only: the windowed mask is filled via a full-width scratch copy
+    if (attn_window == 0 || ubatch.n_tokens == 0 || ubatch.n_tokens > 16 || v_trans) {
+        return 0;
+    }
+    llama_pos p_min = ubatch.pos[0];
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch.pos[i]);
+    }
+    int64_t off = (int64_t) p_min - (int64_t) attn_window;
+    if (off <= 0) {
+        return 0;
+    }
+    // the view must contain the cells written by this ubatch
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (const auto idx : sinfo.idxs[s]) {
+            off = std::min<int64_t>(off, idx);
+        }
+    }
+    off = (off / 256) * 256;
+    if (off <= 0 || off >= (int64_t) n_kv) {
+        return 0;
+    }
+    return (uint32_t) off;
+}
+
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1280,10 +1306,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 + ggml_row_size(k->type, n_embd_k_gqa)*kv_off);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1303,8 +1329,10 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0 + ggml_row_size(v->type, n_embd_v_gqa)*kv_off);
     }
+
+    GGML_ASSERT(kv_off == 0 && "attention window requires a non-transposed V cache");
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
@@ -1939,6 +1967,35 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+void llama_kv_cache::set_input_kq_mask_off(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off) const {
+    if (kv_off == 0) {
+        set_input_kq_mask(dst, ubatch, causal_attn);
+        return;
+    }
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const size_t  es     = ggml_type_size(dst->type);
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_full = n_kv + kv_off;
+    const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+
+    kq_mask_off_scratch.resize((size_t) (n_full*n_rows)*es);
+
+    ggml_tensor tmp = *dst;
+    tmp.ne[0] = n_full;
+    tmp.nb[1] = n_full*es;
+    tmp.nb[2] = tmp.nb[1]*tmp.ne[1];
+    tmp.nb[3] = tmp.nb[2]*tmp.ne[2];
+    tmp.data  = kq_mask_off_scratch.data();
+
+    set_input_kq_mask(&tmp, ubatch, causal_attn);
+
+    for (int64_t r = 0; r < n_rows; ++r) {
+        std::memcpy((uint8_t *) dst->data + (size_t) r*n_kv*es,
+                    kq_mask_off_scratch.data() + ((size_t) r*n_full + kv_off)*es, (size_t) n_kv*es);
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2880,6 +2937,8 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    kv_off = kv->get_kv_off(sinfos[i_cur], ubatches[i_cur], n_kv);
+    n_kv -= kv_off;
 
     return true;
 }
@@ -2907,11 +2966,11 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], kv_off);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], kv_off);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -2951,7 +3010,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask_off(dst, ubatch, causal_attn, kv_off);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

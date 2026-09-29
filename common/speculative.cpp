@@ -1526,6 +1526,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
 
+        if (this->params.attn_window > 0 && !is_mem_shared) {
+            if (llama_set_attn_window(ctx_dft, (uint32_t) this->params.attn_window)) {
+                SPC_INF("MTP draft attention window: %d\n", this->params.attn_window);
+            } else {
+                SPC_WRN("%s", "--spec-draft-window ignored: draft memory is not a plain KV cache\n");
+            }
+        }
+
         dvocab_n = llama_model_draft_vocab_n(llama_get_model(ctx_dft));
         dvocab_adaptive = this->params.vocab_adaptive && dvocab_n > 0;
         if (this->params.vocab_adaptive && dvocab_n <= 0) {

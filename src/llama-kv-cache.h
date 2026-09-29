@@ -185,9 +185,16 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
-    // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // attention window (0 = full): first cell of the attended view for this ubatch (multiple of 256)
+    void     set_attn_window(uint32_t w) { attn_window = w; }
+    uint32_t get_kv_off(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const;
+    // set_input_kq_mask for a view starting at cell kv_off (attention window): fills the full
+    // [kv_off + n_kv] mask into a scratch buffer, then copies the columns [kv_off, kv_off + n_kv)
+    void set_input_kq_mask_off(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off) const;
+
+    // get views of the current state of the cache (cells [kv_off, kv_off + n_kv))
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -270,6 +277,9 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    // see set_attn_window
+    uint32_t attn_window = 0;
+
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
     bool attn_rot_v = false;
@@ -321,6 +331,7 @@ private:
     mutable kq_mask_cache kqm_cache;
 
     bool set_input_kq_mask_cached(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    mutable std::vector<uint8_t> kq_mask_off_scratch;
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
@@ -407,6 +418,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_kv_off() const { return kv_off; }
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -478,4 +490,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // first cell of the attended view (attention window, see llama_kv_cache::set_attn_window)
+    uint32_t kv_off = 0;
 };

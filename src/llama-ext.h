@@ -105,6 +105,10 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // Changing it rebuilds the draft graph. Default false.
 LLAMA_API void llama_set_draft_vocab_full(struct llama_context * ctx, bool full);
 
+// Attention window on the context's KV cache: graphs view only the cells from ~(first ubatch pos - window)
+// (rounded down to 256) to the end; the cells stay resident. 0 = full. Returns false if unsupported.
+LLAMA_API bool llama_set_attn_window(struct llama_context * ctx, uint32_t window);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

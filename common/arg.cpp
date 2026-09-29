@@ -4158,6 +4158,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_ADAPTIVE"));
     add_opt(common_arg(
+        {"--spec-draft-window"}, "N",
+        string_format("MTP draft context: attention reads only the most recent >= N KV cells (0 = full, default: %d)", params.speculative.draft.attn_window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.attn_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_WINDOW"));
+    add_opt(common_arg(
         {"--spec-draft-vocab-adaptive-window"}, "W",
         string_format("adaptive draft vocab: window of recent context tokens (default: %d)", params.speculative.draft.vocab_adapt_w),
         [](common_params & params, int value) {

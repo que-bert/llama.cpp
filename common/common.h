@@ -336,6 +336,7 @@ struct common_params_speculative_draft {
     bool        vocab_adaptive = false; // per sequence: subset head only while the recent context is inside it
     int32_t     vocab_adapt_w  = 256;   // rolling window of recent context tokens
     int32_t     vocab_adapt_max_out = 3; // max window tokens outside the subset per W (permuted row >= vocab_n)
+    int32_t     attn_window = 0; // MTP draft ctx: attend only the last ~N KV cells (0 = full)
 
     common_params_model mparams;
 

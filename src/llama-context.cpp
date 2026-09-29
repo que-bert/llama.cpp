@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -4059,6 +4061,19 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_set_draft_vocab_full(llama_context * ctx, bool full) {
     ctx->set_draft_vocab_full(full);
+}
+
+bool llama_set_attn_window(llama_context * ctx, uint32_t window) {
+    auto * mem = ctx->get_memory();
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        kv->set_attn_window(window);
+        return true;
+    }
+    if (auto * hy = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        hy->get_mem_attn()->set_attn_window(window);
+        return true;
+    }
+    return false;
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
