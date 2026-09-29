@@ -90,6 +90,29 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+#define MAT_VEC_FUSION_FLAGS_GATEUP 0x10
+
+#ifdef GATEUP_ENABLED
+// fused FFN gate+up (+swiglu): stage 1 stashes the gate result, stage 2 writes silu(gate)*up
+FLOAT_TYPE gu_gate[NUM_COLS][NUM_ROWS];
+uint gu_stage = 0;
+void write_result(const uint j, const uint n, const uint idx, FLOAT_TYPE v) {
+    if (gu_stage == 1) {
+        gu_gate[j][n] = v;
+        return;
+    }
+    if (gu_stage == 2) {
+        const FLOAT_TYPE g = gu_gate[j][n];
+        v = g / (FLOAT_TYPE(1.0) + exp(-g)) * v;
+    }
+    data_d[idx] = D_TYPE(v);
+}
+#else
+void write_result(const uint j, const uint n, const uint idx, FLOAT_TYPE v) {
+    data_d[idx] = D_TYPE(v);
+}
+#endif
+
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -121,7 +144,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                write_result(j, n, j*p.batch_stride_d + d_offset + first_row + n, temp[j][n]);
             }
         }
     }
@@ -176,7 +199,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                write_result(j, n, j*p.batch_stride_d + d_offset + first_row + n, temp[j][n]);
             }
         }
     }
@@ -221,7 +244,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                write_result(j, n, j*p.batch_stride_d + d_offset + first_row + n, tmpsh[j][n][0]);
             }
         }
     }

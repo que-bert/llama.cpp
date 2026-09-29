@@ -9153,6 +9153,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 256, 384, 768, false, 1, 1, false, false, true, false, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 512, 17408, 5120, false, 1, 1, false, false, true, false, {1, 1}));
+    // fused FFN gate+up+swiglu GEMV at verify/decode batch sizes (n=1..4): real 27B FFN shape and an odd row count
+    for (int64_t m_batch : { 1, 2, 3, 4 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, m_batch, 17408, 5120, false, 1, 1, false, false, true, false, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, m_batch, 1001, 1280, false, 1, 1, false, false, true, false, {1, 1}));
+    }
     for (int64_t n : { 64, 77, 130, 255 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, n, 256, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 384, n, 1024, {1, 1}, {1, 1}));
