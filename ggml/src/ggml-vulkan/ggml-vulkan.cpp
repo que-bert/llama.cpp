@@ -3352,6 +3352,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
                                                  flash_attn_prefill_rdna4_v64_cm1_len, flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
                                                  sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                        // P2c design 3 probe: mask double-buffered, opt-in (GGML_VK_FA_PREFILL_RDNA4_DB=1)
+                        if (getenv("GGML_VK_FA_PREFILL_RDNA4_DB") != nullptr) {
+                            ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_db[g], "flash_attn_prefill_rdna4_db_g" + std::to_string(g),
+                                                     flash_attn_prefill_rdna4_db_cm1_len, flash_attn_prefill_rdna4_db_cm1_data, "main", 5,
+                                                     sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                        }
                     }
                 }
             }
@@ -8667,7 +8673,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                              (nbk1 % 16) == 0 && (nbv1 % 16) == 0;
         if (use_v64) {
             // _v64: one dequant pass writes K rows [ns][h][kv][d] and V tiles [ns][h][kv/32][d][32 kv] (zero-padded)
-            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_v64[G];
+            // P2c design 3 probe (mask double-buffered): same dispatch/push-constants as _v64, opt-in only.
+            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_db[G] != nullptr ? ctx->device->pipeline_fa_prefill_rdna4_db[G]
+                                                                                      : ctx->device->pipeline_fa_prefill_rdna4_v64[G];
             vk_pipeline dq = ctx->device->pipeline_fa_dequant_q8_0_rdna4;
             ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
             ggml_pipeline_request_descriptor_sets(ctx, dq, 2);

@@ -942,6 +942,7 @@ void process_shaders() {
     string_to_spv("flash_attn_prefill_rdna4_vt", "flash_attn_prefill_rdna4_vt.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_prefill_rdna4_rs", "flash_attn_prefill_rdna4_rs.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_prefill_rdna4_v64", "flash_attn_prefill_rdna4_v64.comp", {}, true, true, false, false);
+    string_to_spv("flash_attn_prefill_rdna4_db", "flash_attn_prefill_rdna4_db.comp", {}, true, true, false, false);
     string_to_spv("fa_dequant_q8_0_rdna4", "fa_dequant_q8_0_rdna4.comp", {});
 #endif
 
