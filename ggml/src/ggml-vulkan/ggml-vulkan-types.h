@@ -798,6 +798,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_mmq_q6k_rdna4;     // RDNA4 Q6_K x q8_1 prefill GEMM, int8 WMMA (GGML_VK_MMQ_Q6K_RDNA4=int8)
+    vk_pipeline pipeline_mm_q8_rdna4_f16;    // RDNA4 q8_0 prefill GEMM (f16 WMMA); GGML_VK_NO_Q8_GEMM_TUNE=1 disables
+    vk_pipeline pipeline_mm_q8_rdna4_f16_sk; // split-K variant
     vk_pipeline pipeline_mm_q6k_rdna4_f16_sk; // split-K variant of the f16 one (m=5120-class shapes with large K)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_up, pipeline_mm_q6k_rdna4_f16_upsk; // uniform-parity variants (K/256 even)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_n256, pipeline_mm_q6k_rdna4_f16_n256sk; // 128x256 tiles, 8 waves (K/256 even, N >= 256)

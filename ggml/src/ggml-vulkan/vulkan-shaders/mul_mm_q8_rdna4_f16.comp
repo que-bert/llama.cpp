@@ -1,0 +1,204 @@
+#version 450
+
+// RDNA4 prefill GEMM for Q8_0 weights, f16 WMMA: D[n][m] = sum_k W[m][k] * Y[n][k]
+//   W = Q8_0 blocks (34 B: f16 d + 32 x int8), dequantised to f16 on the global->LDS path
+//       (int8 ^ 0x80 -> 0x6400 | u exponent trick, one packed sub + one packed mul per pair)
+//   Y = f16 activations (host-side f32->f16 copy into prealloc_y)
+// Same skeleton as mul_mm_q6k_rdna4_f16.comp: BM x BN = 128 x 128, BK = 32 (= one Q8_0 block per row per K step),
+// single-buffered LDS, register prefetch, n-fast workgroup order. Requires K % 64 == 0 so the block parity
+// (row * (K/32) + kt) & 1 == kt & 1 is workgroup-uniform (blocks are 2-byte aligned only).
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+#ifndef SG
+#define SG 64
+#endif
+#ifndef WARPS_M
+#define WARPS_M 2
+#endif
+#ifndef WARPS_N
+#define WARPS_N (256 / SG / WARPS_M)
+#endif
+#define NT (WARPS_M * WARPS_N * SG)
+#define BM 128
+#ifndef BN
+#define BN 128
+#endif
+#define BK 32
+#ifndef PAD
+#define PAD 2
+#endif
+#define STR (BK / 2 + PAD)   // LDS row stride in uint32 (2 halves each)
+#define WTM (BM / WARPS_M)
+#define WTN (BN / WARPS_N)
+#define TM (WTM / 16)
+#define TN (WTN / 16)
+
+layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { uint data_au[]; };   // Q8_0 blocks, 34 B (2-byte aligned)
+layout(binding = 1) readonly buffer B { uvec4 data_b[]; };   // f16 activations, K-contiguous rows
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint M; uint N; uint K;
+    uint stride_a; uint stride_b; uint stride_d;
+    uint batch_stride_a; uint batch_stride_b; uint batch_stride_d;
+    uint base_work_group_z; uint num_batches; uint k_split;
+    uint ne02; uint ne12; uint broadcast2; uint broadcast3; uint padded_n;
+} p;
+
+layout(constant_id = 0) const uint ORDER_N = 1;
+
+shared uint shW[BM * STR];
+shared uint shY[BN * STR];
+
+#define MAT(T, U) coopmat<T, gl_ScopeSubgroup, 16, 16, U>
+
+#define GW ((BM * BK) / (4 * NT)) // 4-value words dequantised per thread per K step (4)
+#define GPR (8 / GW)              // items per weight row per K step (2 x 16 values)
+#define W_PER ((BM * GPR) / NT)   // (row, group) items per thread
+#define Y_VR 4                    // uvec4 (8 x f16) per token row per K step
+#define Y_PER ((BN * Y_VR) / NT)  // (token, uvec4) items per thread
+
+uint fsh(const uint lo, const uint hi, const uint s) { return uint(pack64(u32vec2(lo, hi)) >> s); }
+
+// four int8 (already ^ 0x80808080) -> two f16vec2 of (u - 128) * s
+void deq4(const uint q, const f16vec2 s, out uint o0, out uint o1) {
+    const uint lo = (((q & 0x0000FFFFu) | ((q << 8) & 0xFFFF0000u)) & 0x00FF00FFu) | 0x64006400u;
+    const uint hi = ((((q >> 16) & 0x0000FFFFu) | ((q >> 8) & 0xFFFF0000u)) & 0x00FF00FFu) | 0x64006400u;
+    const f16vec2 c = f16vec2(float16_t(1152.0));
+    o0 = packFloat2x16((unpackFloat2x16(lo) - c) * s);
+    o1 = packFloat2x16((unpackFloat2x16(hi) - c) * s);
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint warp = gl_SubgroupID;
+    const uint wm = warp % WARPS_M, wn = warp / WARPS_M;
+
+    uint mt, nt;
+    if (ORDER_N != 0) {
+        const uint lin = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        mt = lin / gl_NumWorkGroups.y;
+        nt = lin % gl_NumWorkGroups.y;
+    } else {
+        mt = gl_WorkGroupID.x;
+        nt = gl_WorkGroupID.y;
+    }
+    const uint m0 = mt * BM, n0 = nt * BN;
+    const uint nb = p.K / 32;        // Q8_0 blocks per row (even)
+    const uint kv = p.stride_b / 8;  // uvec4 per activation row
+
+    MAT(float, gl_MatrixUseAccumulator) acc[TM * TN];
+    [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = MAT(float, gl_MatrixUseAccumulator)(0.0f);
+
+    uint rq[W_PER][GW + 1];
+    uint rdw[W_PER];
+    uint rbase[W_PER];
+    uvec4 ry[Y_PER];
+
+    // per-item block-row byte base, hoisted out of the K loop
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) {
+        const uint row = (tid + i * NT) / GPR;
+        rbase[i] = (m0 + row) * nb * 34u;
+    }
+
+// step kt = Q8_0 block kt of every row. Even block: bb % 4 == 0, values start at byte bb + 2 (2 into word bb/4);
+// odd block: bb % 4 == 2, values start dword-aligned at word (bb + 2)/4. Unconditional (GW + 1)-dword loads.
+#define GLOAD(kt) { \
+    const uint odd = (kt) & 1u; \
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
+        const uint v = tid + i * NT, g = v % GPR; \
+        const uint wb = (rbase[i] + (kt) * 34u) >> 2; \
+        const uint w0 = wb + odd + g * GW; \
+        [[unroll]] for (uint w = 0; w < GW + 1; ++w) rq[i][w] = data_au[w0 + w]; \
+        rdw[i] = data_au[wb]; \
+    } \
+    [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+        const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
+        const uint tok = min(n0 + r, p.N - 1); \
+        ry[i] = data_b[tok * kv + (kt) * Y_VR + q]; \
+    } }
+
+#define SSTORE(kt) { \
+    const uint odd = (kt) & 1u; \
+    [[unroll]] for (uint i = 0; i < W_PER; ++i) { \
+        const uint v = tid + i * NT, row = v / GPR, g = v % GPR; \
+        const f16vec2 s = f16vec2(unpackHalf2x16(rdw[i] >> (16u * odd)).x); \
+        [[unroll]] for (uint w = 0; w < GW; ++w) { \
+            const uint q = fsh(rq[i][w], rq[i][w + 1], 16u * (1u - odd)) ^ 0x80808080u; \
+            uint o0, o1; deq4(q, s, o0, o1); \
+            shW[row * STR + g * 2 * GW + 2 * w] = o0; \
+            shW[row * STR + g * 2 * GW + 2 * w + 1] = o1; \
+        } \
+    } \
+    [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
+        const uint v = tid + i * NT, r = v / Y_VR, q = v % Y_VR; \
+        const uint o = r * STR + q * 4; \
+        shY[o] = ry[i].x; shY[o + 1] = ry[i].y; shY[o + 2] = ry[i].z; shY[o + 3] = ry[i].w; \
+    } }
+
+#ifdef SPLITK
+    const uint kt0 = gl_WorkGroupID.z * (p.k_split / BK);
+    const uint nk  = min(kt0 + p.k_split / BK, p.K / BK);
+    const uint dbase = gl_WorkGroupID.z * p.batch_stride_d;
+#else
+    const uint kt0 = 0;
+    const uint nk = p.K / BK;
+    const uint dbase = 0;
+#endif
+    GLOAD(kt0)
+    SSTORE(kt0)
+    barrier();
+
+    for (uint kt = kt0; kt < nk; ++kt) {
+        // unconditional (clamped) prefetch keeps the loop branch-free so the global loads stay in flight
+        const uint kn = min(kt + 1, nk - 1);
+        GLOAD(kn)
+        [[unroll]] for (uint kk = 0; kk < BK / 16; ++kk) {
+            MAT(float16_t, gl_MatrixUseA) ma[TM];
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                coopMatLoad(ma[i], shW, (wm * WTM + i * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                MAT(float16_t, gl_MatrixUseB) mb;
+                coopMatLoad(mb, shY, (wn * WTN + j * 16) * STR + kk * 8, STR, gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0; i < TM; ++i) acc[j * TM + i] = coopMatMulAdd(ma[i], mb, acc[j * TM + i]);
+            }
+        }
+        barrier();
+        SSTORE(kn)
+        barrier();
+    }
+
+    if (n0 + BN <= p.N) {
+        [[unroll]] for (uint j = 0; j < TN; ++j)
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                coopMatStore(acc[j * TM + i], data_d, dbase + (n0 + wn * WTN + j * 16) * p.stride_d + m0 + wm * WTM + i * 16, p.stride_d,
+                             gl_CooperativeMatrixLayoutColumnMajor);
+    } else {
+        // token tail: stage each 16x16 tile through LDS (reusing shW) and store the in-range columns
+        const uint scr = warp * 256;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            [[unroll]] for (uint i = 0; i < TM; ++i) {
+                MAT(float, gl_MatrixUseAccumulator) t = acc[j * TM + i];
+                coopMatStore(t, shW, scr, 16, gl_CooperativeMatrixLayoutColumnMajor);
+                subgroupMemoryBarrierShared();
+                for (uint e = gl_SubgroupInvocationID; e < 256; e += SG) {
+                    const uint cn = e / 16, rm = e % 16;
+                    const uint tok = n0 + wn * WTN + j * 16 + cn;
+                    if (tok < p.N) {
+                        data_d[dbase + tok * p.stride_d + m0 + wm * WTM + i * 16 + rm] = uintBitsToFloat(shW[scr + e]);
+                    }
+                }
+                subgroupMemoryBarrierShared();
+            }
+        }
+    }
+}
