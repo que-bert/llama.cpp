@@ -265,9 +265,10 @@ uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
     return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
 }
 
+static bool ggml_vk_host_get_rows_enabled();
 size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
-    if (ctx->device->uma) {
+    if (ctx->device->uma || ggml_vk_host_get_rows_enabled()) {
         vk_buffer buf = nullptr;
         size_t off = 0;
         ggml_vk_host_get(ctx->device, t->data, buf, off);

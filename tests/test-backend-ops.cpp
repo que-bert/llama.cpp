@@ -9287,6 +9287,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
 
+    // vocab-sized embedding table, prefill-sized batch
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q6_K, 5120, 248320, 512, 1, 1, false));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
