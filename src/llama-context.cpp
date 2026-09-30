@@ -1477,7 +1477,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // the previous graph may still be running on the device and reading its host inputs
         // (pipeline parallelism, or the opt-in async input uploads): wait before overwriting them
         static const bool async_inputs = getenv("GGML_SCHED_ASYNC_INPUT_COPY") && atoi(getenv("GGML_SCHED_ASYNC_INPUT_COPY"));
-        if (cparams.pipeline_parallel || async_inputs) {
+        // GGML_VK_HOST_GET_ROWS: token ids feed a GPU GET_ROWS at the head of the graph, so they are a device-side
+        // input that a still-queued previous graph would read after they were overwritten
+        static const bool gpu_token_input = getenv("GGML_VK_HOST_GET_ROWS") && atoi(getenv("GGML_VK_HOST_GET_ROWS"));
+        if (cparams.pipeline_parallel || async_inputs || gpu_token_input) {
             ggml_backend_sched_synchronize(sched.get());
         }
 

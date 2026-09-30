@@ -265,9 +265,10 @@ uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
     return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
 }
 
+static bool ggml_vk_host_get_rows_enabled();
 size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
-    if (ctx->device->uma) {
+    if (ctx->device->uma || ggml_vk_host_get_rows_enabled()) {
         vk_buffer buf = nullptr;
         size_t off = 0;
         ggml_vk_host_get(ctx->device, t->data, buf, off);
@@ -5935,12 +5936,22 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
+static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft);
+static bool ggml_vk_tensor_in_host_buffer(const ggml_tensor * t) {
+    return t->buffer && t->buffer->buft->iface.get_name == ggml_backend_vk_host_buffer_type_name;
+}
+// GGML_VK_HOST_GET_ROWS=1: GET_ROWS may read src0 straight from the pinned host buffer (PCIe)
+static bool ggml_vk_host_get_rows_enabled() {
+    static const bool en = [] { const char * e = getenv("GGML_VK_HOST_GET_ROWS"); return e && atoi(e) != 0; }();
+    return en;
+}
+
 vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign) {
 
     vk_buffer buffer = nullptr;
     size_t offset = 0;
-    if (ctx->device->uma) {
+    if (ctx->device->uma || ggml_vk_host_get_rows_enabled()) {
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
@@ -13249,11 +13260,17 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
+            if (ggml_vk_tensor_in_host_buffer(node)) {
+                return false;  // pinned host weight: never written by the graph
+            }
             auto n_base = vk_tensor_offset(node) + node->view_offs;
             auto n_size = ggml_nbytes(node);
             ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
             vk_buffer a_buf = a_buf_ctx->dev_buffer;
             for (auto &other : unsynced_nodes) {
+                if (ggml_vk_tensor_in_host_buffer(other)) {
+                    continue;
+                }
                 ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
                 vk_buffer o_buf = o_buf_ctx->dev_buffer;
                 if (a_buf == o_buf) {
@@ -15205,6 +15222,9 @@ bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgr
 }
 
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
+    if (ggml_vk_tensor_in_host_buffer(a) || ggml_vk_tensor_in_host_buffer(b)) {
+        return false;
+    }
     ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
     vk_buffer a_buf = a_buf_ctx->dev_buffer;
     ggml_backend_vk_buffer_context * b_buf_ctx = (ggml_backend_vk_buffer_context *)b->buffer->context;
@@ -16572,6 +16592,16 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    if (ggml_vk_host_get_rows_enabled()) {
+        // ops whose sources live in the pinned host buffer: only GET_ROWS (src0) is supported there
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * s = op->src[i];
+            if (s && s->buffer && s->buffer->buft->iface.get_name == ggml_backend_vk_host_buffer_type_name &&
+                !(op->op == GGML_OP_GET_ROWS && i == 0)) {
+                return false;
+            }
+        }
+    }
     const vk_device& device = ggml_vk_get_device(ctx->device);
 
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
@@ -17226,6 +17256,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    if (ggml_vk_host_get_rows_enabled() && buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
+        return true;
+    }
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return false;
     }
