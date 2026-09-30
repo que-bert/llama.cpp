@@ -1345,8 +1345,8 @@ struct ggml_backend_vk_context {
     struct vk_gdn_cache_fuse {
         const ggml_tensor * cache;      // recurrent cache tensor (read through ids, snapshots written back)
         const ggml_tensor * ids;        // s_copy_main
-        const ggml_tensor * cpy_dst[4]; // snapshot destinations (views of cache)
-        uint32_t t_off[4];              // concat time offset of each snapshot (CONCAT only)
+        const ggml_tensor * cpy_dst[8]; // snapshot destinations (views of cache)
+        uint32_t t_off[8];              // concat time offset of each snapshot (CONCAT only)
         uint32_t n_cpy;
         // GDN gate chain folded in (GATED_DELTA_NET only): g = softplus(alpha + dt) * a, beta = sigmoid(beta_raw)
         const ggml_tensor * gate_alpha;

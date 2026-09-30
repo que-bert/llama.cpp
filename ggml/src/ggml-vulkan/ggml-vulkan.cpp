@@ -11117,6 +11117,9 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         *cache = base;
         return t;
     };
+    // K = n_rs_seq+1 snapshot CPYs per conv layer (up to 8; LLAMA_NO_RS_INDEX=1 restores the old cap of 4)
+    static const bool no_rs_index = getenv("LLAMA_NO_RS_INDEX") != nullptr && atoi(getenv("LLAMA_NO_RS_INDEX")) != 0;
+    const size_t max_conv_cpys = no_rs_index ? 4 : 8;
     // no compute node in [lo, hi] other than the fused ones touches the cache
     auto cache_untouched = [&](const ggml_tensor * cache, int lo, int hi, const std::unordered_set<const ggml_tensor *> & mine) {
         for (int j = lo; j <= hi; ++j) {
@@ -11204,7 +11207,7 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
             const int64_t d = n->src[0]->ne[0], C = n->src[0]->ne[1];
             if (!g || ggml_get_op_params_i32(n, 0) != 0 || n->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32 ||
                 !ggml_is_contiguous(n) || n->src[0]->ne[2] != 1 || n->src[0]->ne[3] != 1 || s1->ne[2] != 1 || s1->ne[3] != 1 ||
-                s1->ne[1] != C || d < 1 || d > 8 || s1->ne[0] > 64 || cpys.empty() || cpys.size() > 4 ||
+                s1->ne[1] != C || d < 1 || d > 8 || s1->ne[0] > 64 || cpys.empty() || cpys.size() > max_conv_cpys ||
                 s1->nb[0] % sizeof(float) || s1->nb[1] % sizeof(float) || f.cache->nb[1] != (size_t)(d * C) * sizeof(float)) {
                 continue;
             }

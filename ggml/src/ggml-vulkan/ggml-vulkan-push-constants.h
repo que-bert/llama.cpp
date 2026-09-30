@@ -701,8 +701,8 @@ struct vk_op_gdn_conv_state_push_constants {
     uint32_t in_row_stride;
     uint32_t cat_nb1, cat_nb2;
     uint32_t n_cpy, dst_seq_stride;
-    uint32_t t_off[4];
-    uint32_t dst_off[4];
+    uint32_t t_off[8];
+    uint32_t dst_off[8];
 };
 
 struct vk_op_ssm_scan_push_constants {

@@ -11292,6 +11292,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_recurrent_cache(2, 128, 8, 4, 3, 256, 1));
     test_cases.emplace_back(new test_gdn_recurrent_cache(4, 32,  4, 2, 3, 64,  1));
     test_cases.emplace_back(new test_gdn_recurrent_cache(4, 128, 4, 4, 3, 256, 2, true));
+    // K = n_rs_seq+1 = 5..8 conv snapshots (draft n_max 4..7)
+    test_cases.emplace_back(new test_gdn_recurrent_cache(48, 128, 5, 5, 3, 256, 3, true));
+    test_cases.emplace_back(new test_gdn_recurrent_cache(4, 128, 3, 5, 3, 256, 4));
+    test_cases.emplace_back(new test_gdn_recurrent_cache(4, 64, 8, 8, 3, 300, 5, true));
     test_cases.emplace_back(new test_gdn_recurrent_cache(8, 64,  1, 4, 3, 100, 3, true));
     test_cases.emplace_back(new test_gdn_recurrent_cache(48, 128, 4, 4, 3, 256, 1, true));
     test_cases.emplace_back(new test_gdn_recurrent_cache(4, 32,  8, 4, 3, 64,  0, true));

@@ -18,8 +18,8 @@ layout(push_constant) uniform Parameters {
     uint in_row_stride;
     uint cat_nb1; uint cat_nb2;
     uint n_cpy; uint dst_seq_stride;
-    uvec4 t_off;
-    uvec4 dst_off;
+    uvec4 t_off[2];
+    uvec4 dst_off[2];
 };
 
 layout(binding = 0)           buffer CacheBuf { float data_cache[]; };
@@ -56,10 +56,14 @@ void main() {
         data_cat[cat_base + t] = v;
     }
 
-    for (uint k = 0; k < n_cpy; k++) {
-        const uint dst_base = dst_off[k] + seq * dst_seq_stride + c * d;
+    // constant indices into the push-constant arrays (unrolled), guarded by n_cpy
+    [[unroll]] for (uint k = 0; k < 8; k++) {
+        if (k >= n_cpy) {
+            break;
+        }
+        const uint dst_base = dst_off[k / 4][k % 4] + seq * dst_seq_stride + c * d;
         for (uint j = 0; j < d; j++) {
-            const uint t = t_off[k] + j;
+            const uint t = t_off[k / 4][k % 4] + j;
             float v;
             if (t < d) {
                 v = old_v[min(t, MAX_D - 1)];
