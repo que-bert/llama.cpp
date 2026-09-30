@@ -174,6 +174,67 @@ struct clip_ctx {
 
     bool support_batch = false;
 
+    // Lazy GPU residency (env MTMD_LAZY_GPU=1, default off): the mmproj weights, compute buffers and
+    // the backend instance are dropped from the device after init and after every encode, and rebuilt
+    // (from a host copy of the weights) at the start of the next encode. Frees ~1.1 GB of VRAM while idle.
+    bool lazy_gpu = false;
+    bool gpu_released = false;
+    ggml_backend_dev_t gpu_dev = nullptr;
+    ggml_backend_sched_eval_callback lazy_cb_eval = nullptr;
+    void * lazy_cb_eval_user_data = nullptr;
+    std::vector<std::vector<uint8_t>> host_weights; // one blob per ctx_data tensor, in iteration order
+
+    void gpu_release() {
+        if (!lazy_gpu || gpu_released || backend == backend_cpu || !backend || !buf) {
+            return;
+        }
+        if (host_weights.empty()) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_data.get()); t; t = ggml_get_next_tensor(ctx_data.get(), t)) {
+                host_weights.emplace_back(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, host_weights.back().data(), 0, ggml_nbytes(t));
+            }
+        }
+        sched.reset();
+        buf.reset();
+        ggml_backend_free(backend);
+        backend = backend_cpu;
+        backend_ptrs.assign(1, backend_cpu);
+        backend_buft.assign(1, ggml_backend_get_default_buffer_type(backend_cpu));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_data.get()); t; t = ggml_get_next_tensor(ctx_data.get(), t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+        is_allocated = false;
+        gpu_released = true;
+        LOG_INF("%s: mmproj released from the GPU (lazy)\n", __func__);
+    }
+
+    void gpu_acquire() {
+        if (!gpu_released) {
+            return;
+        }
+        backend = ggml_backend_dev_init(gpu_dev, nullptr);
+        if (!backend) {
+            throw std::runtime_error("lazy mmproj: failed to re-initialize the GPU backend");
+        }
+        backend_ptrs.assign({ backend, backend_cpu });
+        backend_buft.assign({ ggml_backend_get_default_buffer_type(backend), ggml_backend_get_default_buffer_type(backend_cpu) });
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true));
+        if (lazy_cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), lazy_cb_eval, lazy_cb_eval_user_data);
+        }
+        buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_data.get(), ggml_backend_get_default_buffer_type(backend)));
+        if (!buf) {
+            throw std::runtime_error("lazy mmproj: failed to allocate the weight buffer");
+        }
+        ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        size_t i = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_data.get()); t; t = ggml_get_next_tensor(ctx_data.get(), t), ++i) {
+            ggml_backend_tensor_set(t, host_weights[i].data(), 0, ggml_nbytes(t));
+        }
+        gpu_released = false;
+    }
+
     // for audio gen, reseeded only when the caller asks for another seed
     std::mt19937 rng{std::random_device{}()};
     uint32_t rng_seed = UINT32_MAX;
@@ -199,6 +260,10 @@ struct clip_ctx {
         }
 
         if (backend) {
+            gpu_dev = ggml_backend_get_device(backend);
+            lazy_cb_eval = ctx_params.cb_eval;
+            lazy_cb_eval_user_data = ctx_params.cb_eval_user_data;
+            lazy_gpu = !no_alloc && std::getenv("MTMD_LAZY_GPU") != nullptr;
             LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
             backend_ptrs.push_back(backend);
             backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
@@ -3974,6 +4039,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             if (ctx_params.warmup) {
                 loader.warmup(*ctx_vision);
             }
+            ctx_vision->gpu_release();
 
             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
             // we can remove this check when we implement audio support for Gemma 3N
@@ -3988,6 +4054,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             if (ctx_params.warmup) {
                 loader.warmup(*ctx_audio);
             }
+            ctx_audio->gpu_release();
         }
 
         if (loader.has_gen_audio) {
@@ -4413,7 +4480,23 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
+static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * params);
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    if (!ctx->lazy_gpu) {
+        return clip_encode_impl(ctx, params);
+    }
+    struct release_guard { clip_ctx * c; ~release_guard() { c->gpu_release(); } } guard{ ctx };
+    try {
+        ctx->gpu_acquire();
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+    return clip_encode_impl(ctx, params);
+}
+
+static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
