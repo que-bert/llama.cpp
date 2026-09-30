@@ -1691,18 +1691,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int64_t tim_cp = spec_tim_now();
-        struct tim_guard { int64_t t0; ~tim_guard() { common_spec_timing_ns[4] += spec_tim_now() - t0; } } tim_g{tim_cp};
+        struct tim_guard { int64_t t0; ~tim_guard() {
+            common_spec_timing_ns[4] += spec_tim_now() - t0;
+            static int n = 0;
+            if (t0 != 0 && ++n % 35 == 0) { fprintf(stderr, "MTPP_TIMING n=%d decode_ms=%.1f post_copy_ms=%.1f (cumulative)\n", n, common_spec_timing_ns[3]/1e6, common_spec_timing_ns[4]/1e6); }
+        } } tim_g{tim_cp};
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            static const bool fast = [] { const char * e = getenv("MTP_PROMPT_FAST"); return e && atoi(e) != 0; }();
+            int32_t i_first = 0;
+            if (fast && n_rows > 64) {
+                // prompt-sized batch: accept() is only ever called after a verify batch, so only the last row is needed
+                i_first = n_rows - 1;
+                n_rows  = 1;
+            }
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i_first + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
