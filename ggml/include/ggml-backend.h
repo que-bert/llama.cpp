@@ -333,6 +333,9 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
+    // when true (until the next reset), tensors computed on another backend are always copied, even if the target backend
+    // accepts their buffer type (GGML_VK_HOST_GET_ROWS: prefill must not read host inputs in place)
+    GGML_API void                 ggml_backend_sched_set_copy_host_inputs(ggml_backend_sched_t sched, bool copy);
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 

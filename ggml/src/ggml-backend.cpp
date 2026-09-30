@@ -786,6 +786,7 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool copy_host_inputs; // see ggml_backend_sched_buffer_supported; cleared by reset
 
     int n_backends;
 
@@ -1049,6 +1050,12 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
         }
         if (tensor_backend_id != -1) {
             buft = sched->bufts[tensor_backend_id];
+            // GGML_VK_HOST_GET_ROWS: the GPU backend accepts the pinned host buffer so small batches read host inputs in place.
+            // For large batches (prefill) llama sets copy_host_inputs: every host-computed tensor is then copied to the device
+            // like without HGR, otherwise each layer re-reads the KQ mask over PCIe and the next ubatch can overwrite it under the GPU.
+            if (sched->copy_host_inputs && tensor_backend_id != backend_id) {
+                return false;
+            }
         }
     }
 
@@ -1983,6 +1990,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->copy_host_inputs = false;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2537,4 +2545,8 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+void ggml_backend_sched_set_copy_host_inputs(ggml_backend_sched_t sched, bool copy) {
+    sched->copy_host_inputs = copy;
 }

@@ -1419,6 +1419,18 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// GGML_VK_HOST_GET_ROWS=1: small batches (<= GGML_VK_HOST_GET_ROWS_MAX, default 16) let the GPU read host inputs in place
+static int64_t hgr_max_tokens() {
+    static const int64_t v = getenv("GGML_VK_HOST_GET_ROWS_MAX") ? atoll(getenv("GGML_VK_HOST_GET_ROWS_MAX")) : 16;
+    return v;
+}
+
+static bool hgr_large_batch(uint32_t n_tokens) {
+    static const bool en = getenv("GGML_VK_HOST_GET_ROWS") && atoi(getenv("GGML_VK_HOST_GET_ROWS"));
+    static const bool noflag = getenv("HGR_NOFLAG") != nullptr;
+    return en && !noflag && (int64_t) n_tokens > hgr_max_tokens();
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1445,6 +1457,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_copy_host_inputs(sched.get(), hgr_large_batch(ubatch.n_tokens));
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -1480,7 +1493,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // GGML_VK_HOST_GET_ROWS: token ids feed a GPU GET_ROWS at the head of the graph, so they are a device-side
         // input that a still-queued previous graph would read after they were overwritten
         static const bool gpu_token_input = getenv("GGML_VK_HOST_GET_ROWS") && atoi(getenv("GGML_VK_HOST_GET_ROWS"));
-        if (cparams.pipeline_parallel || async_inputs || gpu_token_input) {
+        // only small batches run GET_ROWS on the GPU (GGML_VK_HOST_GET_ROWS_MAX); sync if this or the previous ubatch did
+        static int64_t hgr_prev_n_tokens = 0;
+        const bool sync_tokens = gpu_token_input && ((int64_t) ubatch.n_tokens <= hgr_max_tokens() || hgr_prev_n_tokens <= hgr_max_tokens());
+        hgr_prev_n_tokens = ubatch.n_tokens;
+        if (cparams.pipeline_parallel || async_inputs || sync_tokens) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -2577,6 +2594,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_copy_host_inputs(sched.get(), hgr_large_batch(n_tokens));
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {

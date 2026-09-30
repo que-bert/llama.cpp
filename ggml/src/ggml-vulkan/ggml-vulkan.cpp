@@ -5946,6 +5946,12 @@ static bool ggml_vk_host_get_rows_enabled() {
     return en;
 }
 
+// GGML_VK_HOST_GET_ROWS_MAX (default 16): max rows per GET_ROWS run on the GPU from the host buffer
+static int64_t ggml_vk_host_get_rows_max() {
+    static const int64_t v = [] { const char * e = getenv("GGML_VK_HOST_GET_ROWS_MAX"); return e ? (int64_t) atoll(e) : (int64_t) 16; }();
+    return v;
+}
+
 vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign) {
 
@@ -16598,6 +16604,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             const ggml_tensor * s = op->src[i];
             if (s && s->buffer && s->buffer->buft->iface.get_name == ggml_backend_vk_host_buffer_type_name &&
                 !(op->op == GGML_OP_GET_ROWS && i == 0)) {
+                return false;
+            }
+            // large batches (prefill) gather faster on the CPU than over PCIe: leave those to the CPU backend
+            if (s && s->buffer && s->buffer->buft->iface.get_name == ggml_backend_vk_host_buffer_type_name &&
+                op->op == GGML_OP_GET_ROWS && i == 0 && ggml_nelements(op->src[1]) > ggml_vk_host_get_rows_max()) {
                 return false;
             }
         }
