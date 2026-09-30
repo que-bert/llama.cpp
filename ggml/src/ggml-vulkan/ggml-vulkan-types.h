@@ -1355,6 +1355,10 @@ struct ggml_backend_vk_context {
         const ggml_tensor * gate_a;
         const ggml_tensor * gate_beta;
     };
+    // GGML_VK_HOST_GET_ROWS: large host-resident graph inputs (KQ mask) are copied once per graph into this device buffer
+    struct vk_host_input { const uint8_t * p; size_t size; size_t off; };
+    vk_buffer host_in_dev;
+    std::vector<vk_host_input> host_in_map;
     std::unordered_set<const ggml_tensor *> gdn_skip_nodes;
     std::unordered_map<const ggml_tensor *, vk_gdn_cache_fuse> gdn_cache_fuse;
     const vk_gdn_cache_fuse * cur_gdn_cache_fuse {};

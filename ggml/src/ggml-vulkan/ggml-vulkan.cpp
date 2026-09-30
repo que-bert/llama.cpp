@@ -266,12 +266,24 @@ uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
 }
 
 static bool ggml_vk_host_get_rows_enabled();
+static bool ggml_vk_host_input_redirect(const ggml_backend_vk_context * ctx, const void * data, vk_buffer & buf, size_t & off) {
+    for (const auto & e : ctx->host_in_map) {
+        if ((const uint8_t *) data >= e.p && (const uint8_t *) data < e.p + e.size) {
+            buf = ctx->host_in_dev;
+            off = e.off + ((const uint8_t *) data - e.p);
+            return true;
+        }
+    }
+    return false;
+}
 size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
     if (ctx->device->uma || ggml_vk_host_get_rows_enabled()) {
         vk_buffer buf = nullptr;
         size_t off = 0;
-        ggml_vk_host_get(ctx->device, t->data, buf, off);
+        if (!ggml_vk_host_input_redirect(ctx, t->data, buf, off)) {
+            ggml_vk_host_get(ctx->device, t->data, buf, off);
+        }
         if (buf) {
             return off;
         }
@@ -5952,7 +5964,14 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
     vk_buffer buffer = nullptr;
     size_t offset = 0;
     if (ctx->device->uma || ggml_vk_host_get_rows_enabled()) {
-        ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
+        bool redir = ggml_vk_host_input_redirect(ctx, tensor->data, buffer, offset);
+        if (!redir) {
+            ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
+        }
+        if (buffer && getenv("GGML_VK_HGR_LOG") && ggml_nbytes(tensor) >= 65536) {
+            static int cnt = 0;
+            if (cnt++ % 4 == 0) fprintf(stderr, "HGRLOG %s host-read %s type=%s ne=%ld,%ld,%ld bytes=%zu buft=%s\n", redir ? "REDIR" : "INPLACE", tensor->name, ggml_type_name(tensor->type), (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], ggml_nbytes(tensor), tensor->buffer ? tensor->buffer->buft->iface.get_name(tensor->buffer->buft) : "?");
+        }
     }
     if (!buffer) {
         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
@@ -11090,6 +11109,63 @@ static bool ggml_vk_gdn_find_gate(const ggml_tensor * n, UsesFn && uses, const g
 }
 
 // Find the GDN recurrent-cache patterns (see vk_gdn_cache_fuse) in this graph.
+// GGML_VK_HOST_INPUT_MAX (bytes, default 262144): with GGML_VK_HOST_GET_ROWS the GPU reads small host-resident inputs in
+// place, but a large one (the KQ mask grows with context) is re-read over PCIe by every consuming op. Copy those once
+// per graph into a device buffer instead. Keyed on tensor size, so graph topology never depends on batch size.
+static void ggml_vk_host_input_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->host_in_map.clear();
+    if (!ggml_vk_host_get_rows_enabled()) {
+        return;
+    }
+    static const size_t max_in_place = [] { const char * e = getenv("GGML_VK_HOST_INPUT_MAX"); return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) 262144; }();
+    static const size_t max_copy = (size_t) 320 << 20;
+    size_t total = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = node->src[j];
+            if (!s || !ggml_vk_tensor_in_host_buffer(s) || (node->op == GGML_OP_GET_ROWS && j == 0)) {
+                continue;
+            }
+            const ggml_tensor * b = s->view_src ? s->view_src : s;
+            if (b->op != GGML_OP_NONE) {
+                continue;  // written by the graph itself: must be read where it is produced
+            }
+            const size_t sz = ggml_nbytes(b);
+            if (sz < max_in_place || sz > max_copy) {
+                continue;
+            }
+            bool dup = false;
+            for (const auto & e : ctx->host_in_map) {
+                dup |= e.p == (const uint8_t *) b->data;
+            }
+            if (!dup) {
+                ctx->host_in_map.push_back({ (const uint8_t *) b->data, sz, total });
+                total += (sz + 255) & ~(size_t) 255;
+            }
+        }
+    }
+    if (ctx->host_in_map.empty()) {
+        return;
+    }
+    if (!ctx->host_in_dev || ctx->host_in_dev->size < total) {
+        ggml_vk_synchronize(ctx);  // previous graph may still read the old buffer
+        if (ctx->host_in_dev) {
+            ggml_vk_destroy_buffer(ctx->host_in_dev);
+        }
+        ctx->host_in_dev = ggml_vk_create_buffer_device(ctx->device, (total + ((size_t) 64 << 20) - 1) & ~(((size_t) 64 << 20) - 1));
+    }
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    for (const auto & e : ctx->host_in_map) {
+        vk_buffer hb = nullptr;
+        size_t ho = 0;
+        ggml_vk_host_get(ctx->device, e.p, hb, ho);
+        GGML_ASSERT(hb != nullptr);
+        ggml_vk_buffer_copy_async(compute_ctx, ctx->host_in_dev, e.off, hb, ho, e.size);
+    }
+    ggml_vk_sync_buffers(ctx, compute_ctx);
+}
+
 static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->gdn_skip_nodes.clear();
     ctx->gdn_cache_fuse.clear();
@@ -15442,6 +15518,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
+
+    ggml_vk_host_input_prepass(ctx, cgraph);
 
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
     // Estimate the amount of compute work using flops, and submit every 200 GFLOP
