@@ -2402,6 +2402,55 @@ struct test_get_rows : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS, reduced-draft-vocab logit unpermute: f32 [1, V, n_out] gathered by a
+// [V, n_out] id view with a zero token stride (ne00 == 1 fast path)
+struct test_get_rows_unperm : public test_case {
+    const int V;
+    const int n_out;
+
+    std::string vars() override {
+        return VARS_TO_STR2(V, n_out);
+    }
+
+    test_get_rows_unperm(int V = 248320, int n_out = 5) : V(V), n_out(n_out) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, V, n_out);
+        ggml_set_name(logits, "logits");
+        ggml_tensor * inv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, V);
+        ggml_set_name(inv, "inv");
+        ggml_tensor * rows = ggml_reshape_3d(ctx, logits, 1, V, n_out);
+        ggml_tensor * ids  = ggml_view_2d(ctx, inv, V, 1, inv->nb[1], 0);
+        ids->ne[1] = n_out;
+        ids->nb[1] = ids->nb[2] = ids->nb[3] = 0;
+        ggml_tensor * out = ggml_get_rows(ctx, rows, ids);
+        out = ggml_reshape_2d(ctx, out, V, n_out);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                // random permutation
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (int) i;
+                }
+                for (size_t i = data.size() - 1; i > 0; i--) {
+                    std::swap(data[i], data[rand() % (i + 1)]);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -9288,6 +9337,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 5000, 3000, 5, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 5000, 3000, 5, 2, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 5000, 3000, 5, 1, true));
+    test_cases.emplace_back(new test_get_rows_unperm(248320, 5));
+    test_cases.emplace_back(new test_get_rows_unperm(248320, 1));
+    test_cases.emplace_back(new test_get_rows_unperm(4096, 16));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -11342,6 +11397,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    test_cases.emplace_back(new test_get_rows_unperm(248320, 5));
 
     // R9700 decode GEMV shapes: Qwen3.8-27B Q6_K weights at the MTP verify width
     // (n=3 rows). These are 43.8 ms of a ~117 ms 183k decode step.
