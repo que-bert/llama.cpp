@@ -280,6 +280,12 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // true when the state gather of the first n_seqs cells is an identity (source == destination, no rollback
+    // snapshot), so build_rs(..., view_ok = true) can read the state in place; needs to match for graph reuse
+    bool identity = false;
+
+    static bool calc_identity(const llama_memory_recurrent_context * mctx, int64_t n_seqs);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1339,7 +1345,8 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
+                   bool   identity = false) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
@@ -1349,6 +1356,14 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    // same as above, but reads the state in place (view instead of gather) when inp->identity;
+    // only for callers which do not modify the returned tensor in place
+    ggml_tensor * build_rs_view(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

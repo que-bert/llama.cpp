@@ -17,6 +17,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <chrono>
 #include <map>
@@ -329,6 +330,25 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_rs::calc_identity(const llama_memory_recurrent_context * mctx, int64_t n_seqs) {
+    static const bool disabled = getenv("LLAMA_NO_RS_VIEW") != nullptr && atoi(getenv("LLAMA_NO_RS_VIEW")) != 0;
+    if (disabled || n_seqs < 1 || (int64_t) mctx->get_n_rs() < n_seqs) {
+        return false;
+    }
+    const int32_t head = mctx->get_head();
+    const int32_t rs_z = mctx->get_rs_z();
+    // the zero-state clear must not touch the rows we read in place
+    if (rs_z >= head && rs_z < head + n_seqs) {
+        return false;
+    }
+    for (int64_t i = 0; i < n_seqs; ++i) {
+        if (mctx->s_copy_peek((int) i) != head + (int32_t) i) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -359,6 +379,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= identity == calc_identity(mctx, params.ubatch.n_seqs);
 
     return res;
 }
@@ -1135,6 +1156,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->identity == llm_graph_input_rs::calc_identity(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1178,6 +1200,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->identity == llm_graph_input_rs::calc_identity(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1266,6 +1289,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->identity == llm_graph_input_rs::calc_identity(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -3504,7 +3528,8 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   identity) const {
 
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
@@ -3517,7 +3542,9 @@ ggml_tensor * llm_graph_context::build_rs(
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
     // {state_size, rs_size} -> {state_size, n_seqs}
-    ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
+    ggml_tensor * output_states = identity
+        ? ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1])
+        : get_state_rows(ctx0, states, state_copy_main);
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
@@ -3548,6 +3575,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->identity = llm_graph_input_rs::calc_identity(mctx_cur, n_seqs);
 
     return inp;
 }
@@ -3571,6 +3599,18 @@ ggml_tensor * llm_graph_context::build_rs(
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+}
+
+ggml_tensor * llm_graph_context::build_rs_view(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    const auto * kv_state = inp->mctx;
+
+    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+                    kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+                    ggml_get_rows, inp->identity);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

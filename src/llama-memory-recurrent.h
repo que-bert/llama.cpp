@@ -176,6 +176,7 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    int32_t s_copy_peek(int i) const; // same as s_copy, without resetting the rollback idx
 
 private:
     const llama_memory_status status;

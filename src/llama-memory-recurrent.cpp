@@ -1303,7 +1303,7 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
-int32_t llama_memory_recurrent_context::s_copy(int i) const {
+int32_t llama_memory_recurrent_context::s_copy_peek(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
@@ -1316,9 +1316,23 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+int32_t llama_memory_recurrent_context::s_copy(int i) const {
+    const int32_t res = s_copy_peek(i);
+
+    if (mem->n_rs_seq != 0) {
+        const uint32_t cell_idx = i + mem->head;
+        if (!mem->cells[cell_idx].seq_id.empty()) {
+            const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+            if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+                // reset rollback idx
+                mem->rs_idx[seq] = 0;
+            }
+        }
+    }
+    return res;
 }
