@@ -803,7 +803,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mm_q6k_rdna4_f16_sk; // split-K variant of the f16 one (m=5120-class shapes with large K)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_up, pipeline_mm_q6k_rdna4_f16_upsk; // uniform-parity variants (K/256 even)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_n256, pipeline_mm_q6k_rdna4_f16_n256sk; // 128x256 tiles, 8 waves (K/256 even, N >= 256)
-    vk_pipeline pipeline_mm_q6k_rdna4_f16_glu, pipeline_mm_q6k_rdna4_f16_glun256; // fused FFN gate+up GEMM with swiglu epilogue (64 gate + 64 up rows per tile)
+    vk_pipeline pipeline_mm_q6k_rdna4_f16_glu, pipeline_mm_q6k_rdna4_f16_glun256, pipeline_mm_q6k_rdna4_f16_glu2; // fused FFN gate+up GEMM with swiglu epilogue (64 gate + 64 up rows per tile)
     vk_pipeline pipeline_mm_q6k_rdna4_f32y; // same, activations read as f32 and converted in-kernel (no f32->f16 pre-pass)
     vk_pipeline pipeline_mm_q6k_rdna4_f16;  // RDNA4 Q6_K x f16 prefill GEMM, f16 WMMA (default; GGML_VK_NO_MMQ_Q6K_RDNA4=1 disables)
     vk_pipeline pipeline_quantize_q8_1_x4;
@@ -876,6 +876,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_fast[6];
     // RMS_NORM_MUL + SILU_MUL (norm_gated) on the fast shader: [0]=512 threads [1]=128 (null if unsupported)
     vk_pipeline pipeline_rms_norm_gate[2];
+    vk_pipeline pipeline_rms_norm_resadd;
     vk_pipeline pipeline_rms_norm_scale_f32;        // rms_norm -> scale fused
     vk_pipeline pipeline_rms_norm_scale_small_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
@@ -1340,6 +1341,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_q6k_swiglu {};
     bool fused_rms_gate {};
+    bool fused_add_rms_mul {};  // ADD -> RMS_NORM -> MUL (nrows > 1) in one dispatch
 
     // recurrent-cache fusion (GGML_VK_NO_GDN_CACHE=1 disables): GET_ROWS/CPY nodes whose work is done by
     // the GATED_DELTA_NET or CONCAT node that owns them. Rebuilt per graph.

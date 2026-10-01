@@ -32,6 +32,13 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 layout (binding = 3) readonly buffer C {float data_c[];};
 layout (binding = 4) readonly buffer E {float data_e[];};
 
+#elif RMS_NORM_RESADD_FUSION
+
+// add(a, c) -> rms_norm -> mul(weight): x = a + c is also written to data_s (the residual stream);
+// a, c, s, d are contiguous with the same shape (host checks)
+layout (binding = 3) readonly buffer RC {float data_c[];};
+layout (binding = 4) writeonly buffer RS {float data_s[];};
+
 #elif RMS_NORM_SET_ROWS_FUSION
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
@@ -96,7 +103,11 @@ void rms_norm(uint num_iters) {
     [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
         const uint col = tid + idx * BLOCK_SIZE;
         const uint cc  = min(col, ncols - 1);
+#if RMS_NORM_RESADD_FUSION
+        const FLOAT_TYPE xv = FLOAT_TYPE(data_a[a_offset + cc]) + FLOAT_TYPE(data_c[d_offset + cc]);
+#else
         const FLOAT_TYPE xv = FLOAT_TYPE(data_a[a_offset + cc]);
+#endif
         xs[idx] = col < ncols ? xv : FLOAT_TYPE(0);
         if (do_multiply) {
             ws[idx] = FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(cc, p.ne10) : cc)]);
@@ -138,6 +149,9 @@ void rms_norm(uint num_iters) {
                 const float zv = data_z[d_offset - get_doffset() + col];
                 const FLOAT_TYPE sz = FLOAT_TYPE(zv / (1.0f + exp(-zv)));
                 data_d[d_offset + col] = D_TYPE(normed * sz);
+#elif RMS_NORM_RESADD_FUSION
+                data_s[d_offset + col] = xs[idx];
+                data_d[d_offset + col] = D_TYPE(scale * xs[idx] * ws[idx]);
 #else
                 data_d[d_offset + col] = D_TYPE(do_multiply ? scale * xs[idx] * ws[idx] : scale * xs[idx]);
 #endif
