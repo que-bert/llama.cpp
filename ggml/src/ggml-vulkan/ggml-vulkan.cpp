@@ -1745,7 +1745,7 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 }
 
 // plain (mask 0) or GQV-masked module of a LEANQ variant
-#define GQV_PICK(var, m, field) ((m) == 2 ? var##_g2_cm1_##field : var##_cm1_##field)
+#define GQV_PICK(var, m, field) ((m) == 34 ? var##_g34_cm1_##field : (m) == 2 ? var##_g2_cm1_##field : var##_cm1_##field)
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -2591,7 +2591,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // slots; GGML_VK_NO_Q6K_LEANQ=1 restores the previous modules
                 const bool lq = !p2 && getenv("GGML_VK_NO_Q6K_LEANQ") == nullptr;
                 // GQV instruction-diet modules (GGML_VK_NO_GQV=1 = plain LEANQ; aligns the Q6_K block once per 4 K steps, ~-7 ms/ubatch; GGML_VK_GQV=0 equals NO_GQV, default 2)
-                const int gq = getenv("GGML_VK_NO_GQV") != nullptr ? 0 : (getenv("GGML_VK_GQV") ? atoi(getenv("GGML_VK_GQV")) : 2);
+                const int gq = getenv("GGML_VK_NO_GQV") != nullptr ? 0 : (getenv("GGML_VK_GQV") ? atoi(getenv("GGML_VK_GQV")) : (getenv("GGML_VK_NO_PKF") != nullptr ? 2 : 34));
+                // PKF (bit 32 of the mask): dequant (q-1056)*s as one packed fma; GGML_VK_NO_PKF=1 keeps GQV 2
                 // uniform-parity variants for K/256 even (block parity is sb & 1); GGML_VK_NO_Q6K_UPAR=1 disables
                 if (getenv("GGML_VK_NO_Q6K_UPAR") == nullptr) {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_up, "mul_mm_q6k_rdna4_f16_up", p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_len : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqup, gq, len) : mul_mm_q6k_rdna4_f16_up_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_data : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqup, gq, data) : mul_mm_q6k_rdna4_f16_up_cm1_data), "main", 3,

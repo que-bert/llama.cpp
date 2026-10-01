@@ -987,7 +987,7 @@ void process_shaders() {
     string_to_spv("mul_mm_q6k_rdna4_f16_lqglu", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_lqglun256", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);
     // GQV: instruction-diet variants of the LEANQ modules (bit mask in the define, see the shader); GGML_VK_NO_GQV=1 selects the plain ones
-    for (const char * gq : {"2"}) {
+    for (const char * gq : {"2", "34"}) {
         const std::string sfx = std::string("_g") + gq;
         string_to_spv("mul_mm_q6k_rdna4_f16_lqup" + sfx, "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GQV", gq}}, true, true);
         string_to_spv("mul_mm_q6k_rdna4_f16_lqupsk" + sfx, "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"SPLITK", "1"}, {"GQV", gq}}, true, true);

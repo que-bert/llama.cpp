@@ -115,16 +115,22 @@ void deq4(const uint q, const f16vec2 s, out uint o0, out uint o1) {
 uint fsh(const uint lo, const uint hi, const uint s) { return uint(pack64(u32vec2(lo, hi)) >> s); }
 // byte spread as bitfield selects (v_bfi_b32) + one and_or with the exponent (ACO lowers a u8vec4 pack
 // byte by byte, 4 v_perm per pair)
-void deq4p(const uint q, const f16vec2 s, out uint o0, out uint o1) {
+// PKF (GQV bit 32): w = x * s + (-1056 * s) as one v_pk_fma_f16 per pair (nb = -1056 * s hoisted per scale group)
+void deq4p(const uint q, const f16vec2 s, const f16vec2 nb, out uint o0, out uint o1) {
     const uint lo = (((q & 0x0000FFFFu) | ((q << 8) & 0xFFFF0000u)) & 0x00FF00FFu) | 0x64006400u;
     const uint hi = ((((q >> 16) & 0x0000FFFFu) | ((q >> 8) & 0xFFFF0000u)) & 0x00FF00FFu) | 0x64006400u;
     const f16vec2 c = f16vec2(float16_t(1056.0));
+#if (GQV & 32) != 0
+    o0 = packFloat2x16(fma(unpackFloat2x16(lo), s, nb));
+    o1 = packFloat2x16(fma(unpackFloat2x16(hi), s, nb));
+#else
     o0 = packFloat2x16((unpackFloat2x16(lo) - c) * s);
     o1 = packFloat2x16((unpackFloat2x16(hi) - c) * s);
+#endif
 }
 #if (GQV & 4) != 0
 // K-permuted spread: byte pairs (0,2) and (1,3) are one and_or each (the second behind one shift)
-void deq4k(const uint q, const f16vec2 s, out uint o0, out uint o1) {
+void deq4k(const uint q, const f16vec2 s, const f16vec2 nb, out uint o0, out uint o1) {
     const f16vec2 c = f16vec2(float16_t(1056.0));
     o0 = packFloat2x16((unpackFloat2x16((q & 0x00FF00FFu) | 0x64006400u) - c) * s);
     o1 = packFloat2x16((unpackFloat2x16(((q >> 8) & 0x00FF00FFu) | 0x64006400u) - c) * s);
@@ -261,13 +267,14 @@ void main() {
         const uint v = tid + i * NT, row = v / GPR, g = v % GPR; \
         const float dsc = unpackHalf2x16(rd[i] >> oh).x * float(bitfieldExtract(int(rsc[i]), int(8 * (rodd[i] >> 8)), 8)); \
         const f16vec2 s = f16vec2(float16_t(dsc)); \
+        const f16vec2 nb = f16vec2(float16_t(-1056.0 * dsc)); \
         [[unroll]] for (uint w = 0; w < GW; ++w) { \
             const uint l0 = ((QD) & 1) != 0 ? rq1[i][w] : rq0[i][w]; \
             const uint l = ((QD) >> 1) != 0 ? (l0 >> 4) : l0; \
             const uint h0 = rqh[i][w]; \
             const uint h = (QD) == 3 ? (h0 >> 2) : ((QD) == 2 ? h0 : (h0 << (4 - 2 * (QD)))); \
             const uint q = (l & 0x0F0F0F0Fu) | (h & 0x30303030u); \
-            uint o0, o1; GQ_DEQ(q, s, o0, o1); \
+            uint o0, o1; GQ_DEQ(q, s, nb, o0, o1); \
             shW[buf][row * STR + g * 2 * GW + 2 * w] = o0; \
             shW[buf][row * STR + g * 2 * GW + 2 * w + 1] = o1; \
         } \
@@ -284,11 +291,12 @@ void main() {
         const uint v = tid + i * NT, row = v / GPR, g = v % GPR; \
         const float dsc = unpackHalf2x16(rd[i] >> oh).x * float(bitfieldExtract(int(rsc[i]), int(8 * (rodd[i] >> 8)), 8)); \
         const f16vec2 s = f16vec2(float16_t(dsc)); \
+        const f16vec2 nb = f16vec2(float16_t(-1056.0 * dsc)); \
         [[unroll]] for (uint w = 0; w < GW; ++w) { \
             const uint l = ((QD) & 1) != 0 ? fsh(rq1[i][w], rq1[i][w + 1], sl) : fsh(rq0[i][w], rq0[i][w + 1], sl); \
             const uint h = fsh(rqh[i][w], rqh[i][w + 1], sh); \
             const uint q = (l & 0x0F0F0F0Fu) | ((h << 4) & 0x30303030u); \
-            uint o0, o1; deq4p(q, s, o0, o1); \
+            uint o0, o1; deq4p(q, s, nb, o0, o1); \
             shW[buf][row * STR + g * 2 * GW + 2 * w] = o0; \
             shW[buf][row * STR + g * 2 * GW + 2 * w + 1] = o1; \
         } \
