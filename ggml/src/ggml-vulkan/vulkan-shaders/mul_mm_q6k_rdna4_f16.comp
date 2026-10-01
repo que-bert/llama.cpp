@@ -46,6 +46,13 @@ layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
 layout(binding = 0) readonly buffer A { uint data_au[]; };   // Q6_K blocks, 210 B (2-byte aligned)
 layout(binding = 1) readonly buffer B { uvec4 data_b[]; };   // f16 activations, K-contiguous rows
 layout(binding = 2) writeonly buffer D { float data_d[]; };
+#ifdef GLU2
+// fused gate+up whose weight tensors live in different device buffers: up rows read binding 3 (LEANQ only)
+layout(binding = 3) readonly buffer A2 { uint data_au2[]; };
+#define AU(i, x) ((((tid + (i) * NT) / GPR) >= BM / 2) ? data_au2[x] : data_au[x])
+#else
+#define AU(i, x) data_au[x]
+#endif
 
 layout(push_constant) uniform parameter {
     uint M; uint N; uint K;
@@ -209,15 +216,15 @@ void main() {
         const uint bb = rbase[i] + sb * 210u; \
         if ((QD) == 0) { \
             const uint wl = (bb + hf * 64 + go) >> 2, wh = (bb + 128 + hf * 32 + go) >> 2; \
-            [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rq0[i][w] = data_au[wl + w]; rqh[i][w] = data_au[wh + w]; } \
-            rd[i] = data_au[(bb + 208) >> 2]; \
+            [[unroll]] for (uint w = 0; w < GW + 1; ++w) { rq0[i][w] = AU(i, wl + w); rqh[i][w] = AU(i, wh + w); } \
+            rd[i] = AU(i, (bb + 208) >> 2); \
         } \
         if ((QD) == 1) { \
             const uint wl = (bb + hf * 64 + 32 + go) >> 2; \
-            [[unroll]] for (uint w = 0; w < GW + 1; ++w) rq1[i][w] = data_au[wl + w]; \
+            [[unroll]] for (uint w = 0; w < GW + 1; ++w) rq1[i][w] = AU(i, wl + w); \
         } \
         const uint so = bb + 192 + c * 2 + (go >> 4); \
-        rsc[i] = data_au[so >> 2]; \
+        rsc[i] = AU(i, so >> 2); \
         rodd[i] = (so & 3u) << 8; \
     } \
     [[unroll]] for (uint i = 0; i < Y_PER; ++i) { \
