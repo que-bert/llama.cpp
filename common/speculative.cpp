@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1371,6 +1372,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // tree-drafting oracle (env MTP_TOP2_LOG=1, default off, no effect on outputs): when the first draft
+    // token is rejected, where does the target's token rank among the MTP's top-4 at draft position 1?
+    // Also the histogram of accepted draft lengths. Printed to stderr every MTP_TOP2_LOG_N steps.
+    bool                                    top_log = false;
+    std::vector<std::array<llama_token, 4>> top_ids;   // [n_seq] MTP top-4 at draft position 1
+    std::vector<int>                        last_acc;  // [n_seq] n_accepted of the last step, -1 = none
+    int64_t top_steps = 0, top_rank[5] = {0}, top_hist[8] = {0}, top_every = 200;
+
+    void top_print() const {
+        fprintf(stderr, "MTP_TOP2 steps=%" PRId64 " acc_hist=", top_steps);
+        for (int a = 0; a < 8; ++a) {
+            fprintf(stderr, "%s%" PRId64, a ? "," : "", top_hist[a]);
+        }
+        fprintf(stderr, " rej1_rank(2,3,4,miss)=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "\n",
+                top_rank[1], top_rank[2], top_rank[3], top_rank[4]);
+    }
+
     // adaptive reduced draft vocab (--spec-draft-vocab N --spec-draft-vocab-adaptive): per sequence, a
     // rolling window over the last W context tokens counts those outside the draft subset (permuted
     // row >= N). The subset head is used only while that count is <= max_out. Updated incrementally
@@ -1525,6 +1543,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        top_log = getenv("MTP_TOP2_LOG") && atoi(getenv("MTP_TOP2_LOG"));
+        if (const char * e = getenv("MTP_TOP2_LOG_N")) {
+            top_every = std::max(1, atoi(e));
+        }
+        top_ids.assign(n_seq, { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL });
+        last_acc.assign(n_seq, -1);
 
         dvocab_n = llama_model_draft_vocab_n(llama_get_model(ctx_dft));
         dvocab_adaptive = this->params.vocab_adaptive && dvocab_n > 0;
@@ -1740,6 +1765,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             i_last[seq_id] = batch.n_tokens - 1;
 
+            if (top_log && last_acc[seq_id] == 0 && top_ids[seq_id][0] != LLAMA_TOKEN_NULL) {
+                // the last step rejected draft position 1, so id_last is the target's token there
+                int r = 4;
+                for (int k = 1; k < 4; ++k) {
+                    if (top_ids[seq_id][k] == dp.id_last) {
+                        r = k;
+                        break;
+                    }
+                }
+                top_rank[r]++;
+            }
+            if (top_log) {
+                last_acc[seq_id] = -1;
+                top_ids[seq_id][0] = LLAMA_TOKEN_NULL;
+            }
+
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
@@ -1815,6 +1856,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                if (top_log && i == 0) {
+                    // top-4 by p (linear scan; does not rely on the candidates being sorted)
+                    std::array<llama_token, 4> ids = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+                    std::array<float, 4>       ps  = { -1.0f, -1.0f, -1.0f, -1.0f };
+                    for (size_t c = 0; c < cur_p->size; ++c) {
+                        float p = cur_p->data[c].p;
+                        llama_token t = cur_p->data[c].id;
+                        for (int k = 0; k < 4; ++k) {
+                            if (p > ps[k]) {
+                                std::swap(p, ps[k]);
+                                std::swap(t, ids[k]);
+                            }
+                        }
+                    }
+                    top_ids[seq_id] = ids;
+                }
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -1896,6 +1954,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (top_log && top_ids[seq_id][0] != LLAMA_TOKEN_NULL) {
+            last_acc[seq_id] = n_accepted;
+            top_hist[std::min<int>(n_accepted, 7)]++;
+            if (++top_steps % top_every == 0) {
+                top_print();
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
