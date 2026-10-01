@@ -3389,10 +3389,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         const uint32_t fov = getenv("GGML_VK_NO_FOV") == nullptr ? 1u : 0u;
                         // FV2: base-2 softmax + invariant staging addresses; GGML_VK_NO_FV2=1 reverts to FOV
                         const uint32_t fv2 = getenv("GGML_VK_NO_FV2") == nullptr ? 1u : 0u;
+                        // FV3: fewer VALU per KV tile (bit 16: half2 mask + contiguous prefetch addressing); GGML_VK_NO_FV3=1 reverts to FV2,
+                        // GGML_VK_FV3=<mask> picks the variant (experiments)
+                        uint32_t fv3 = getenv("GGML_VK_NO_FV3") == nullptr ? 16u : 0u;
+                        if (fv3 && getenv("GGML_VK_FV3") != nullptr) { fv3 = (uint32_t) atoi(getenv("GGML_VK_FV3")); }
                         ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
                                                  fov ? flash_attn_prefill_rdna4_v64p_cm1_len : flash_attn_prefill_rdna4_v64_cm1_len,
                                                  fov ? flash_attn_prefill_rdna4_v64p_cm1_data : flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
-                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag, fpq_ns, fov, fv2}, 1, true, true, 32);
+                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag, fpq_ns, fov, fv2, fv3}, 1, true, true, 32);
                     }
                 }
             }
@@ -8726,7 +8730,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                              ctx->device->pipeline_fa_dequant_q8_0_rdna4 != nullptr &&
                              // the dequant reads whole 272-byte q8_0 rows as uvec4
                              (ggml_vk_tensor_subbuffer(ctx, k).offset % 16) == 0 && (ggml_vk_tensor_subbuffer(ctx, v).offset % 16) == 0 &&
-                             (nbk1 % 16) == 0 && (nbv1 % 16) == 0;
+                             (nbk1 % 16) == 0 && (nbv1 % 16) == 0 &&
+                             // FV3 reads the mask as half2 words
+                             (!mask || ((ggml_vk_tensor_subbuffer(ctx, mask).offset % 4) == 0 && (mask->nb[1] % 4) == 0 && (mask->nb[3] % 4) == 0));
         if (use_v64) {
             // _v64: one dequant pass writes K rows [ns][h][kv][d] and V tiles [ns][h][kv/32][d][32 kv] (zero-padded)
             vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_v64[G];

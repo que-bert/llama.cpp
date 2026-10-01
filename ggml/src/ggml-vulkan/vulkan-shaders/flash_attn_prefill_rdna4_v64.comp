@@ -55,6 +55,14 @@ layout(constant_id = 4) const uint FOV = 1;
 // multiply) and loop-invariant LDS staging addresses (one base per thread + immediate offsets).
 // 0 = FOV schedule (GGML_VK_NO_FV2=1).
 layout(constant_id = 5) const uint FV2 = 1;
+// FV3: fewer VALU per KV tile. Default 16 (GGML_VK_NO_FV3=1 = 0 reverts to FV2; GGML_VK_FV3=<mask> picks a variant).
+//   16 = prefetch addressing without per-load index registers (K/V rows contiguous: one base + immediate
+//        offsets, no clamp on the unstaged tail), mask fetched and staged as half2 words
+//        (one load, one packed log2e multiply, one select).
+// Probes, measured null or worse in loop VALU/shuffle counts: 1 = KV loop unrolled by 2 (an odd tile
+// count runs one extra fully masked tile, an exact no-op), 2 = P/V fragment loads after the O rescale,
+// 4 / 8 = V / K+mask prefetch issued mid-B instead of in A, 32 = per-tile LDS addresses hoisted.
+layout(constant_id = 6) const uint FV3 = 16;
 const float LOG2E = 1.4426950408889634;
 const float TAU = (FV2 != 0) ? 8.0 * LOG2E : 8.0;
 
@@ -90,6 +98,7 @@ layout(binding = 0) readonly buffer Q { vec4 data_q[]; };
 layout(binding = 1) PFQ buffer K { uvec4 data_k[]; };
 layout(binding = 2) PFQ buffer V { uvec4 data_v[]; };
 layout(binding = 3) PFQ buffer M { float16_t data_m[]; };
+layout(binding = 3) PFQ buffer M32 { uint data_m32[]; };   // FV3: the same mask as half2 pairs
 layout(binding = 4) writeonly buffer O { float data_o[]; };
 
 shared uvec4 sK[BC * KSTR];                    // K tile (also Q staging and O staging)
@@ -161,6 +170,15 @@ void main() {
     float mxo;                                 // this wave's partial max of the pending tile
 
     const uint nj = (KV + BC - 1) / BC;
+    // FV3 bit 32: LDS addresses that do not change per tile, computed once (a handful of VALU per tile otherwise)
+    const uint ixr_h = (wave ^ 1) * 16 + lr;               // sMx partner read
+    const uint ixw_h = wave * 16 + lane;                   // sMx write
+    const uint ipw_h = (t * 16 + lr) * PSTR + (lc >> 3);   // sP store
+    const uint ism_h = lr * MSTR + lc;                     // sM read base
+    const uint ixr = ((FV3 & 32) != 0) ? ixr_h : (wave ^ 1) * 16 + lr;
+    const uint ixw = ((FV3 & 32) != 0) ? ixw_h : wave * 16 + lane;
+    const uint ipw = ((FV3 & 32) != 0) ? ipw_h : (t * 16 + lr) * PSTR + (lc >> 3);
+    const uint ism = ((FV3 & 32) != 0) ? ism_h : lr * MSTR + lc;
 
     const float sc_ = (FV2 != 0) ? p.scale * LOG2E : p.scale;
     // FV2: loop-invariant per-thread LDS staging bases
@@ -174,12 +192,16 @@ void main() {
     uvec4 prk[NLK];
     uvec4 prv[NLV];
     float16_t pm[NML][2];
+    uint pmw[NML];                             // FV3 AM: mask half2 words
 
 // Prefetch loads are unconditional with clamped indices: a "x = 0; if (in range) x = load" form
 // makes ACO wait for each load right away (the else-path write is a WAW on the load's VGPRs), which
 // serialized the register prefetch in the base kernel. Out-of-range K/V rows read row KV-1 (finite;
 // their columns are masked to -inf, so P = 0); out-of-range mask entries are fixed up at staging.
-#define PREFETCH_K(j) if (FOV != 0) { \
+#define PREFETCH_K(j) if ((FV3 & 16) != 0) { \
+        const uint ko_ = kb0 + min((j), nj - 1) * (BC * 32); \
+        [[unroll]] for (uint i = 0; i < NLK; ++i) prk[i] = data_k[ko_ + i * WG]; \
+    } else if (FOV != 0) { \
         const uint ko_ = min((j), nj - 1) * BC * p.k_s1; \
         [[unroll]] for (uint i = 0; i < NLK; ++i) prk[i] = data_k[kofs[i] + ko_]; \
     } else { \
@@ -202,14 +224,20 @@ void main() {
     }
 
 
-#define PREFETCH_V(j) { \
+#define PREFETCH_V(j) if ((FV3 & 16) != 0) { \
+        const uint tb_ = v_base + min((j), nj - 1) * p.v_s1 + tid; \
+        [[unroll]] for (uint i = 0; i < NLV; ++i) prv[i] = data_v[tb_ + i * WG]; \
+    } else { \
         const uint tb_ = v_base + min((j), nj - 1) * p.v_s1; \
         [[unroll]] for (uint i = 0; i < NLV; ++i) { \
             prv[i] = data_v[tb_ + min(tid + i * WG, D * BC / 8 - 1)]; \
         } \
     }
 
-#define PREFETCH_M(j) if (FOV != 0) { \
+#define PREFETCH_M(j) if ((FV3 & 16) != 0) { \
+        const uint mo_ = has_mask ? min((j), nj - 1) * (BC / 2) : 0; \
+        [[unroll]] for (uint i = 0; i < NML; ++i) pmw[i] = data_m32[mofs[i] + mo_]; \
+    } else if (FOV != 0) { \
         const uint mo_ = min((j), nj - 1) * BC; \
         [[unroll]] for (uint i = 0; i < NML; ++i) { \
             pm[i][0] = data_m[has_mask ? mofs[i] + mo_     : 0]; \
@@ -237,7 +265,25 @@ void main() {
     }
 
 #define STAGE_M(j) { \
-        if (FV2 != 0) { \
+        if ((FV3 & 16) != 0) { \
+            const int rem_ = int(KV) - int((j) * BC); \
+            const uint wmask_ = has_mask ? 0xFFFFFFFFu : 0u; \
+            const f16vec2 l2v_ = f16vec2(float16_t(LOG2E)); \
+            [[unroll]] for (uint i = 0; i < NML; ++i) { \
+                const uint e = tid + i * WG; \
+                if (e < PQ * BC / 2) { \
+                    const uint sm_ = smb + i * (WG / 16) * MSTR; \
+                    uint w_ = packFloat2x16(unpackFloat2x16(pmw[i] & wmask_) * l2v_); \
+                    if (rem_ >= int(BC) || (rem_ & 1) == 0) { \
+                        w_ = (smrow[i] && smcol < rem_) ? w_ : 0xFC00FC00u; \
+                    } else { \
+                        w_ = !smrow[i] || smcol >= rem_ ? 0xFC00FC00u : (smcol + 1 < rem_ ? w_ : ((w_ & 0xFFFFu) | 0xFC000000u)); \
+                    } \
+                    const f16vec2 r_ = unpackFloat2x16(w_); \
+                    sM[sm_] = r_.x; sM[sm_ + 1] = r_.y; \
+                } \
+            } \
+        } else if (FV2 != 0) { \
             const int rem_ = int(KV) - int((j) * BC); \
             const float16_t l2_ = float16_t(LOG2E); \
             const float16_t ninf = float16_t(-1.0/0.0); \
@@ -266,11 +312,11 @@ void main() {
 #define S_FINISH(Sacc) { \
         mxo = -1.0/0.0; \
         [[unroll]] for (uint i = 0; i < 8; ++i) { \
-            sv[i] = Sacc[i] * sc_ + float(sM[lr * MSTR + lc + i]); \
+            sv[i] = Sacc[i] * sc_ + float(sM[ism + i]); \
             mxo = max(mxo, sv[i]); \
         } \
         mxo = max(mxo, subgroupShuffleXor(mxo, 16)); \
-        if (lane < 16) sMx[wave * 16 + lane] = mxo; \
+        if (lane < 16) sMx[ixw] = mxo; \
     }
 
     // FOV: per-thread loop-invariant prefetch offsets. The tile index is clamped to the last tile;
@@ -285,6 +331,13 @@ void main() {
     [[unroll]] for (uint i = 0; i < NML; ++i) {
         const uint e = min(tid + i * WG, PQ * BC / 2 - 1);
         mofs[i] = m_base + min(p0 + (e >> 4), N - 1) * p.m_s1 + (e & 15) * 2;
+    }
+
+    const uint kb0 = k_base + tid;   // FV3 AM: K scratch rows are 32 uvec4 (HSK / 8) and contiguous, so row*32 + c == e
+    if ((FV3 & 16) != 0) {
+        [[unroll]] for (uint i = 0; i < NML; ++i) {
+            mofs[i] = has_mask ? mofs[i] >> 1 : 0;
+        }
     }
 
     PREFETCH_K(0)
@@ -309,10 +362,14 @@ void main() {
     }
     barrier();
 
-    for (uint j = 0; j < nj; ++j) {
+    const uint FV3U = ((FV3 & 1) != 0) ? 2 : 1;
+    const uint njl = (nj + FV3U - 1) / FV3U * FV3U;
+    for (uint j0 = 0; j0 < njl; j0 += FV3U) {
+      [[unroll]] for (uint u = 0; u < FV3U; ++u) {
+        const uint j = j0 + u;
         // ---- A(j): finish online softmax of tile j in registers, f32
         {
-            const float m_c = max(m_i, max(mxo, sMx[(wave ^ 1) * 16 + lr]));
+            const float m_c = max(m_i, max(mxo, sMx[ixr]));
             // FOV: both waves of a row pair see the same m_i and tile max, so they agree on m_new
             const float m_new = (FOV != 0 && m_c <= m_i + TAU) ? m_i : m_c;
             const float alpha = (FV2 != 0) ? exp2(m_i - m_new) : exp(m_i - m_new);
@@ -326,7 +383,7 @@ void main() {
             }
             l_i = l_i * alpha + rs;
             m_i = m_new;
-            sP[(t * 16 + lr) * PSTR + (lc >> 3)] = uvec4(packFloat2x16(ph[0]), packFloat2x16(ph[1]),
+            sP[ipw] = uvec4(packFloat2x16(ph[0]), packFloat2x16(ph[1]),
                                                          packFloat2x16(ph[2]), packFloat2x16(ph[3]));
             const bool resc = subgroupAny(alpha != 1.0);
             // FOV: alpha is the same in both waves of the pair; sA is only read when resc is set
@@ -339,9 +396,9 @@ void main() {
         STAGE_V
         STAGE_M(j + 1)
         if ((DIAG & 4) == 0) {
-            PREFETCH_K(j + 2)
-            PREFETCH_V(j + 1)
-            PREFETCH_M(j + 2)
+            if ((FV3 & 8) == 0) { PREFETCH_K(j + 2) }
+            if ((FV3 & 4) == 0) { PREFETCH_V(j + 1) }
+            if ((FV3 & 8) == 0) { PREFETCH_M(j + 2) }
         }
         barrier();
 
@@ -353,11 +410,13 @@ void main() {
         uvec4 rf = uvec4(0);
         if (FOV != 0) {
             rf = sR4[pt0 >> 1];                // waves 2 pt0 .. 2 pt0 + 3 (pt0 even)
+          if ((FV3 & 2) == 0) {
             coopMatLoad(Pa0, sP, (pt0 * 16) * PSTR, PSTR, gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(Pa1, sP, (pt0 * 16 + 16) * PSTR, PSTR, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint i = 0; i < 4; ++i) {
                 coopMatLoad(Va[i], sVt, (pq * 64 + i * 16) * VSTR, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
             }
+          }
         }
         [[unroll]] for (uint r = 0; r < 2; ++r) {
             const uint tr = pt0 + r;
@@ -367,6 +426,13 @@ void main() {
                 MATC Am;
                 coopMatLoad(Am, sA, tr * 64, 4, gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint i = 0; i < 4; ++i) Oacc[r * 4 + i] = Oacc[r * 4 + i] * Am;
+            }
+        }
+        if (FOV != 0 && (FV3 & 2) != 0) {
+            coopMatLoad(Pa0, sP, (pt0 * 16) * PSTR, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(Pa1, sP, (pt0 * 16 + 16) * PSTR, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                coopMatLoad(Va[i], sVt, (pq * 64 + i * 16) * VSTR, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
             }
         }
         {
@@ -395,12 +461,17 @@ void main() {
                         if ((DIAG & 1) == 0) Sc[k % NS] = coopMatMulAdd(Kf, Qf[k], Sc[k % NS]);
                     }
                 }
+                if (kk == 0 && (DIAG & 4) == 0) {
+                    if ((FV3 & 4) != 0) { PREFETCH_V(j + 1) }
+                    if ((FV3 & 8) != 0) { PREFETCH_K(j + 2) PREFETCH_M(j + 2) }
+                }
             }
             MATC Sacc = Sc[0];
             [[unroll]] for (uint c = 1; c < NS; ++c) Sacc = Sacc + Sc[c];
             S_FINISH(Sacc)
         }
         barrier();
+      }
     }
 
     // ---- row sums: lanes l, l^16, then the wave pair; 1/l -> sA
