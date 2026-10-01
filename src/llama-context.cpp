@@ -49,6 +49,11 @@ struct llama_decode_timing {
     }
 };
 llama_decode_timing g_ldt;
+static void ldt_trace(const void * ctx, const char * what) {
+    static const bool en = getenv("LLAMA_DECODE_TRACE") && atoi(getenv("LLAMA_DECODE_TRACE"));
+    if (!en) { return; }
+    fprintf(stderr, "LDTR %.3f %p %s\n", llama_decode_timing::now() / 1e6, ctx, what);
+}
 struct llama_decode_timing_guard {
     const void * ctx; int n_tok; int64_t t0;
     llama_decode_timing_guard(const void * c, int nt) : ctx(c), n_tok(nt), t0(0) {
@@ -771,6 +776,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    decode_synced_upto = n_decode_calls;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -797,6 +803,21 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+}
+
+void llama_context::set_nextn_dbuf(bool value) {
+    nextn_dbuf = value;
+}
+
+const float * llama_context::get_nextn_at(uint64_t id) {
+    if (!nextn_dbuf || !buf_nextn_dbuf || id > n_decode_calls || id + 1 < n_decode_calls) {
+        return nullptr; // not double-buffered, or the rows were overwritten by a later decode
+    }
+    if (decode_synced_upto < id) {
+        synchronize();
+    }
+    const size_t n = (size_t) model.hparams.n_embd_out() * cparams.n_batch;
+    return (const float *) ggml_backend_buffer_get_base(buf_nextn_dbuf.get()) + (id & 1) * n;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -1470,6 +1491,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const int64_t ldt_t1 = g_ldt.enabled ? llama_decode_timing::now() : 0;
+    ldt_trace(this, "built");
     if (g_ldt.enabled) { g_ldt.cur_build += (double) (ldt_t1 - ldt_t0); }
 
     // set the input data for the input tensors
@@ -1480,12 +1502,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // GGML_VK_HOST_GET_ROWS: token ids feed a GPU GET_ROWS at the head of the graph, so they are a device-side
         // input that a still-queued previous graph would read after they were overwritten
         static const bool gpu_token_input = getenv("GGML_VK_HOST_GET_ROWS") && atoi(getenv("GGML_VK_HOST_GET_ROWS"));
-        if (cparams.pipeline_parallel || async_inputs || gpu_token_input) {
+        if (cparams.pipeline_parallel || async_inputs || gpu_token_input || nextn_dbuf) {
             ggml_backend_sched_synchronize(sched.get());
+            if (nextn_dbuf) {
+                decode_synced_upto = n_decode_calls - 1; // everything before this decode is complete
+            }
         }
 
-        //const auto t_start_us = ggml_time_us();
-
+        ldt_trace(this, "synced");
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
@@ -1493,7 +1517,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const int64_t ldt_t2 = g_ldt.enabled ? llama_decode_timing::now() : 0;
+    ldt_trace(this, "inputs_set");
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ldt_trace(this, "submitted");
     if (g_ldt.enabled) {
         g_ldt.cur_inputs  += (double) (ldt_t2 - ldt_t1);
         g_ldt.cur_compute += (double) (llama_decode_timing::now() - ldt_t2);
@@ -1897,6 +1923,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
+    n_decode_calls++;
+
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
@@ -2211,6 +2239,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
+    const bool dbuf_active = nextn_dbuf && has_embd_nextn && !cparams.embeddings_nextn_masked;
+
     for (bool enabled : cparams.embeddings_layer_inp) {
         if (enabled) {
             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
@@ -2231,7 +2261,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + (dbuf_active ? 0 : embd_nextn.size) + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2280,8 +2310,23 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
 
-    embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
-    offset += embd_nextn.size * sizeof(float);
+    if (dbuf_active) {
+        const size_t n = embd_nextn.size;
+        if (!buf_nextn_dbuf) {
+            auto * dev = model.dev_output();
+            auto * host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            buf_nextn_dbuf.reset(ggml_backend_buft_alloc_buffer(host_buft ? host_buft : ggml_backend_cpu_buffer_type(), 2 * n * sizeof(float)));
+            if (!buf_nextn_dbuf) {
+                LLAMA_LOG_ERROR("%s: failed to allocate nextn double buffer\n", __func__);
+                return 0;
+            }
+            ggml_backend_buffer_clear(buf_nextn_dbuf.get(), 0);
+        }
+        embd_nextn = buffer_view<float>{(float *) ggml_backend_buffer_get_base(buf_nextn_dbuf.get()) + (n_decode_calls & 1) * n, n};
+    } else {
+        embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
+        offset += embd_nextn.size * sizeof(float);
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -4071,6 +4116,12 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 
     return ctx->get_memory();
 }
+
+void llama_set_nextn_dbuf(llama_context * ctx, bool value) { ctx->set_nextn_dbuf(value); }
+
+uint64_t llama_get_decode_id(llama_context * ctx) { return ctx->get_decode_id(); }
+
+const float * llama_get_embeddings_nextn_at(llama_context * ctx, uint64_t id) { return ctx->get_nextn_at(id); }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();

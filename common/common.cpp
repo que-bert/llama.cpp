@@ -1645,7 +1645,28 @@ done:
     return res;
 }
 
+static std::map<llama_context *, std::function<void()>> g_dft_flush;
+
+void common_dft_flush(llama_context * ctx_dft) {
+    if (ctx_dft == nullptr || g_dft_flush.empty()) {
+        return;
+    }
+    auto it = g_dft_flush.find(ctx_dft);
+    if (it != g_dft_flush.end()) {
+        it->second();
+    }
+}
+
+void common_dft_flush_register(llama_context * ctx_dft, std::function<void()> fn) {
+    if (fn) {
+        g_dft_flush[ctx_dft] = std::move(fn);
+    } else {
+        g_dft_flush.erase(ctx_dft);
+    }
+}
+
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    common_dft_flush(ctx);
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
@@ -1653,11 +1674,13 @@ static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llam
 }
 
 static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    common_dft_flush(ctx);
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
 static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    common_dft_flush(ctx);
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 }
@@ -2310,6 +2333,7 @@ void common_prompt_checkpoint::update_tgt(
     if (ctx == nullptr) {
         return;
     }
+    common_dft_flush(ctx);
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
@@ -2328,6 +2352,7 @@ void common_prompt_checkpoint::update_dft(
     if (ctx == nullptr) {
         return;
     }
+    common_dft_flush(ctx);
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
@@ -2346,6 +2371,7 @@ void common_prompt_checkpoint::load_tgt(
     if (ctx == nullptr) {
         return;
     }
+    common_dft_flush(ctx);
 
     if (data_tgt.empty()) {
         return;
@@ -2364,6 +2390,7 @@ void common_prompt_checkpoint::load_dft(
     if (ctx == nullptr) {
         return;
     }
+    common_dft_flush(ctx);
 
     if (data_dft.empty()) {
         return;

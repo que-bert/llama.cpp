@@ -105,6 +105,13 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // Changing it rebuilds the draft graph. Default false.
 LLAMA_API void llama_set_draft_vocab_full(struct llama_context * ctx, bool full);
 
+// Double-buffer the (unmasked) nextn hidden states: llama_get_embeddings_nextn_at(id) returns the rows of decode `id`
+// (llama_get_decode_id() right after that decode) and stays valid until decode id+2 begins. It only waits for the
+// device if decode `id` may still be running. Lets the MTP prompt pass run after the next target ubatch is submitted.
+LLAMA_API void          llama_set_nextn_dbuf(struct llama_context * ctx, bool value);
+LLAMA_API uint64_t      llama_get_decode_id(struct llama_context * ctx);
+LLAMA_API const float * llama_get_embeddings_nextn_at(struct llama_context * ctx, uint64_t id);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

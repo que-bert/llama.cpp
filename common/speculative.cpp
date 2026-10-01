@@ -28,6 +28,12 @@ static int64_t spec_tim_now() {
     return en ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
 }
 
+static void spc_trace(const char * what) {
+    static const bool en = getenv("LLAMA_DECODE_TRACE") && atoi(getenv("LLAMA_DECODE_TRACE"));
+    if (!en) { return; }
+    fprintf(stderr, "LDTR %.3f spec %s\n", std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1e6, what);
+}
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1384,6 +1390,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_token last   = LLAMA_TOKEN_NULL;
         bool        full   = true;
     };
+    // deferred prompt pass (LLAMA_NO_MTP_PIPE=1 disables): process() of a large (prompt) batch only stashes the batch;
+    // the pass runs in flush(), i.e. after the NEXT target decode was submitted, so the host work and the draft
+    // graph overlap that target ubatch on the GPU instead of idling it. Needs the target's double-buffered nextn rows.
+    bool pipe = false;
+    struct pend_t {
+        bool active = false;
+        uint64_t id = 0;
+        std::vector<llama_token>   tok;
+        std::vector<llama_pos>     pos;
+        std::vector<llama_seq_id>  seq;
+    } pend;
+    int32_t pipe_min_tokens = 128;
+
+    void flush() {
+        if (!pend.active) {
+            return;
+        }
+        pend.active = false;
+        const int32_t n = (int32_t) pend.tok.size();
+        const float * h = llama_get_embeddings_nextn_at(params.ctx_tgt, pend.id);
+        if (h == nullptr) {
+            SPC_ERR("deferred MTP prompt pass lost its hidden states (n=%d): draft quality may degrade\n", (int) n);
+            return;
+        }
+        std::vector<int32_t>        n_seq_id(n, 1);
+        std::vector<llama_seq_id *> seq_ptr(n);
+        for (int32_t k = 0; k < n; ++k) {
+            seq_ptr[k] = &pend.seq[k];
+        }
+        llama_batch b = {};
+        b.n_tokens = n;
+        b.token    = pend.tok.data();
+        b.pos      = pend.pos.data();
+        b.n_seq_id = n_seq_id.data();
+        b.seq_id   = seq_ptr.data();
+        process_impl(b, h);
+    }
+
     bool    dvocab_adaptive = false;
     int32_t dvocab_n        = 0;
     int32_t dvocab_w        = 256;
@@ -1507,6 +1551,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        {
+            const char * np = getenv("LLAMA_NO_MTP_PIPE");
+            pipe = !(np && atoi(np) != 0) && n_seq == 1 && !is_mem_shared && !chain_heads;
+            if (pipe) {
+                llama_set_nextn_dbuf(ctx_tgt, true);
+                common_dft_flush_register(ctx_dft, [this]() { flush(); });
+            }
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
@@ -1546,6 +1599,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (pipe) {
+            common_dft_flush_register(this->params.ctx_dft, nullptr);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1566,6 +1622,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        flush();
         if (dvocab_adaptive && seq_id >= 0 && seq_id < (llama_seq_id) dvocab.size()) {
             dvocab_reset(dvocab[seq_id]);
             const int64_t tot = dvocab_steps_sub + dvocab_steps_full;
@@ -1592,6 +1649,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        // a pending deferred pass is submitted now: the target decode that follows it is already on the GPU
+        flush();
+
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1601,6 +1661,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
+        static const bool dbg_skip = getenv("LLAMA_MTP_SKIP_PROMPT") && atoi(getenv("LLAMA_MTP_SKIP_PROMPT"));
+        if (dbg_skip && batch_in.n_tokens >= pipe_min_tokens) {
+            return true; // diagnostic only: MTP KV is left empty for prompt batches
+        }
+
+        if (pipe && batch_in.n_tokens >= pipe_min_tokens) {
+            const int32_t n = batch_in.n_tokens;
+            pend.tok.assign(batch_in.token, batch_in.token + n);
+            pend.pos.assign(batch_in.pos,   batch_in.pos + n);
+            pend.seq.resize(n);
+            for (int32_t k = 0; k < n; ++k) {
+                pend.seq[k] = batch_in.seq_id[k][0];
+            }
+            pend.id     = llama_get_decode_id(params.ctx_tgt);
+            pend.active = true;
+            return true;
+        }
+
+        return process_impl(batch_in, nullptr);
+    }
+
+    // h_rows: when non-null, the target's hidden state rows of this batch (row i = batch index i)
+    bool process_impl(const llama_batch & batch_in, const float * h_rows) {
         const int32_t n_tokens = batch_in.n_tokens;
 
         // remember the first and last batch index for each sequence
@@ -1639,7 +1722,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                spc_trace("process_in");
+                const float * h_tgt = h_rows ? h_rows : llama_get_embeddings_nextn(ctx_tgt);
+                spc_trace("got_h");
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -1657,6 +1742,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+            spc_trace("pre_decode");
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
@@ -1690,6 +1776,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        spc_trace("post_decode");
         const int64_t tim_cp = spec_tim_now();
         struct tim_guard { int64_t t0; ~tim_guard() { common_spec_timing_ns[4] += spec_tim_now() - t0; } } tim_g{tim_cp};
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1702,18 +1789,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = h_rows ? h_rows + (size_t) (i_batch_beg[seq_id] + i) * n_embd
+                                         : llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
+        spc_trace("process_out");
 
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        flush();
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1894,6 +1984,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        flush();
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }

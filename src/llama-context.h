@@ -58,6 +58,10 @@ struct llama_context {
 
     void synchronize();
 
+    void           set_nextn_dbuf(bool value);
+    uint64_t       get_decode_id() const { return n_decode_calls; }
+    const float *  get_nextn_at(uint64_t id);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -306,6 +310,13 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // LLAMA_NO_MTP_PIPE: double-buffered nextn hidden states so the consumer can read decode N's rows
+    // after decode N+1 has been submitted (the speculative MTP prompt pass runs deferred, overlapping the next target ubatch)
+    bool                    nextn_dbuf = false;
+    ggml_backend_buffer_ptr buf_nextn_dbuf;
+    uint64_t                n_decode_calls     = 0;
+    uint64_t                decode_synced_upto = 0; // all decodes <= this have completed on the device
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

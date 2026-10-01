@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-impl.h"
+#include "llama-kv-cache.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -554,8 +556,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
+    // Prompt pass (no output rows, token input): the draft head only has to fill its K/V cache. K and V of this layer
+    // depend only on eh_proj(enorm(tok), hnorm(h)) -> attn_norm -> wk/wv, so skip Q, attention, wo, the FFN and the head
+    // (cuts the draft prompt graph ~5x). LLAMA_NO_MTP_KVONLY=1 reverts to the full graph. K/V rows are bit-identical.
+    static const bool kv_only_on = !(getenv("LLAMA_NO_MTP_KVONLY") && atoi(getenv("LLAMA_NO_MTP_KVONLY")) != 0);
+    const bool kv_only = kv_only_on && n_outputs == 0 && ubatch.token && !layer.wqkv && layer.wk && layer.wv &&
+                         hparams.f_clamp_kqv <= 0.0f && !layer.wk_b && !layer.wv_b;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -575,6 +584,28 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    if (kv_only) {
+        ggml_tensor * Kc = build_lora_mm(layer.wk, cur, layer.wk_s);
+        ggml_tensor * Vc = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Kc = ggml_reshape_3d(ctx0, Kc, n_embd_head, n_head_kv, n_tokens);
+        Kc = build_norm(Kc, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        Vc = ggml_reshape_3d(ctx0, Vc, n_embd_head, n_head_kv, n_tokens);
+        Kc = ggml_rope_multi(ctx0, Kc, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        if (inp_attn->self_k_rot) {
+            Kc = llama_mul_mat_hadamard(ctx0, Kc, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vc = llama_mul_mat_hadamard(ctx0, Vc, inp_attn->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Vc);
+        ggml_build_forward_expand(gf, Kc);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kc, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vc, inp_attn->get_v_idxs(), il));
+        return;
+    }
 
     auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
             n_embd_head * 2, n_head,

@@ -304,6 +304,7 @@ struct server_slot {
             return false;
         }
 
+        common_dft_flush(ctx_dft);
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -2906,8 +2907,12 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+        // LLAMA_NO_MTP_PIPE: with MTP speculation, decode one ubatch per llama_decode so the deferred MTP prompt pass of
+        // ubatch N is submitted right behind ubatch N+1 (GPU never waits for the host MTP work)
+        const bool mtp_pipe = spec && !(getenv("LLAMA_NO_MTP_PIPE") && atoi(getenv("LLAMA_NO_MTP_PIPE")) != 0) && params_base.n_parallel == 1;
+        const int32_t n_chunk_max = mtp_pipe ? std::min<int32_t>(llama_n_ubatch(ctx_tgt), n_batch) : n_batch;
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int32_t n_tokens = std::min(std::min(n_batch, n_chunk_max), batch.size() - off);
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -2948,6 +2953,17 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+        }
+
+        // submit the deferred MTP prompt pass unless more prompt ubatches follow in the next iteration (which overlap it)
+        if (mtp_pipe) {
+            bool more_prompt = false;
+            for (auto & slot : slots) {
+                more_prompt = more_prompt || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+            }
+            if (!more_prompt) {
+                common_dft_flush(ctx_dft);
             }
         }
     }

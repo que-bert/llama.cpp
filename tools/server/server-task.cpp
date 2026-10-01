@@ -1847,6 +1847,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 GGML_ASSERT(ctx_dft);
 
                 const size_t size = data.size();
+                common_dft_flush(ctx_dft);
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
