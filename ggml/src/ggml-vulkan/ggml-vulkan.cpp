@@ -3380,9 +3380,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                              sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
                     // V scratch pre-transposed per 32-kv tile (fa_dequant_q8_0_rdna4); GGML_VK_NO_FA_PREFILL_RDNA4_V64=1 disables
                     if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_V64") == nullptr) {
+                        // FPQ probe: split the QK S^T WMMA chain into NS accumulators; measured null at KV 66048
+                        // (NS=2 +0.8 ms, NS=4 +3 ms per ubatch), so default 1; GGML_VK_FPQ_NS=2|4 probes it
+                        uint32_t fpq_ns = 1u;
+                        if (const char * e = getenv("GGML_VK_FPQ_NS")) { fpq_ns = (uint32_t)atoi(e); }
+                        if (fpq_ns != 1 && fpq_ns != 2 && fpq_ns != 4) { fpq_ns = 1; }
                         ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
                                                  flash_attn_prefill_rdna4_v64_cm1_len, flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
-                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag, fpq_ns}, 1, true, true, 32);
                     }
                 }
             }

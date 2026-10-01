@@ -41,6 +41,11 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint WG = 384;   // 64 * G
 layout(constant_id = 1) const uint G  = 6;     // q heads per KV head (even)
 layout(constant_id = 2) const uint DIAG = 0;   // diagnostics only: 1 no QK MMA, 2 no PV MMA, 4 no global loads after tile 0
+// FPQ: number of independent S^T accumulator chains (1, 2 or 4). The QK product is a 16-deep
+// dependent WMMA chain on one accumulator; splitting it (summed before the softmax) lets
+// consecutive WMMAs issue without waiting on the previous result. Measured null (probe only:
+// GGML_VK_FPQ_NS=2|4); default 1 = the original single chain.
+layout(constant_id = 3) const uint NS = 1;
 
 const uint D   = 256;
 const uint BC  = 32;
@@ -225,12 +230,15 @@ void main() {
     PREFETCH_M(1)
     barrier();
     {
-        MATC Sacc = MATC(0.0);
+        MATC Sc[NS];
+        [[unroll]] for (uint c = 0; c < NS; ++c) Sc[c] = MATC(0.0);
         [[unroll]] for (uint k = 0; k < 16; ++k) {
             MATA Kf;
             coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutRowMajor);
-            Sacc = coopMatMulAdd(Kf, Qf[k], Sacc);
+            Sc[k % NS] = coopMatMulAdd(Kf, Qf[k], Sc[k % NS]);
         }
+        MATC Sacc = Sc[0];
+        [[unroll]] for (uint c = 1; c < NS; ++c) Sacc = Sacc + Sc[c];
         S_FINISH(Sacc)
     }
     barrier();
@@ -278,7 +286,8 @@ void main() {
             }
         }
         {
-            MATC Sacc = MATC(0.0);
+            MATC Sc[NS];
+            [[unroll]] for (uint c = 0; c < NS; ++c) Sc[c] = MATC(0.0);
             [[unroll]] for (uint kk = 0; kk < 2; ++kk) {
                 MATA Pf0, Pf1;
                 coopMatLoad(Pf0, sP, (pt0 * 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
@@ -294,10 +303,12 @@ void main() {
                         const uint k = kk * 8 + i * 2 + h;
                         MATA Kf;
                         coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutRowMajor);
-                        if ((DIAG & 1) == 0) Sacc = coopMatMulAdd(Kf, Qf[k], Sacc);
+                        if ((DIAG & 1) == 0) Sc[k % NS] = coopMatMulAdd(Kf, Qf[k], Sc[k % NS]);
                     }
                 }
             }
+            MATC Sacc = Sc[0];
+            [[unroll]] for (uint c = 1; c < NS; ++c) Sacc = Sacc + Sc[c];
             S_FINISH(Sacc)
         }
         barrier();
