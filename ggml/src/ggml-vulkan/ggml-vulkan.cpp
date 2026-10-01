@@ -8676,7 +8676,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
+    // GGML_VK_FA_DEQUANT_MAX_KV=N: above N KV tokens skip the full-KV f16 scratch (bounds VRAM; 0 = unlimited)
+    static const int64_t dequant_max_kv = getenv("GGML_VK_FA_DEQUANT_MAX_KV") ? atoll(getenv("GGML_VK_FA_DEQUANT_MAX_KV")) : 0;
     const bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
+                                (dequant_max_kv <= 0 || nek1 <= dequant_max_kv) &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -13175,7 +13178,13 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         if (ctx->prealloc_x != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_x);
         }
-        ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
+        // Grow in coarse steps (default 64 MiB) so the FA dequant scratch is not re-created every ubatch.
+        static const uint64_t x_step = (getenv("GGML_VK_PREALLOC_X_STEP_MIB") ? strtoull(getenv("GGML_VK_PREALLOC_X_STEP_MIB"), nullptr, 10) : 64ull) << 20;
+        uint64_t x_alloc = ctx->prealloc_size_x;
+        if (x_step > 0) {
+            x_alloc = ((x_alloc + x_step - 1) / x_step) * x_step;
+        }
+        ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, x_alloc);
     }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
