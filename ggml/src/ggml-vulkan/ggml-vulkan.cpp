@@ -3384,6 +3384,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                                  flash_attn_prefill_rdna4_v64_cm1_len, flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
                                                  sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
                     }
+                    // K/V dequantized straight from the q8_0 cache while staging (no scratch); GGML_VK_FA_NO_Q8_STAGE=1 disables
+                    if (getenv("GGML_VK_FA_NO_Q8_STAGE") == nullptr) {
+                        ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_q8[g], "flash_attn_prefill_rdna4_q8_g" + std::to_string(g),
+                                                 flash_attn_prefill_rdna4_q8_cm1_len, flash_attn_prefill_rdna4_q8_cm1_data, "main", 5,
+                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
+                    }
                 }
             }
         }
@@ -8712,11 +8718,39 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             !sinks && pf_max_bias == 0.0f && pf_softcap == 0.0f &&
             (nbq1 % 16) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
             ggml_is_contiguous(dst);
+        static const bool no_q8_stage = getenv("GGML_VK_FA_NO_Q8_STAGE") != nullptr;
         const bool use_v64 = use_prefill_rdna4 && ctx->device->pipeline_fa_prefill_rdna4_v64[G] != nullptr &&
                              ctx->device->pipeline_fa_dequant_q8_0_rdna4 != nullptr &&
                              // the dequant reads whole 272-byte q8_0 rows as uvec4
                              (ggml_vk_tensor_subbuffer(ctx, k).offset % 16) == 0 && (ggml_vk_tensor_subbuffer(ctx, v).offset % 16) == 0 &&
                              (nbk1 % 16) == 0 && (nbv1 % 16) == 0;
+        const bool use_q8 = !no_q8_stage && use_prefill_rdna4 && ctx->device->pipeline_fa_prefill_rdna4_q8[G] != nullptr &&
+                            (ggml_vk_tensor_subbuffer(ctx, k).offset % 16) == 0 && (ggml_vk_tensor_subbuffer(ctx, v).offset % 16) == 0 &&
+                            (nbk1 % 16) == 0 && (nbv1 % 16) == 0 && (nbk2 % 4) == 0 && (nbv2 % 4) == 0 && (nbk3 % 4) == 0 && (nbv3 % 4) == 0;
+        if (use_q8) {
+            // _q8: no dequant pass, no scratch; strides are in dwords of the q8_0 cache
+            vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_q8[G];
+            ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+            vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
+            vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
+            vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
+            vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+            vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+            const vk_fa_prefill_rdna4_push_constants ppc = {
+                (uint32_t)neq1, KV, (uint32_t)neq2,
+                (uint32_t)(nbq1 / 4), (uint32_t)(nbq2 / 4), (uint32_t)(nbq3 / 4),
+                (uint32_t)(nbk1 / 4), (uint32_t)(nbk2 / 4), (uint32_t)(nbk3 / 4),
+                (uint32_t)(nbv1 / 4), (uint32_t)(nbv2 / 4), (uint32_t)(nbv3 / 4),
+                mask ? (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)) : 0u,
+                mask ? (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)) : 0u,
+                mask ? 1u : 0u,
+                mask ? std::max<uint32_t>(1u, nem3) : 1u,
+                pf_scale,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pl, { q_buf, k_buf, v_buf, mask_buf, dst_buf }, ppc,
+                                      { (uint32_t)CEIL_DIV(neq1, 16), (uint32_t)nek2, (uint32_t)neq3 });
+            return;
+        }
         if (use_v64) {
             // _v64: one dequant pass writes K rows [ns][h][kv][d] and V tiles [ns][h][kv/32][d][32 kv] (zero-padded)
             vk_pipeline pl = ctx->device->pipeline_fa_prefill_rdna4_v64[G];
