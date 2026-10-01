@@ -995,6 +995,13 @@ void process_shaders() {
         string_to_spv("mul_mm_q6k_rdna4_f16_lqglu" + sfx, "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}, {"GQV", gq}}, true, true);
         string_to_spv("mul_mm_q6k_rdna4_f16_lqglun256" + sfx, "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}, {"BN", "256"}, {"WARPS_N", "4"}, {"GQV", gq}}, true, true);
     }
+    // GQ2: GQV modules with the activation B fragments loaded from global (weight-only LDS, 2x the WGs per WGP); GGML_VK_NO_GQ2=1 disables
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqup_gq2", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GQV", "2"}, {"GQ2", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqupsk_gq2", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"SPLITK", "1"}, {"GQV", "2"}, {"GQ2", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqglu_gq2", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}, {"GQV", "2"}, {"GQ2", "1"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqup_gq2n", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GQV", "2"}, {"GQ2", "2"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqupsk_gq2n", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"SPLITK", "1"}, {"GQV", "2"}, {"GQ2", "2"}}, true, true);
+    string_to_spv("mul_mm_q6k_rdna4_f16_lqglu_gq2n", "mul_mm_q6k_rdna4_f16.comp", {{"SINGLE_BUF", "1"}, {"UPAR", "1"}, {"LEANQ", "1"}, {"GLU", "1"}, {"GQV", "2"}, {"GQ2", "2"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_p2", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_p2sk", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}, {"SPLITK", "1"}}, true, true);
     string_to_spv("mul_mm_q6k_rdna4_f16_n256p2", "mul_mm_q6k_rdna4_f16.comp", {{"UPAR", "1"}, {"PIPE2", "1"}, {"BN", "256"}, {"WARPS_N", "4"}}, true, true);

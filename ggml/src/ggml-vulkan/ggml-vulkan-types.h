@@ -802,6 +802,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mm_q8_rdna4_f16_sk; // split-K variant
     vk_pipeline pipeline_mm_q6k_rdna4_f16_sk; // split-K variant of the f16 one (m=5120-class shapes with large K)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_up, pipeline_mm_q6k_rdna4_f16_upsk; // uniform-parity variants (K/256 even)
+    vk_pipeline pipeline_mm_q6k_rdna4_f16_up_gq2, pipeline_mm_q6k_rdna4_f16_upsk_gq2; // GQ2: B fragments from global, full N tiles only
     vk_pipeline pipeline_mm_q6k_rdna4_f16_n256, pipeline_mm_q6k_rdna4_f16_n256sk; // 128x256 tiles, 8 waves (K/256 even, N >= 256)
     vk_pipeline pipeline_mm_q6k_rdna4_f16_glu, pipeline_mm_q6k_rdna4_f16_glun256; // fused FFN gate+up GEMM with swiglu epilogue (64 gate + 64 up rows per tile)
     vk_pipeline pipeline_mm_q6k_rdna4_f32y; // same, activations read as f32 and converted in-kernel (no f32->f16 pre-pass)
