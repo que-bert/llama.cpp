@@ -14584,7 +14584,8 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         } else {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
-        if (!ctx->device->serialize_submissions) {
+        // MPD2 already waited on its timeline semaphores and submitted nothing with ctx->fence
+        if (!ctx->device->serialize_submissions && !ctx->mpd2) {
             const int64_t tw0 = vk_st.enabled ? vk_step_timing::now() : 0;
             ggml_vk_wait_for_fence(ctx);
             if (vk_st.enabled) { st_wait = vk_step_timing::now() - tw0; }
