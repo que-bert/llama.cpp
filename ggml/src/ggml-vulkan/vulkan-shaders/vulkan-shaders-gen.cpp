@@ -944,6 +944,8 @@ void process_shaders() {
     string_to_spv("flash_attn_prefill_rdna4_rs", "flash_attn_prefill_rdna4_rs.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_prefill_rdna4_v64", "flash_attn_prefill_rdna4_v64.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_prefill_rdna4_v64p", "flash_attn_prefill_rdna4_v64.comp", {{"FOV_PIN", "1"}}, true, true, false, false);
+    string_to_spv("gated_delta_net_chunk", "gated_delta_net_chunk.comp", {}, true, true, false, false);
+    string_to_spv("gated_delta_net_chunk_split", "gated_delta_net_chunk.comp", {{"GDC_SPLIT", "1"}}, true, true, false, false);
     string_to_spv("fa_dequant_q8_0_rdna4", "fa_dequant_q8_0_rdna4.comp", {});
 #endif
 

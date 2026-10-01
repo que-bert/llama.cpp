@@ -1,0 +1,336 @@
+#version 450
+
+// GDC: chunked gated delta rule prefill (scalar gate, S_V = 128, K == 1), RDNA4 coopmat 16x16x16.
+//
+// Same recurrence as gated_delta_net.comp, per V head with state S (k x v, stored v-major):
+//   S_t = e^{g_t} S_{t-1} + k_t d_t^T,  d_t = b_t (v_t - e^{g_t} S_{t-1}^T k_t),  o_t = scale * S_t^T q_t
+// Over a chunk of C tokens with gamma_i = sum_{j<=i} g_j, S0 the incoming state:
+//   M   = (I + L)^-1,  L_ij = b_i e^{gamma_i - gamma_j} (k_i . k_j)  (j < i),  T = M diag(b)
+//   D   = T (V - diag(e^gamma) K S0)                         (per-token deltas, C x dv)
+//   O   = scale * (diag(e^gamma) Q S0 + tril(Q K^T o Gamma) D),  Gamma_ij = e^{gamma_i - gamma_j}
+//   S_C = e^{gamma_C} S0 + K^T diag(e^{gamma_C - gamma}) D
+// WMMA (f16 in, f32 acc): K S0, Q S0, K K^T, Q K^T and the state update; f32 VALU: gates,
+// the 16x16 triangular solve, D and the intra-chunk output. The state is carried in f32
+// accumulators; its f16 copy is the operand of K S0 / Q S0. GDC_SPLIT: every f16 operand is a
+// hi+lo pair and each product takes hi*hi + hi*lo + lo*hi (3 WMMA instead of 1).
+// One workgroup (4 waves) per (V head, 32-column slice of v, seq).
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#ifndef GDC_SPLIT
+#define GDC_SPLIT 0
+#endif
+// GDC_DIAG: profiling-only bitmask that removes work (results are wrong): 1 = no triangular solve,
+// 2 = global loads only for chunk 0, 4 = no output store
+layout(constant_id = 0) const uint GDC_DIAG = 0;
+
+layout(push_constant) uniform Parameters {
+    uint H;
+    uint n_tokens;
+    uint n_seqs;
+    uint s_off;
+    uint sq1, sq2, sq3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint neq1, rq3;
+    float scale;
+    uint K;
+};
+
+layout(binding = 0) readonly buffer QBuf     { float data_q[];     };
+layout(binding = 1) readonly buffer KBuf     { float data_k[];     };
+layout(binding = 2) readonly buffer VBuf     { float data_v[];     };
+layout(binding = 3) readonly buffer GBuf     { float data_g[];     };
+layout(binding = 4) readonly buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5) readonly buffer StateBuf { float data_state[]; };
+layout(binding = 6)          buffer DstBuf   { float data_dst[];   };
+
+const uint D    = 128;   // S_V
+const uint C    = 16;    // chunk
+const uint VS   = 32;    // v columns per workgroup
+const uint NSL  = D / VS;
+const uint KSTR = D + 8; // f16 row strides (multiples of 8 halves)
+const uint SSTR = VS + 8;
+
+#define MATA  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define MATC  coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MATH  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+shared float16_t sK[C * KSTR];
+shared float16_t sQ[C * KSTR];
+#if GDC_SPLIT
+shared float16_t sKl[C * KSTR];   // f16 lo parts (GDC_SPLIT)
+shared float16_t sQl[C * KSTR];
+#endif
+shared float16_t sS[D * SSTR];    // state (k x v-slice), f16 hi
+#if GDC_SPLIT
+shared float16_t sSl[D * SSTR];   // f16 lo (GDC_SPLIT)
+#endif
+shared float16_t sDd[C * SSTR];   // e^{gamma_C - gamma_i} D_i, hi
+#if GDC_SPLIT
+shared float16_t sDl[C * SSTR];   // lo (GDC_SPLIT)
+#endif
+shared float sV[C * VS];          // V, then R = V - e^gamma K S0
+shared float sKS[C * VS];
+shared float sQS[C * VS];
+shared float sKK[C * C];
+shared vec4  sL4[C * C / 4];       // L = b_i Gamma_ij (k_i . k_j), j < i, row-major as vec4
+shared float sQK[C * C];          // Q K^T, then P
+shared float sT[C * C];
+shared float sD[C * VS];
+shared float sg[C], sb[C], sgam[C];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint wave = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+
+    const uint head = gl_WorkGroupID.x / NSL;
+    const uint v0   = (gl_WorkGroupID.x % NSL) * VS;
+    const uint seq  = gl_WorkGroupID.y;
+    const uint iq1  = head % neq1;
+    const uint iq3  = seq / rq3;
+    const uint n    = n_tokens;
+
+    const uint state_base = (seq * H + head) * D * D;
+
+    // state tiles owned by this wave: k-tiles 2*wave, 2*wave+1 x v-tiles 0, 1
+    MATC Sacc[4];
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint kt = wave * 2 + (i >> 1), vt = i & 1;
+        coopMatLoad(Sacc[i], data_state, state_base + (v0 + vt * 16) * D + kt * 16, D, gl_CooperativeMatrixLayoutColumnMajor);
+        MATH h = MATH(Sacc[i]);
+        coopMatStore(h, sS, kt * 16 * SSTR + vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+#if GDC_SPLIT
+            MATC r = Sacc[i] - MATC(h);
+            MATH l = MATH(r);
+            coopMatStore(l, sSl, kt * 16 * SSTR + vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+    }
+
+    const uint n_chunks = (n + C - 1) / C;
+    for (uint ch = 0; ch < n_chunks; ++ch) {
+        const uint t0 = ch * C;
+
+        // ---- A: load q, k (f16), v slice, g, beta (padding tokens are zero)
+        if ((GDC_DIAG & 2) == 0 || ch == 0) {
+        [[unroll]] for (uint it = 0; it < (C * D) / 128; ++it) {
+            const uint e = tid + it * 128;
+            const uint i = e / D, c = e % D;
+            const uint t = min(t0 + i, n - 1);
+            const float ok = (t0 + i < n) ? 1.0f : 0.0f;
+            const uint qo = iq3 * sq3 + t * sq2 + iq1 * sq1 + c;
+            const float kf = data_k[qo] * ok, qf = data_q[qo] * ok;
+            const float16_t kh = float16_t(kf), qh = float16_t(qf);
+            sK[i * KSTR + c] = kh;
+            sQ[i * KSTR + c] = qh;
+#if GDC_SPLIT
+                sKl[i * KSTR + c] = float16_t(kf - float(kh));
+                sQl[i * KSTR + c] = float16_t(qf - float(qh));
+#endif
+        }
+        [[unroll]] for (uint it = 0; it < (C * VS) / 128; ++it) {
+            const uint e = tid + it * 128;
+            const uint i = e / VS, c = e % VS;
+            const uint t = min(t0 + i, n - 1);
+            const float ok = (t0 + i < n) ? 1.0f : 0.0f;
+            sV[e] = data_v[seq * sv3 + t * sv2 + head * sv1 + v0 + c] * ok;
+        }
+        if (tid < C) {
+            const uint t = min(t0 + tid, n - 1);
+            const float ok = (t0 + tid < n) ? 1.0f : 0.0f;
+            const uint gb = seq * sb3 + t * sb2 + head * sb1;
+            sg[tid] = data_g[gb] * ok;
+            sb[tid] = data_beta[gb] * ok;
+        }
+        }
+        barrier();
+
+        // ---- B: K S0, Q S0 (one 16x16 tile per wave), K K^T (wave 0), Q K^T (wave 1); gamma (wave 2)
+        {
+            const uint vt = wave & 1;
+            MATC acc = MATC(0.0f);
+            [[unroll]] for (uint kk = 0; kk < D / 16; ++kk) {
+                MATA a;
+                if (wave < 2) {
+                    coopMatLoad(a, sK, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+                    coopMatLoad(a, sQ, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                MATB b;
+                coopMatLoad(b, sS, kk * 16 * SSTR + vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+                acc = coopMatMulAdd(a, b, acc);
+#if GDC_SPLIT
+                    MATB bl;
+                    coopMatLoad(bl, sSl, kk * 16 * SSTR + vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+                    acc = coopMatMulAdd(a, bl, acc);
+                    if (wave < 2) {
+                        coopMatLoad(a, sKl, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                    } else {
+                        coopMatLoad(a, sQl, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    acc = coopMatMulAdd(a, b, acc);
+#endif
+            }
+            if (wave < 2) {
+                coopMatStore(acc, sKS, vt * 16, VS, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopMatStore(acc, sQS, vt * 16, VS, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        if (wave < 2) {
+            MATC acc = MATC(0.0f);
+            [[unroll]] for (uint kk = 0; kk < D / 16; ++kk) {
+                MATA a;
+                if (wave == 0) {
+                    coopMatLoad(a, sK, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+                    coopMatLoad(a, sQ, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                MATB b;
+                coopMatLoad(b, sK, kk * 16, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
+                acc = coopMatMulAdd(a, b, acc);
+#if GDC_SPLIT
+                    MATB bl;
+                    coopMatLoad(bl, sKl, kk * 16, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc = coopMatMulAdd(a, bl, acc);
+                    if (wave == 0) {
+                        coopMatLoad(a, sKl, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                    } else {
+                        coopMatLoad(a, sQl, kk * 16, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    acc = coopMatMulAdd(a, b, acc);
+#endif
+            }
+            if (wave == 0) {
+                coopMatStore(acc, sKK, 0, C, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopMatStore(acc, sQK, 0, C, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        } else if (wave == 2) {
+            const float x = sg[lane & (C - 1)];
+            const float gm = subgroupInclusiveAdd(lane < C ? x : 0.0f);
+            if (lane < C) {
+                sgam[lane] = gm;
+            }
+        }
+        barrier();
+
+        // ---- C1: triangular solve (wave 0, one column per lane) | P and R (waves 1-3)
+        // C1a (all threads): Gamma-weighted L, P and R; C1b (wave 0): solve with L from LDS
+        [[unroll]] for (uint it = 0; it < (C * C) / 128; ++it) {
+            const uint e = tid + it * 128;
+            const uint i = e / C, j = e % C;
+            const float gm = (j <= i) ? exp(sgam[i] - sgam[j]) : 0.0f;
+            sQK[e] = gm * sQK[e];
+            sL4[e / 4][e % 4] = (j < i) ? sb[i] * gm * sKK[e] : 0.0f;
+        }
+        [[unroll]] for (uint it = 0; it < (C * VS) / 128; ++it) {
+            const uint e = tid + it * 128;
+            sV[e] = sV[e] - exp(sgam[e / VS]) * sKS[e];
+        }
+        barrier();
+        if (wave == 0 && lane < C) {
+            const uint c = lane;
+            const float bc = sb[c];
+            if ((GDC_DIAG & 1) != 0) {
+                [[unroll]] for (uint i = 0; i < C; ++i) {
+                    sT[i * C + c] = (i == c) ? bc : 0.0f;
+                }
+            } else {
+                // one LDS round trip per row (4 x vec4), not per element
+                float m[C];
+                vec4 r[4];
+                [[unroll]] for (uint q = 0; q < 4; ++q) { r[q] = sL4[q]; }
+                [[unroll]] for (uint i = 0; i < C; ++i) {
+                    vec4 rn[4];
+                    if (i + 1 < C) {
+                        [[unroll]] for (uint q = 0; q < 4; ++q) { rn[q] = sL4[(i + 1) * 4 + q]; }
+                    }
+                    float s = (i == c) ? 1.0f : 0.0f;
+                    [[unroll]] for (uint j = 0; j < i; ++j) {
+                        s = fma(-r[j / 4][j % 4], m[j], s);
+                    }
+                    m[i] = s;
+                    sT[i * C + c] = s * bc;
+                    if (i + 1 < C) {
+                        [[unroll]] for (uint q = 0; q < 4; ++q) { r[q] = rn[q]; }
+                    }
+                }
+            }
+        }
+        barrier();
+
+        // ---- C2: D = T R; scaled f16 copy for the state update
+        const float gC = sgam[C - 1];
+        [[unroll]] for (uint it = 0; it < (C * VS) / 128; ++it) {
+            const uint e = tid + it * 128;
+            const uint i = e / VS, c = e % VS;
+            float d = 0.0f;
+            [[unroll]] for (uint j = 0; j < C; ++j) {
+                d += sT[i * C + j] * sV[j * VS + c];
+            }
+            sD[e] = d;
+            const float dd = exp(gC - sgam[i]) * d;
+            const float16_t hi = float16_t(dd);
+            sDd[i * SSTR + c] = hi;
+#if GDC_SPLIT
+                sDl[i * SSTR + c] = float16_t(dd - float(hi));
+#endif
+        }
+        barrier();
+
+        // ---- E: output (VALU) and state update (WMMA)
+        [[unroll]] for (uint it = 0; it < (C * VS) / 128; ++it) {
+            const uint e = tid + it * 128;
+            const uint i = e / VS, c = e % VS;
+            float o = exp(sgam[i]) * sQS[e];
+            [[unroll]] for (uint j = 0; j < C; ++j) {
+                o += sQK[i * C + j] * sD[j * VS + c];
+            }
+            if (t0 + i < n && (GDC_DIAG & 4) == 0) {
+                data_dst[(seq * n * H + (t0 + i) * H + head) * D + v0 + c] = o * scale;
+            }
+        }
+        const float eC = exp(gC);
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            const uint kt = wave * 2 + (i >> 1), vt = i & 1;
+            Sacc[i] = Sacc[i] * eC;
+            MATA a;
+            coopMatLoad(a, sK, kt * 16, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
+            MATB b;
+            coopMatLoad(b, sDd, vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+            Sacc[i] = coopMatMulAdd(a, b, Sacc[i]);
+#if GDC_SPLIT
+                MATB bl;
+                coopMatLoad(bl, sDl, vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+                Sacc[i] = coopMatMulAdd(a, bl, Sacc[i]);
+                coopMatLoad(a, sKl, kt * 16, KSTR, gl_CooperativeMatrixLayoutColumnMajor);
+                Sacc[i] = coopMatMulAdd(a, b, Sacc[i]);
+#endif
+            MATH h = MATH(Sacc[i]);
+            coopMatStore(h, sS, kt * 16 * SSTR + vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+#if GDC_SPLIT
+                MATC r = Sacc[i] - MATC(h);
+                MATH l = MATH(r);
+                coopMatStore(l, sSl, kt * 16 * SSTR + vt * 16, SSTR, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        }
+        barrier();
+    }
+
+    const uint out_base = s_off + state_base;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint kt = wave * 2 + (i >> 1), vt = i & 1;
+        coopMatStore(Sacc[i], data_dst, out_base + (v0 + vt * 16) * D + kt * 16, D, gl_CooperativeMatrixLayoutColumnMajor);
+    }
+}

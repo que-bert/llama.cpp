@@ -1505,6 +1505,8 @@ struct test_case {
                 //printf("\n");
                 //exit(1);
                 ud->ok = false;
+            } else if (getenv("TBO_PRINT_ERR") != nullptr) {
+                printf("[%s] ERR = %.3e (max %.1e) ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
             }
             return true;
 
@@ -11324,6 +11326,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+    // GDC (Vulkan chunked prefill, S_v 128): Qwen3.8-27B shape at ubatch 512, tails and n_seqs 2
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 77, 1, 1, true));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
@@ -11905,6 +11912,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
     // Qwen3.8-27B (qwen35): 16 K heads / 48 V heads (v_repeat=3), d=128, decode.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3)); // Qwen3.8-27B prefill ub512 (GDC)
     // PP: n_seq_tokens=64,256 (prompt processing)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256

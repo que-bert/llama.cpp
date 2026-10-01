@@ -3401,6 +3401,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_fa_dequant_q8_0_rdna4, "fa_dequant_q8_0_rdna4", fa_dequant_q8_0_rdna4_len, fa_dequant_q8_0_rdna4_data,
                                      "main", 2, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true, true, 32);
         }
+        // GDC: chunked prefill gated delta net. Discarded spike (383 us/call in-model vs 306 for the
+        // token recurrence), so opt-in: GGML_VK_GDC=1 enables it. GGML_VK_GDC_SPLIT=1 makes every
+        // f16 WMMA operand a hi+lo pair (did not change the error, so the error is not f16 rounding).
+        if (getenv("GGML_VK_GDC") != nullptr && getenv("GGML_VK_NO_GDC") == nullptr) {
+            const bool split = getenv("GGML_VK_GDC_SPLIT") != nullptr;
+            // GGML_VK_GDC_DIAG: profiling-only bitmask that removes work (results are wrong)
+            const char * gdc_diag = getenv("GGML_VK_GDC_DIAG");
+            const uint32_t diag = gdc_diag ? (uint32_t)atoi(gdc_diag) : 0u;
+            ggml_vk_create_pipeline2(device, device->pipeline_gdn_chunk, "gated_delta_net_chunk",
+                                     split ? gated_delta_net_chunk_split_cm1_len : gated_delta_net_chunk_cm1_len,
+                                     split ? gated_delta_net_chunk_split_cm1_data : gated_delta_net_chunk_cm1_data,
+                                     "main", 7, sizeof(vk_op_gated_delta_net_push_constants), {1, 1, 1}, {diag}, 1, true, true, 32);
+        }
     }
 #endif
 
@@ -11003,6 +11016,16 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
              f.gate_alpha ? ggml_vk_tensor_subbuffer(ctx, f.gate_dt) : src_buf[3],
              f.gate_alpha ? ggml_vk_tensor_subbuffer(ctx, f.gate_a)  : src_buf[3]},
             cpc, { H, n_seqs, S_v });
+        return;
+    }
+
+    // GDC: chunked form for prefill (one workgroup per (V head, 32-column v slice, seq))
+    vk_pipeline gdc = ctx->device->pipeline_gdn_chunk;
+    if (gdc != nullptr && S_v == 128 && K == 1 && n_tokens >= 64 && dst->src[3]->ne[0] == 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, gdc, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, gdc,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H * (S_v / 32), n_seqs, 1 });
         return;
     }
 
