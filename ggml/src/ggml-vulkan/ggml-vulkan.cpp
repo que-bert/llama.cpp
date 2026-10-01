@@ -1744,6 +1744,9 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
+// plain (mask 0) or GQV-masked module of a LEANQ variant
+#define GQV_PICK(var, m, field) ((m) == 2 ? var##_g2_cm1_##field : var##_cm1_##field)
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -2587,12 +2590,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // lean dequant (funnel-shift parity + byte-permute spread, hoisted row bases) in the UPAR, N256 and GLU
                 // slots; GGML_VK_NO_Q6K_LEANQ=1 restores the previous modules
                 const bool lq = !p2 && getenv("GGML_VK_NO_Q6K_LEANQ") == nullptr;
+                // GQV instruction-diet modules (GGML_VK_NO_GQV=1 = plain LEANQ; aligns the Q6_K block once per 4 K steps, ~-7 ms/ubatch; GGML_VK_GQV=0 equals NO_GQV, default 2)
+                const int gq = getenv("GGML_VK_NO_GQV") != nullptr ? 0 : (getenv("GGML_VK_GQV") ? atoi(getenv("GGML_VK_GQV")) : 2);
                 // uniform-parity variants for K/256 even (block parity is sb & 1); GGML_VK_NO_Q6K_UPAR=1 disables
                 if (getenv("GGML_VK_NO_Q6K_UPAR") == nullptr) {
-                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_up, "mul_mm_q6k_rdna4_f16_up", p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqup_cm1_len : mul_mm_q6k_rdna4_f16_up_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqup_cm1_data : mul_mm_q6k_rdna4_f16_up_cm1_data), "main", 3,
+                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_up, "mul_mm_q6k_rdna4_f16_up", p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_len : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqup, gq, len) : mul_mm_q6k_rdna4_f16_up_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_data : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqup, gq, data) : mul_mm_q6k_rdna4_f16_up_cm1_data), "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
-                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_upsk, "mul_mm_q6k_rdna4_f16_upsk", p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqupsk_cm1_len : mul_mm_q6k_rdna4_f16_upsk_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqupsk_cm1_data : mul_mm_q6k_rdna4_f16_upsk_cm1_data), "main", 3,
+                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_upsk, "mul_mm_q6k_rdna4_f16_upsk", p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_len : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqupsk, gq, len) : mul_mm_q6k_rdna4_f16_upsk_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_data : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqupsk, gq, data) : mul_mm_q6k_rdna4_f16_upsk_cm1_data), "main", 3,
                                                 sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
                 }
@@ -2601,20 +2606,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // GGML_VK_Q6K_LEANQ_N256=1
                 const bool lq_n256 = !lq || getenv("GGML_VK_Q6K_LEANQ_N256") != nullptr;
                 if (lq_n256 && getenv("GGML_VK_NO_Q6K_N256") == nullptr && getenv("GGML_VK_NO_Q6K_UPAR") == nullptr) {
-                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256, "mul_mm_q6k_rdna4_f16_n256", p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqn256_cm1_len : mul_mm_q6k_rdna4_f16_n256_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqn256_cm1_data : mul_mm_q6k_rdna4_f16_n256_cm1_data), "main", 3,
+                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256, "mul_mm_q6k_rdna4_f16_n256", p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_len : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqn256, gq, len) : mul_mm_q6k_rdna4_f16_n256_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_data : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqn256, gq, data) : mul_mm_q6k_rdna4_f16_n256_cm1_data), "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
-                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256sk, "mul_mm_q6k_rdna4_f16_n256sk", p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqn256sk_cm1_len : mul_mm_q6k_rdna4_f16_n256sk_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqn256sk_cm1_data : mul_mm_q6k_rdna4_f16_n256sk_cm1_data), "main", 3,
+                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256sk, "mul_mm_q6k_rdna4_f16_n256sk", p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_len : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqn256sk, gq, len) : mul_mm_q6k_rdna4_f16_n256sk_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_data : (lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqn256sk, gq, data) : mul_mm_q6k_rdna4_f16_n256sk_cm1_data), "main", 3,
                                                 sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
                 }
                 // fused FFN gate+up GEMM + swiglu epilogue (graph fusion MUL_MAT, MUL_MAT, GLU); GGML_VK_NO_Q6K_SWIGLU=1 disables
                 if (getenv("GGML_VK_NO_Q6K_SWIGLU") == nullptr) {
-                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_glu, "mul_mm_q6k_rdna4_f16_glu", lq ? mul_mm_q6k_rdna4_f16_lqglu_cm1_len : mul_mm_q6k_rdna4_f16_glu_cm1_len, lq ? mul_mm_q6k_rdna4_f16_lqglu_cm1_data : mul_mm_q6k_rdna4_f16_glu_cm1_data, "main", 3,
+                    ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_glu, "mul_mm_q6k_rdna4_f16_glu", lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqglu, gq, len) : mul_mm_q6k_rdna4_f16_glu_cm1_len, lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqglu, gq, data) : mul_mm_q6k_rdna4_f16_glu_cm1_data, "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {64, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     // 256-token tiles, 8 waves (GGML_VK_NO_Q6K_SWIGLU_N256=1 keeps the 128-token one)
                     if (lq_n256 && getenv("GGML_VK_NO_Q6K_SWIGLU_N256") == nullptr) {
-                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_glun256, "mul_mm_q6k_rdna4_f16_glun256", lq ? mul_mm_q6k_rdna4_f16_lqglun256_cm1_len : mul_mm_q6k_rdna4_f16_glun256_cm1_len, lq ? mul_mm_q6k_rdna4_f16_lqglun256_cm1_data : mul_mm_q6k_rdna4_f16_glun256_cm1_data, "main", 3,
+                        ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_glun256, "mul_mm_q6k_rdna4_f16_glun256", lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqglun256, gq, len) : mul_mm_q6k_rdna4_f16_glun256_cm1_len, lq ? GQV_PICK(mul_mm_q6k_rdna4_f16_lqglun256, gq, data) : mul_mm_q6k_rdna4_f16_glun256_cm1_data, "main", 3,
                                                 sizeof(vk_mat_mat_push_constants), {64, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
                 }
