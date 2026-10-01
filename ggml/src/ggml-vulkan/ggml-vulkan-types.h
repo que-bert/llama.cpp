@@ -1316,6 +1316,10 @@ struct ggml_backend_vk_context {
     vk_context_ref transfer_ctx;
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
+    // MPD2: timeline semaphore signalled by every compute-queue submission of this ctx, so synchronize can wait for
+    // this ctx's own work instead of an empty device-queue submit (which also waits for other ctxs' in-flight work)
+    vk_semaphore mpd2_sem {};
+    bool mpd2 = false;
 
     std::vector<vk_context_ref> tensor_ctxs;
 

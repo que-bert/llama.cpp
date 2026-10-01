@@ -5699,6 +5699,18 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
 
+    {
+        const char * e = getenv("GGML_VK_NO_MPD2");
+        ctx->mpd2 = !(e && atoi(e) != 0) && !ctx->device->serialize_submissions;
+        if (ctx->mpd2) {
+            vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+            vk::SemaphoreCreateInfo ci{};
+            ci.setPNext(&tci);
+            ctx->mpd2_sem.s     = ctx->device->device.createSemaphore(ci);
+            ctx->mpd2_sem.value = 0;
+        }
+    }
+
     ctx->compute_cmd_pool.init(ctx->device, ctx->device->compute_queue.get());
     if (ctx->device->async_use_transfer_queue) {
         vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
@@ -6085,6 +6097,15 @@ vk_context ggml_vk_get_transfer_ctx(ggml_backend_vk_context * ctx) {
     }
 
     return result;
+}
+
+// MPD2: tag the last submission of subctx with the ctx's own timeline semaphore (see vk_context mpd2_sem)
+static void ggml_vk_mpd2_mark(ggml_backend_vk_context * ctx, vk_context & subctx) {
+    if (!ctx->mpd2 || subctx->seqs.empty() || subctx->seqs.back().empty()) {
+        return;
+    }
+    ctx->mpd2_sem.value++;
+    subctx->seqs.back().back().signal_semaphores.push_back(ctx->mpd2_sem);
 }
 
 bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
@@ -13174,6 +13195,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     if (subctx) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
+        ggml_vk_mpd2_mark(ctx, subctx);
         ggml_vk_submit(subctx, {});
         ctx->submit_pending = true;
         ggml_vk_synchronize(ctx);
@@ -13844,6 +13866,7 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             memset(mset.dst, mset.val, mset.n);
         }
 
+        ggml_vk_mpd2_mark(ctx, subctx);
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(subctx, ctx->fence);
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
@@ -13941,6 +13964,9 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    if (ctx->mpd2) {
+        ctx->device->device.destroySemaphore(ctx->mpd2_sem.s);
+    }
 
     for (auto& pool : ctx->descriptor_pools) {
         ctx->device->device.destroyDescriptorPool(pool);
@@ -14499,6 +14525,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
 
+        ggml_vk_mpd2_mark(ctx, compute_ctx);
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(compute_ctx, ctx->fence);
             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
@@ -14512,6 +14539,34 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     if (ctx->submit_pending) {
         if (ctx->device->serialize_submissions) {
             ctx->submit_pending = false;
+        } else if (ctx->mpd2) {
+            // wait only for this ctx's own submissions (timeline semaphores), not for the whole device queue
+            if (ctx->almost_ready_fence_pending) {
+                VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence", ctx->device);
+                ctx->device->device.resetFences({ ctx->almost_ready_fence });
+                ctx->almost_ready_fence_pending = false;
+            }
+            vk::Semaphore sems[2];
+            uint64_t      vals[2];
+            uint32_t      n = 0;
+            if (ctx->mpd2_sem.value > 0) {
+                sems[n] = ctx->mpd2_sem.s; vals[n] = ctx->mpd2_sem.value; n++;
+            }
+            if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+                sems[n] = ctx->transfer_semaphore.s; vals[n] = ctx->transfer_semaphore.value; n++;
+                ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+            }
+            if (n > 0) {
+                const int64_t tw0 = vk_st.enabled ? vk_step_timing::now() : 0;
+                vk::SemaphoreWaitInfo wi{ {}, n, sems, vals };
+                VK_CHECK(ctx->device->device.waitSemaphores(wi, UINT64_MAX), "mpd2 waitSemaphores", ctx->device);
+                if (vk_st.enabled) { st_wait = vk_step_timing::now() - tw0; }
+            }
+            ctx->submit_pending = false;
+            if (cmd_buf) {
+                cmd_buf->in_use = false;
+                cmd_buf->buf.reset();
+            }
         } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
             vk::TimelineSemaphoreSubmitInfo tl_info{
                 1, &ctx->transfer_semaphore.value,
@@ -16390,6 +16445,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
     ggml_vk_ctx_end(compute_ctx);
 
+    ggml_vk_mpd2_mark(ctx, compute_ctx);
     ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
     vkev->cmd_buffer = cmd_buf;
