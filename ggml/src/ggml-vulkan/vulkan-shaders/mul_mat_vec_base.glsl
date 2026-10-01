@@ -37,8 +37,21 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint grp_m1;     // grouped GEMV: first virtual row of weight 1 / 2, and dst element offsets
+    uint grp_m2;
+    uint grp_do0;
+    uint grp_do1;
+    uint grp_do2;
 #endif
 } p;
+
+// dst column stride: per-weight in grouped GEMV mode (MMQ shaders set g_bsd in main)
+#ifdef MMQ
+uint g_bsd;
+#define BSD_D g_bsd
+#else
+#define BSD_D p.batch_stride_d
+#endif
 
 #ifdef MUL_MAT_ID
 uint expert_id;
@@ -121,7 +134,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                data_d[j*BSD_D + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
         }
     }
@@ -176,7 +189,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                data_d[j*BSD_D + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
         }
     }
@@ -221,7 +234,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                data_d[j*BSD_D + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
             }
         }
     }

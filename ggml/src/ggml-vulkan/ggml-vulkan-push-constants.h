@@ -29,6 +29,11 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+    uint32_t grp_m1;     // grouped q6_K MMVQ (GGML_VK_GEMV_MULTI): virtual row starts of weight 1/2, dst element offsets
+    uint32_t grp_m2;
+    uint32_t grp_do0;
+    uint32_t grp_do1;
+    uint32_t grp_do2;
 };
 
 struct vk_mat_vec_p021_push_constants {

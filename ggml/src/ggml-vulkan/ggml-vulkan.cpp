@@ -7122,10 +7122,37 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         }
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+    // grouped q6_K GEMV: nodes node_idx .. node_idx+grp-1 are MUL_MATs on the same src1, run as one dispatch
+    const int grp = (!swap_inputs && quantize_y) ? ctx->fused_mm_group : 0;
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + (grp > 1 ? 0 : ctx->num_additional_fused_ops)]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
     vk_subbuffer d_X, d_Y;
+    vk_subbuffer d_G1 = d_Qx, d_G2 = d_Qx;
+    uint32_t grp_total_rows = ne01, grp_m1 = 0, grp_m2 = 0xFFFFFFFFu, grp_do[3] = {0, 0, 0};
+    if (grp > 1) {
+        GGML_ASSERT(grp <= 3);
+        uint64_t lo = UINT64_MAX, hi = 0;
+        vk_subbuffer dsb[3];
+        for (int k = 0; k < grp; ++k) {
+            dsb[k] = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + k]);
+            GGML_ASSERT(dsb[k].buffer == dsb[0].buffer);
+            lo = std::min(lo, dsb[k].offset);
+            hi = std::max(hi, dsb[k].offset + dsb[k].size);
+        }
+        for (int k = 0; k < grp; ++k) {
+            grp_do[k] = (uint32_t)((dsb[k].offset - lo) / sizeof(float));
+        }
+        d_D = { dsb[0].buffer, lo, hi - lo };
+        d_G1 = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + 1]->src[0]);
+        d_G2 = grp > 2 ? ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + 2]->src[0]) : d_Qx;
+        grp_m1 = (uint32_t) cgraph->nodes[node_idx]->ne[0];
+        grp_total_rows = grp_m1 + (uint32_t) cgraph->nodes[node_idx + 1]->ne[0];
+        if (grp > 2) {
+            grp_m2 = grp_total_rows;
+            grp_total_rows += (uint32_t) cgraph->nodes[node_idx + 2]->ne[0];
+        }
+    }
 
     if (qx_needs_dequant) {
         d_X = { ctx->prealloc_x, 0, ctx->prealloc_x->size };
@@ -7190,10 +7217,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
 
-    uint32_t groups_x = ne01;
+    uint32_t groups_x = grp > 1 ? grp_total_rows : ne01;
     uint32_t groups_z = 1;
 
-    if (ne01 > max_groups_x) {
+    if (groups_x > max_groups_x) {
+        GGML_ASSERT(grp <= 1);
         groups_z = 64;
         groups_x = CEIL_DIV(groups_x, groups_z);
     }
@@ -7201,7 +7229,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     uint32_t fusion_flags = 0;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0) {
+    if (grp > 1) {
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_GROUP;
+        d_F0 = d_G1;
+    } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
@@ -7210,7 +7241,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops == 2) {
+    if (grp > 1) {
+        d_F1 = d_G2;
+    } else if (ctx->num_additional_fused_ops == 2) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
 
@@ -7225,10 +7258,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
         uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         const vk_mat_vec_push_constants pc = {
-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, grp > 1 ? grp_total_rows : (uint32_t)ne01,
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            grp_m1, grp_m2, grp_do[0], grp_do[1], grp_do[2],
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -7626,7 +7660,61 @@ static bool ggml_vk_can_fuse_q6k_swiglu(const ggml_backend_vk_context * ctx, con
     return og % 4 == 0 && ou % 4 == 0 && span <= ctx->device->properties.limits.maxStorageBufferRange;
 }
 
+// GGML_VK_GEMV_MULTI=1: consecutive q6_K MUL_MATs reading the same activation (n = 5..max_cols verify batch, RDNA4 fast MMVQ
+// path) run as ONE dispatch over the concatenated rows (per-row arithmetic unchanged). Returns the group size (2 or 3), 0 if none.
+static bool ggml_vk_gemv_multi_enabled() {
+    static const bool en = [] { const char * e = getenv("GGML_VK_GEMV_MULTI"); return e && atoi(e) != 0; }();
+    return en;
+}
+static int ggml_vk_can_group_mmvq(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_vk_gemv_multi_enabled() || ctx->device->architecture != vk_device_architecture::AMD_RDNA4 ||
+        getenv("GGML_VK_NO_MQ5_TUNE") != nullptr || (getenv("GGML_VK_MQ5_FAST") && atoi(getenv("GGML_VK_MQ5_FAST")) == 0) ||
+        !ctx->device->integer_dot_product || ctx->do_add_rms_partials) {
+        return 0;
+    }
+    int n = 0;
+    const ggml_tensor * first = cgraph->nodes[i];
+    for (int k = 0; k < 3 && i + k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * m = cgraph->nodes[i + k];
+        if (m->op != GGML_OP_MUL_MAT || m->src[1] != first->src[1]) {
+            break;
+        }
+        const ggml_tensor * w = m->src[0], * x = m->src[1];
+        if (w->type != GGML_TYPE_Q6_K || x->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(m) ||
+            w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
+            x->ne[1] < 5 || x->ne[1] > (int64_t) mul_mat_vec_max_cols || x->ne[1] != first->src[1]->ne[1] ||
+            w->ne[0] != first->src[0]->ne[0] || w->ne[1] % 4 != 0 || m->ne[0] != w->ne[1] ||
+            ggml_nbytes(w) > ctx->device->properties.limits.maxStorageBufferRange ||
+            get_misalign_bytes(ctx, w) != 0 || get_misalign_bytes(ctx, m) != 0 || get_misalign_bytes(ctx, x) != 0 ||
+            ggml_vk_tensor_in_host_buffer(w) || ggml_vk_tensor_in_host_buffer(m) || ggml_vk_can_use_fwht(ctx, x, m) ||
+            !ggml_vk_should_use_mmvq(ctx->device, w->ne[1], x->ne[1], x->ne[0], GGML_TYPE_Q6_K)) {
+            break;
+        }
+        // consecutive-nodes group: no node may read another's output (src1 is shared and not a group member)
+        bool dep = false;
+        for (int c = 0; c < k; ++c) {
+            if (cgraph->nodes[i + c] == x || cgraph->nodes[i + c] == w) { dep = true; }
+        }
+        if (dep || (k > 0 && ((ggml_backend_vk_buffer_context *) m->buffer->context)->dev_buffer !=
+                              ((ggml_backend_vk_buffer_context *) first->buffer->context)->dev_buffer)) {
+            break;
+        }
+        ++n;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    uint32_t total = 0;
+    for (int k = 0; k < n; ++k) { total += (uint32_t) cgraph->nodes[i + k]->ne[0]; }
+    return total <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] ? n : 0;
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->fused_mm_group > 1) {
+        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+        return;
+    }
     if (ctx->fused_q6k_swiglu) {
         const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
         ggml_vk_mul_mat_q_f16(ctx, subctx, glu->src[0]->src[0], glu->src[0]->src[1], cgraph->nodes[node_idx + 2], true, glu->src[1]->src[0]);
@@ -15539,6 +15627,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_q6k_swiglu = false;
+        ctx->fused_mm_group = 0;
         ctx->fused_rms_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->cur_gdn_cache_fuse = nullptr;
@@ -15564,6 +15653,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (int ng = ggml_vk_can_group_mmvq(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = ng - 1;
+                ctx->fused_mm_group = ng;
+                fusion_string = "MUL_MAT_GROUP";
+                std::fill_n(op_srcs_fused_elementwise, ng, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -15751,10 +15845,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
+        if (ctx->fused_mm_group > 1) {
+            ctx->fused_ops_write_mask = (1u << (ctx->num_additional_fused_ops + 1)) - 1;   // every grouped MUL_MAT writes its own dst
+        }
 
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->num_additional_fused_ops && ctx->fused_mm_group <= 1) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -16124,6 +16221,33 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
+
+        // GGML_VK_GEMV_MULTI: pull later q6_K MUL_MATs that read the same activation next to this one
+        // (the GDN z projection sits far behind qkv) so ggml_vk_can_group_mmvq can run them as one dispatch.
+        if (ggml_vk_gemv_multi_enabled() && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT &&
+            graph->nodes[first_unused]->src[0]->type == GGML_TYPE_Q6_K && graph->nodes[first_unused]->src[1]->ne[1] >= 5 &&
+            graph->nodes[first_unused]->src[1]->ne[1] <= (int64_t) mul_mat_vec_max_cols) {
+            const ggml_tensor * m0 = graph->nodes[first_unused];
+            int extra = 0;
+            for (int j = first_unused + 1; j < std::min(first_unused + 160, graph->n_nodes) && extra < 2; ++j) {
+                const ggml_tensor * mj = graph->nodes[j];
+                if (used[j] || mj->op != GGML_OP_MUL_MAT || mj->src[0]->type != GGML_TYPE_Q6_K || mj->src[1] != m0->src[1]) {
+                    continue;
+                }
+                bool ok = true;
+                for (int c = first_unused; c < j && ok; ++c) {
+                    if (!used[c] && std::find(current_set.begin(), current_set.end(), c) == current_set.end() && is_src_of(mj, graph->nodes[c])) {
+                        ok = false;
+                    }
+                }
+                // nothing already pulled may read this node's output either
+                if (ok) {
+                    current_set.push_back(j);
+                    used[j] = true;
+                    ++extra;
+                }
+            }
+        }
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set

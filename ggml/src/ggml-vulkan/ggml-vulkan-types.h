@@ -1140,6 +1140,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_GROUP 0x20
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1339,6 +1340,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_q6k_swiglu {};
+    int fused_mm_group {};   // >1: that many consecutive q6_K MUL_MATs sharing src1 run as one dispatch (GGML_VK_GEMV_MULTI)
     bool fused_rms_gate {};
 
     // recurrent-cache fusion (GGML_VK_NO_GDN_CACHE=1 disables): GET_ROWS/CPY nodes whose work is done by

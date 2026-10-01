@@ -4,6 +4,7 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_GROUP 0x20
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
@@ -28,6 +29,14 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 layout (binding = 3) readonly buffer Fuse0 {D_TYPE data_fuse0[];};
 layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
+
+#if defined(MMQ) && defined(DATA_A_Q6_K) && !defined(MUL_MAT_ID)
+// grouped q6_K GEMV (GGML_VK_GEMV_MULTI): bindings 3/4 alias the 2nd/3rd weight tensor (no bias fusion in this mode)
+layout (binding = 3) readonly buffer A1 {A_TYPE data_a1[];};
+layout (binding = 3) readonly buffer A1_PACKED16 {A_TYPE_PACKED16 data_a1_packed16[];};
+layout (binding = 4) readonly buffer A2 {A_TYPE data_a2[];};
+layout (binding = 4) readonly buffer A2_PACKED16 {A_TYPE_PACKED16 data_a2_packed16[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
