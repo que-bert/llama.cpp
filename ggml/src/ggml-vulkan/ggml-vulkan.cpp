@@ -3385,9 +3385,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         uint32_t fpq_ns = 1u;
                         if (const char * e = getenv("GGML_VK_FPQ_NS")) { fpq_ns = (uint32_t)atoi(e); }
                         if (fpq_ns != 1 && fpq_ns != 2 && fpq_ns != 4) { fpq_ns = 1; }
+                        // FOV: lazy O rescale (TAU = 8) + loop-invariant prefetch offsets; GGML_VK_NO_FOV=1 reverts
+                        const uint32_t fov = getenv("GGML_VK_NO_FOV") == nullptr ? 1u : 0u;
                         ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
-                                                 flash_attn_prefill_rdna4_v64_cm1_len, flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
-                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag, fpq_ns}, 1, true, true, 32);
+                                                 fov ? flash_attn_prefill_rdna4_v64p_cm1_len : flash_attn_prefill_rdna4_v64_cm1_len,
+                                                 fov ? flash_attn_prefill_rdna4_v64p_cm1_data : flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
+                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag, fpq_ns, fov}, 1, true, true, 32);
                     }
                 }
             }
