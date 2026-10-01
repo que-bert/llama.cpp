@@ -1883,8 +1883,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     ldt_trace(this,"D3");
     llama_memory_context_ptr mctx;
 
+    // MPB: a KV-only MTP prompt pass (no output rows) is cheap per row, so run it in fewer, larger ubatches:
+    // every extra ubatch costs a device sync + input upload + submit on the host, with the GPU idle in between.
+    // LLAMA_NO_MPB=1 reverts; LLAMA_MPB_DUB=<rows> sets the cap (default 1024).
+    uint32_t n_ub_pass = cparams.n_ubatch;
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_outputs_all == 0 && batch_inp.token && batch_inp.embd) {
+        static const bool mpb_on = !(getenv("LLAMA_NO_MPB") && atoi(getenv("LLAMA_NO_MPB")) != 0);
+        static const uint32_t mpb_dub = getenv("LLAMA_MPB_DUB") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_MPB_DUB"))) : 1024u;
+        if (mpb_on) {
+            n_ub_pass = std::min<uint32_t>(cparams.n_batch, std::max(cparams.n_ubatch, mpb_dub));
+        }
+    }
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ub_pass, output_all);
         if (!mctx) {
             return -2;
         }
