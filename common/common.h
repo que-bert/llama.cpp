@@ -1003,7 +1003,7 @@ enum common_context_seq_rm_type {
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
-// Deferred MTP prompt pass (LLAMA_NO_MTP_PIPE reverts): anything that touches the draft context's memory must call
+// Deferred MTP prompt pass (opt-in LLAMA_MTP_PIPE=1): anything that touches the draft context's memory must call
 // this first so a pending pass is submitted. No-op for contexts without a registered flush.
 void common_dft_flush(llama_context * ctx_dft);
 void common_dft_flush_register(llama_context * ctx_dft, std::function<void()> fn); // empty fn unregisters

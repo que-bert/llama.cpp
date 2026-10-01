@@ -2907,9 +2907,9 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
-        // LLAMA_NO_MTP_PIPE: with MTP speculation, decode one ubatch per llama_decode so the deferred MTP prompt pass of
+        // LLAMA_MTP_PIPE=1 (opt-in): with MTP speculation, decode one ubatch per llama_decode so the deferred MTP prompt pass of
         // ubatch N is submitted right behind ubatch N+1 (GPU never waits for the host MTP work)
-        const bool mtp_pipe = spec && !(getenv("LLAMA_NO_MTP_PIPE") && atoi(getenv("LLAMA_NO_MTP_PIPE")) != 0) && params_base.n_parallel == 1;
+        const bool mtp_pipe = spec && (getenv("LLAMA_MTP_PIPE") && atoi(getenv("LLAMA_MTP_PIPE")) != 0) && params_base.n_parallel == 1;
         const int32_t n_chunk_max = mtp_pipe ? std::min<int32_t>(llama_n_ubatch(ctx_tgt), n_batch) : n_batch;
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(std::min(n_batch, n_chunk_max), batch.size() - off);

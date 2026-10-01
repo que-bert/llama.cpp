@@ -1390,7 +1390,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_token last   = LLAMA_TOKEN_NULL;
         bool        full   = true;
     };
-    // deferred prompt pass (LLAMA_NO_MTP_PIPE=1 disables): process() of a large (prompt) batch only stashes the batch;
+    // deferred prompt pass (opt-in LLAMA_MTP_PIPE=1): process() of a large (prompt) batch only stashes the batch;
     // the pass runs in flush(), i.e. after the NEXT target decode was submitted, so the host work and the draft
     // graph overlap that target ubatch on the GPU instead of idling it. Needs the target's double-buffered nextn rows.
     bool pipe = false;
@@ -1552,8 +1552,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         {
-            const char * np = getenv("LLAMA_NO_MTP_PIPE");
-            pipe = !(np && atoi(np) != 0) && n_seq == 1 && !is_mem_shared && !chain_heads;
+            // opt-in: +0.5% prompt rate over KV-only alone, but changes draft trajectories on some prompts (MPH, pool corpus #14)
+            const char * np = getenv("LLAMA_MTP_PIPE");
+            pipe = (np && atoi(np) != 0) && n_seq == 1 && !is_mem_shared && !chain_heads;
             if (pipe) {
                 llama_set_nextn_dbuf(ctx_tgt, true);
                 common_dft_flush_register(ctx_dft, [this]() { flush(); });
