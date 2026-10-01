@@ -2697,6 +2697,17 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // optional: a smaller ubatch for the MTP draft context shrinks its compute buffer (the f16 KQ mask is
+    // n_ctx x n_ubatch, 256 MiB at ctx 262144 / ubatch 512). Draft prompt injection is chunked by n_ubatch.
+    if (spec_mtp) {
+        if (const char * e = std::getenv("LLAMA_DRAFT_UBATCH")) {
+            const int v = std::atoi(e);
+            if (v > 0) {
+                cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, (uint32_t) v);
+            }
+        }
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;

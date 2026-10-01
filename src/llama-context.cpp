@@ -765,6 +765,19 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::release_compute() {
+    synchronize();
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+    gf_res_reserve.reset();
+    sched.reset();
+    sched_need_reserve = true;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -4008,6 +4021,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_release_compute(llama_context * ctx) {
+    ctx->release_compute();
 }
 
 float * llama_get_logits(llama_context * ctx) {

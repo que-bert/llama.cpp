@@ -820,6 +820,13 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    // free the target/draft compute buffers while the (lazy) mmproj is resident; the next decode re-reserves them
+    static const bool release_compute = std::getenv("LLAMA_RELEASE_COMPUTE_ON_IMAGE") != nullptr;
+    if (release_compute) {
+        if (slot.ctx_tgt) { llama_release_compute(slot.ctx_tgt); }
+        if (slot.ctx_dft) { llama_release_compute(slot.ctx_dft); }
+    }
+
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
