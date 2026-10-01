@@ -3399,7 +3399,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_V64") == nullptr) {
             ggml_vk_create_pipeline2(device, device->pipeline_fa_dequant_q8_0_rdna4, "fa_dequant_q8_0_rdna4", fa_dequant_q8_0_rdna4_len, fa_dequant_q8_0_rdna4_data,
-                                     "main", 2, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true, true, 32);
+                                     "main", 2, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true, true, 32);
         }
     }
 #endif
@@ -6531,6 +6531,74 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
 }
 
 // glu_up != nullptr: fused FFN gate (src0) + up (glu_up) + swiglu into dst (the GLU node), RDNA4 Q6_K path only
+// FDO: issue the old-range K/V dequant of the NEXT prefill FA layer inside the barrier-free window of a large GEMM, so the
+// bandwidth-bound dequant shares the GPU with the issue-bound GEMM. Rows written by the ubatch (>= KV - N - 256, the 256 being the
+// KV padding) and anything after are dequantised by the FA itself (fdo_t0 .. NT). Kill: GGML_VK_NO_FDO=1.
+static void ggml_vk_fdo_issue(ggml_backend_vk_context * ctx, vk_context& subctx) {
+    const ggml_tensor * fa = ctx->fdo_next_fa;
+    ctx->fdo_next_fa = nullptr;
+    ctx->fdo_live_node = nullptr;
+    if (fa == nullptr || ctx->device->architecture != vk_device_architecture::AMD_RDNA4) {
+        return;
+    }
+    const ggml_tensor * q = fa->src[0];
+    const ggml_tensor * k = fa->src[1];
+    const ggml_tensor * v = fa->src[2];
+    if (q == nullptr || k == nullptr || v == nullptr) {
+        return;
+    }
+    const int64_t N = q->ne[1];
+    if (N < 64 || k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q8_0 ||
+        q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[2] != v->ne[2] || k->ne[2] == 0 || q->ne[2] % k->ne[2] != 0) {
+        return;
+    }
+    const uint32_t G = (uint32_t)(q->ne[2] / k->ne[2]);
+    if (G < 1 || G > 6 || ctx->device->pipeline_fa_prefill_rdna4_v64[G] == nullptr || ctx->device->pipeline_fa_dequant_q8_0_rdna4 == nullptr) {
+        return;
+    }
+    auto dense = [](const ggml_tensor * t) {
+        return t->nb[0] == ggml_type_size(t->type) && t->nb[2] == ggml_row_size(t->type, t->ne[0]) && t->nb[1] == t->nb[2] * t->ne[2];
+    };
+    if (!dense(k) || !dense(v) || (k->nb[1] % 16) != 0 || (v->nb[1] % 16) != 0) {
+        return;
+    }
+    const uint32_t KV = (uint32_t)k->ne[1];
+    const int64_t late = N + 256;
+    if ((int64_t)KV < late + 64) {
+        return;
+    }
+    const uint32_t t0 = (uint32_t)(((int64_t)KV - late) / 32);
+    const uint32_t NT = CEIL_DIV(KV, 32);
+    const uint64_t fp = sizeof(ggml_fp16_t);
+    const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
+    const uint64_t v_f16_sz = (uint64_t)NT * 32 * 256 * v->ne[2] * fp;
+    // never grow the scratch here (it is live for the previous layer's FA); the FA path sizes it on its first use
+    if (ctx->prealloc_x == nullptr || ctx->prealloc_size_x < k_f16_sz + v_f16_sz || ctx->prealloc_x->size < k_f16_sz + v_f16_sz) {
+        return;
+    }
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    if ((k_buf.offset % 16) != 0 || (v_buf.offset % 16) != 0) {
+        return;
+    }
+    vk_pipeline dq = ctx->device->pipeline_fa_dequant_q8_0_rdna4;
+    ggml_pipeline_request_descriptor_sets(ctx, dq, 2);
+    if (ctx->prealloc_x_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);   // the previous FA layer may still be reading the scratch
+    }
+    vk_subbuffer k_dst = vk_subbuffer{ ctx->prealloc_x, 0,        k_f16_sz };
+    vk_subbuffer v_dst = vk_subbuffer{ ctx->prealloc_x, k_f16_sz, v_f16_sz };
+    const uint32_t nh = (uint32_t)k->ne[2];
+    { const std::array<uint32_t, 5> dpc = { nh, KV, NT, 0u, 0u };
+      ggml_vk_dispatch_pipeline(ctx, subctx, dq, { k_buf, k_dst }, dpc, { nh, t0, 1u }); }
+    { const std::array<uint32_t, 5> dpc = { nh, KV, NT, 1u, 0u };
+      ggml_vk_dispatch_pipeline(ctx, subctx, dq, { v_buf, v_dst }, dpc, { nh, t0, 1u }); }
+    ctx->prealloc_x_need_sync = true;
+    ctx->fdo_live_node = fa;
+    ctx->fdo_t0 = t0;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, const ggml_tensor * glu_up = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -6764,7 +6832,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(d_Qy != nullptr);
     }
     if (qx_needs_dequant) {
-        d_X = ctx->prealloc_x;
+        d_X = ctx->prealloc_x; ctx->fdo_live_node = nullptr;
         GGML_ASSERT(d_X->size >= x_sz);
     } else {
         d_X = d_Qx;
@@ -6832,6 +6900,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
+    }
+
+    if (ctx->fdo_next_fa != nullptr) {
+        static const uint64_t fdo_min_elems = getenv("GGML_VK_FDO_MIN_ELEMS") ? strtoull(getenv("GGML_VK_FDO_MIN_ELEMS"), nullptr, 10) : 50000000ull;
+        if ((uint64_t)ggml_nelements(src0) >= fdo_min_elems) {
+            ggml_vk_fdo_issue(ctx, subctx);
+        }
     }
 
     const bool use_q6k_f16   = want_q6k_f16 && !qx_needs_dequant && d_Y == ctx->prealloc_y && y_buf_offset == 0;
@@ -7138,7 +7213,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     vk_subbuffer d_X, d_Y;
 
     if (qx_needs_dequant) {
-        d_X = { ctx->prealloc_x, 0, ctx->prealloc_x->size };
+        d_X = { ctx->prealloc_x, 0, ctx->prealloc_x->size }; ctx->fdo_live_node = nullptr;
     } else {
         d_X = d_Qx;
         GGML_ASSERT(qx_sz == x_sz);
@@ -7959,7 +8034,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         GGML_ASSERT(d_ids != nullptr);
     }
     if (qx_needs_dequant) {
-        d_X = ctx->prealloc_x;
+        d_X = ctx->prealloc_x; ctx->fdo_live_node = nullptr;
         GGML_ASSERT(d_X->size >= x_sz);
     } else {
         d_X = d_Qx;
@@ -8206,7 +8281,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     vk_subbuffer d_X, d_Y;
 
     if (qx_needs_dequant) {
-        d_X = { ctx->prealloc_x, 0, ctx->prealloc_x->size };
+        d_X = { ctx->prealloc_x, 0, ctx->prealloc_x->size }; ctx->fdo_live_node = nullptr;
     } else {
         d_X = d_Qx;
     }
@@ -8748,15 +8823,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
                 ggml_vk_preallocate_buffers(ctx, subctx);
             }
+            // FDO: tiles [0, fdo_t0) were already dequantised into this scratch while a GEMM ran
+            const bool fdo_live = ctx->fdo_live_node == dst && ctx->fdo_t0 < NT && nek3 == 1 && nev3 == 1;
+            const uint32_t fdo_t0 = fdo_live ? ctx->fdo_t0 : 0u;
+            ctx->fdo_live_node = nullptr;
             if (ctx->prealloc_x_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
             vk_subbuffer k_dst = vk_subbuffer{ ctx->prealloc_x, 0,        k_f16_sz };
             vk_subbuffer v_dst = vk_subbuffer{ ctx->prealloc_x, k_f16_sz, v_f16_sz };
-            { const std::array<uint32_t, 4> dpc = { (uint32_t)nek2, KV, NT, 0u };
-              ggml_vk_dispatch_pipeline(ctx, subctx, dq, { k_buf, k_dst }, dpc, { (uint32_t)nek2, NT, (uint32_t)nek3 }); }
-            { const std::array<uint32_t, 4> dpc = { (uint32_t)nev2, KV, NT, 1u };
-              ggml_vk_dispatch_pipeline(ctx, subctx, dq, { v_buf, v_dst }, dpc, { (uint32_t)nev2, NT, (uint32_t)nev3 }); }
+            { const std::array<uint32_t, 5> dpc = { (uint32_t)nek2, KV, NT, 0u, fdo_t0 };
+              ggml_vk_dispatch_pipeline(ctx, subctx, dq, { k_buf, k_dst }, dpc, { (uint32_t)nek2, NT - fdo_t0, (uint32_t)nek3 }); }
+            { const std::array<uint32_t, 5> dpc = { (uint32_t)nev2, KV, NT, 1u, fdo_t0 };
+              ggml_vk_dispatch_pipeline(ctx, subctx, dq, { v_buf, v_dst }, dpc, { (uint32_t)nev2, NT - fdo_t0, (uint32_t)nev3 }); }
             ggml_vk_sync_buffers(ctx, subctx);
             if (vk_perf_logger_enabled && !vk_perf_logger_concurrent && ctx->query_pool && ctx->query_idx < ctx->num_queries) {
                 ctx->query_nodes[ctx->query_idx] = dst;
@@ -12105,6 +12184,7 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
             ggml_vk_sync_buffers(ctx, subctx);
         }
 
+        ctx->fdo_live_node = nullptr;
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
 
@@ -12290,6 +12370,7 @@ void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
+        ctx->fdo_live_node = nullptr;
         subbuf1 = { ctx->prealloc_x, 0, ctx->prealloc_x->size };
     }
 
@@ -12450,12 +12531,14 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
             pc2.first_pass = 1;
             src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
         } else {
+            ctx->fdo_live_node = nullptr;
             src_buf = { ctx->prealloc_x, dbl_buf_index * dbl_buf_size, dbl_buf_size };
         }
         if (num_dst_elements == k) {
             pc2.last_pass = 1;
             dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
         } else {
+            ctx->fdo_live_node = nullptr;
             dst_buf = { ctx->prealloc_x, (dbl_buf_index ^ 1) * dbl_buf_size, dbl_buf_size };
         }
 
@@ -12513,6 +12596,7 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
         1,
     };
+    ctx->fdo_live_node = nullptr;
     vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -12632,6 +12716,7 @@ void ggml_vk_cross_entropy_loss(ggml_backend_vk_context * ctx, vk_context& subct
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
+    ctx->fdo_live_node = nullptr;
     vk_subbuffer tmp_buf = { ctx->prealloc_x, 0, tmp_size };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, tmp_buf }, pc, ggml_vk_nrows_elements(nrows));
     ggml_vk_sync_buffers(ctx, subctx);
@@ -13741,6 +13826,13 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+
+        ctx->fdo_next_fa = nullptr;
+        if (ctx->fdo_enabled && src0->ne[1] >= 64) {
+            for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+                if (cgraph->nodes[j]->op == GGML_OP_FLASH_ATTN_EXT) { ctx->fdo_next_fa = cgraph->nodes[j]; break; }
+            }
+        }
 
         break;
 
@@ -15381,6 +15473,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->graph_seq++;
+    ctx->fdo_next_fa = nullptr;
+    ctx->fdo_live_node = nullptr;
+    if (ctx->fdo_enabled) {
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * fn = cgraph->nodes[j];
+            if (fn->op == GGML_OP_FLASH_ATTN_EXT) {
+                if (fn->src[0]->ne[1] >= 64) { ctx->fdo_next_fa = fn; }
+                break;
+            }
+        }
+    }
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 

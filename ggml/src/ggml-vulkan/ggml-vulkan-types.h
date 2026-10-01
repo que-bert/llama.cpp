@@ -1310,6 +1310,11 @@ struct ggml_backend_vk_context {
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
     bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync;
+    // FDO: early K/V dequant of the next prefill FA layer (see ggml_vk_fdo_issue)
+    const ggml_tensor * fdo_next_fa   = nullptr;  // next FLASH_ATTN_EXT node, armed after the previous one is encoded
+    const ggml_tensor * fdo_live_node = nullptr;  // FA node whose old-range K/V f16 scratch is already (being) written
+    bool                fdo_enabled   = getenv("GGML_VK_NO_FDO") == nullptr;
+    uint32_t            fdo_t0        = 0;        // first 32-kv tile NOT covered by the early dequant
 
     vk_context_ref compute_ctx;
 

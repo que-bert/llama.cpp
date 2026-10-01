@@ -15,7 +15,7 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform parameter { uint NH; uint KV; uint NT; uint mode; } p;
+layout(push_constant) uniform parameter { uint NH; uint KV; uint NT; uint mode; uint t0; } p;
 
 // q8_0 block = f16 d + 32 x int8 = 34 bytes; one (kv, head) row = 8 blocks = 272 bytes = 17 uvec4
 layout(binding = 0) readonly buffer A { uvec4 data_a[]; };
@@ -26,7 +26,7 @@ shared uvec4 sRaw[32 * 17];                    // the tile's 32 raw q8_0 rows
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint h = gl_WorkGroupID.x, t = gl_WorkGroupID.y, ns = gl_WorkGroupID.z;   // heads fastest: adjacent WGs read adjacent 272-byte rows
+    const uint h = gl_WorkGroupID.x, t = gl_WorkGroupID.y + p.t0, ns = gl_WorkGroupID.z;   // heads fastest: adjacent WGs read adjacent 272-byte rows
     const uint NH = p.NH, KV = p.KV;
     const bool vmode = p.mode != 0;
 
