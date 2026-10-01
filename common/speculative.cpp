@@ -1785,13 +1785,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t n_rows_all = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // MFL: a prompt-sized batch is never verified, only its last row seeds the next draft; keep just that row
+            static const bool mfl_on = !(getenv("LLAMA_NO_MFL") && atoi(getenv("LLAMA_NO_MFL")) != 0);
+            const int32_t row_skip = (mfl_on && n_rows_all > 64) ? n_rows_all - 1 : 0;
+            const int32_t n_rows = n_rows_all - row_skip;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = h_rows ? h_rows + (size_t) (i_batch_beg[seq_id] + i) * n_embd
-                                         : llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const int32_t ib = i_batch_beg[seq_id] + row_skip + i;
+                const float * h = h_rows ? h_rows + (size_t) ib * n_embd
+                                         : llama_get_embeddings_nextn_ith(ctx_tgt, ib);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 

@@ -753,7 +753,15 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
+    // MFL: a ubatch over a contiguous run of the batch's embeddings points into the batch instead of copying them
+    // (the batch outlives the decode call; LLAMA_NO_MFL=1 reverts to the copy)
+    static const bool mfl_on = !(getenv("LLAMA_NO_MFL") && atoi(getenv("LLAMA_NO_MFL")) != 0);
+    bool embd_view = mfl_on && batch.embd && n_tokens > 0;
+    for (size_t i = 1; embd_view && i < idxs.size(); ++i) {
+        embd_view = idxs[i] == idxs[i - 1] + 1;
+    }
+
+    const int64_t n_embd_all = (batch.embd && !embd_view) ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -774,7 +782,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (batch.embd) {
+        if (batch.embd && !embd_view) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -824,7 +832,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.embd         =*/ batch.embd ? (embd_view ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data()) : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

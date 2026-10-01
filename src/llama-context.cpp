@@ -1835,6 +1835,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    ldt_trace(this,"D0");
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -1870,13 +1871,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
+    ldt_trace(this,"D1");
     sched_reserve();
+    ldt_trace(this,"D2");
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
 
+    ldt_trace(this,"D3");
     llama_memory_context_ptr mctx;
 
     while (true) {
@@ -1922,6 +1926,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    ldt_trace(this,"D4");
     // reserve output buffer
     n_decode_calls++;
 
@@ -1930,6 +1935,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -2;
     };
 
+    ldt_trace(this,"D5");
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
