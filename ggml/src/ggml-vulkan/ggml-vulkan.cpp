@@ -348,6 +348,8 @@ struct vk_step_timing {
     int  n       = 0;
     int64_t t_last_exit = 0;   // last time the host left a blocking backend call
     int64_t t_enter = 0, t_first_submit = 0, t_exit = 0;
+    int64_t t_prepass = 0, t_xfer = 0, t_prealloc = 0; int first_node = 0;
+    double ph_prepass = 0, ph_xfer = 0, ph_prealloc = 0, ph_loop = 0, ph_fnode = 0; uint64_t ph_n = 0;
     int     cur_nodes = -1;
     int     cur_nsub = 0;
     std::map<int, agg> by_nodes;
@@ -369,6 +371,7 @@ struct vk_step_timing {
             fprintf(stderr, "VK_STEP_TIMING %6d %6llu %8.1f %8.1f %8.1f %8.1f %8.1f %5.1f %5.1f\n", kv.first, (unsigned long long) a.cnt,
                 a.gap/c/1e3, a.pre/c/1e3, a.rec/c/1e3, a.wait/c/1e3, a.sync/c/1e3, a.nsub/c, 100.0*a.late/c);
         }
+        if (ph_n) { fprintf(stderr, "VK_STEP_TIMING_PRE (us mean over %llu) prepass %.1f xfer %.1f prealloc %.1f first_batch_loop %.1f first_batch_nodes %.1f\n", (unsigned long long) ph_n, ph_prepass/ph_n/1e3, ph_xfer/ph_n/1e3, ph_prealloc/ph_n/1e3, ph_loop/ph_n/1e3, ph_fnode/ph_n); ph_prepass = ph_xfer = ph_prealloc = ph_loop = ph_fnode = 0; ph_n = 0; }
         if (n_rd) { fprintf(stderr, "VK_STEP_TIMING buffer_read cnt %llu mean %.1f us\n", (unsigned long long) n_rd, t_rd/n_rd/1e3); }
         fflush(stderr);
         by_nodes.clear(); n = 0; n_rd = 0; t_rd = 0;
@@ -11145,17 +11148,38 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
     if (!any) {
         return;
     }
-    std::unordered_map<const ggml_tensor *, int> idx;
-    std::unordered_map<const ggml_tensor *, std::vector<int>> cpys_of; // CPY nodes keyed by their src's view_src
+    // VSUB: no per-node hash map. use counts come from the graph's own hash set, and only the CPY / GET_ROWS /
+    // GDN-view nodes (a few hundred) are indexed. GGML_VK_NO_VSUB=1 restores the original full-graph maps.
+    static const bool fast = getenv("GGML_VK_NO_VSUB") == nullptr;
+    static thread_local std::unordered_map<const ggml_tensor *, int> idx;
+    static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> cpys_of; // CPY nodes keyed by their src's view_src
+    static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> views_of; // nodes viewing a GDN node
+    idx.clear();
+    cpys_of.clear();
+    views_of.clear();
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
-        idx[n] = i;
+        if (!fast) {
+            idx[n] = i;
+        } else if (n->op == GGML_OP_CPY || n->op == GGML_OP_GET_ROWS) {
+            idx[n] = i;
+        }
         if (n->op == GGML_OP_CPY && n->src[0]->view_src) {
             cpys_of[n->src[0]->view_src].push_back(i);
+        }
+        if (fast && n->view_src && n->view_src->op == GGML_OP_GATED_DELTA_NET) {
+            views_of[n->view_src].push_back(i);
         }
     }
     auto base_of = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
     auto uses = [&](const ggml_tensor * t) -> int {
+        if (fast) {
+            if (t->op == GGML_OP_NONE) {
+                return -1;  // leaf
+            }
+            const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+            return ggml_bitset_get(cgraph->visited_hash_set.used, pos) ? cgraph->use_counts[pos] : -1;
+        }
         auto it = idx.find(t);
         return it == idx.end() ? -1 : ggml_node_get_use_count(cgraph, it->second);
     };
@@ -11238,10 +11262,23 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
             }
             // nothing else may read the snapshot region of the GDN output
             bool ok = true;
-            for (int j = 0; j < cgraph->n_nodes && ok; ++j) {
-                const ggml_tensor * w = cgraph->nodes[j];
-                if (w != sv && w->view_src == n && w->view_offs + ggml_nbytes(w) > s_off_b) {
-                    ok = false;
+            if (fast) {
+                auto vit = views_of.find(n);
+                if (vit != views_of.end()) {
+                    for (int j : vit->second) {
+                        const ggml_tensor * w = cgraph->nodes[j];
+                        if (w != sv && w->view_offs + ggml_nbytes(w) > s_off_b) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (int j = 0; j < cgraph->n_nodes && ok; ++j) {
+                    const ggml_tensor * w = cgraph->nodes[j];
+                    if (w != sv && w->view_src == n && w->view_offs + ggml_nbytes(w) > s_off_b) {
+                        ok = false;
+                    }
                 }
             }
             if (!ok) {
@@ -15481,6 +15518,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ggml_vk_gdn_cache_prepass(ctx, cgraph);
+    if (vk_st.enabled) { vk_st.t_prepass = vk_step_timing::now(); }
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -15497,6 +15535,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     int submit_node_idx = 0; // index to first node in a batch
 
     ggml_vk_submit_transfer_ctx(ctx);
+    if (vk_st.enabled) { vk_st.t_xfer = vk_step_timing::now(); }
 
     vk_context compute_ctx;
     if (vk_perf_logger_enabled) {
@@ -15541,6 +15580,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
+    if (vk_st.enabled) { vk_st.t_prealloc = vk_step_timing::now(); }
+
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
     // Estimate the amount of compute work using flops, and submit every 200 GFLOP
     // (and scaled down based on total graph flops, so smaller models submit earlier).
@@ -15583,7 +15624,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->device->diag_prev_end = end;
         }
         if (vk_st.enabled) {
-            if (vk_st.cur_nsub == 0) { vk_st.t_first_submit = vk_step_timing::now(); }
+            if (vk_st.cur_nsub == 0) {
+                vk_st.t_first_submit = vk_step_timing::now();
+                vk_st.first_node = end + 1;
+                if (vk_st.cur_nodes > 2000) {
+                    vk_st.ph_n++;
+                    vk_st.ph_prepass += vk_st.t_prepass - vk_st.t_enter;
+                    vk_st.ph_xfer += vk_st.t_xfer - vk_st.t_prepass;
+                    vk_st.ph_prealloc += vk_st.t_prealloc - vk_st.t_xfer;
+                    vk_st.ph_loop += vk_st.t_first_submit - vk_st.t_prealloc;
+                    vk_st.ph_fnode += vk_st.first_node;
+                }
+            }
             vk_st.cur_nsub++;
         }
         first_node_in_batch = true;
