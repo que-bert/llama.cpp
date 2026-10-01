@@ -40,7 +40,18 @@
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint WG = 384;   // 64 * G
 layout(constant_id = 1) const uint G  = 6;     // q heads per KV head (even)
-layout(constant_id = 2) const uint DIAG = 0;   // diagnostics only: 1 no QK MMA, 2 no PV MMA, 4 no global loads after tile 0
+layout(constant_id = 2) const uint DIAG = 0;   // diagnostics only: 1 no QK MMA, 2 no PV MMA, 4 no global loads after tile 0, 8 no K frag LDS loads, 16 no V frag LDS loads, 32 no O rescale
+// FPQ: number of independent S^T accumulator chains (1, 2 or 4). The QK product is a 16-deep
+// dependent WMMA chain on one accumulator; splitting it (summed before the softmax) lets
+// consecutive WMMAs issue without waiting on the previous result. Measured null (probe only:
+// GGML_VK_FPQ_NS=2|4); default 1 = the original single chain.
+layout(constant_id = 3) const uint NS = 1;
+// FOV: 1 = lazy O rescale (the running max m_i only moves when a tile's max exceeds it by more
+// than TAU, so P <= e^TAU and alpha == 1 on most tiles: no O rescale, no sA/sR traffic) plus
+// loop-invariant per-thread prefetch offsets (one scalar tile offset per load instead of the
+// clamped index math). 0 = the original schedule (GGML_VK_NO_FOV=1).
+layout(constant_id = 4) const uint FOV = 1;
+const float TAU = 8.0;
 
 const uint D   = 256;
 const uint BC  = 32;
@@ -64,9 +75,16 @@ layout(push_constant) uniform parameter {
 } p;
 
 layout(binding = 0) readonly buffer Q { vec4 data_q[]; };
-layout(binding = 1) readonly buffer K { uvec4 data_k[]; };
-layout(binding = 2) readonly buffer V { uvec4 data_v[]; };
-layout(binding = 3) readonly buffer M { float16_t data_m[]; };
+// FOV_PIN (the _v64p build, used when FOV is on): volatile K/V/mask loads are not reorderable, so
+// NIR does not sink the register prefetch from A(j) to the end of B(j), where it hid no latency.
+#ifdef FOV_PIN
+#define PFQ volatile readonly
+#else
+#define PFQ readonly
+#endif
+layout(binding = 1) PFQ buffer K { uvec4 data_k[]; };
+layout(binding = 2) PFQ buffer V { uvec4 data_v[]; };
+layout(binding = 3) PFQ buffer M { float16_t data_m[]; };
 layout(binding = 4) writeonly buffer O { float data_o[]; };
 
 shared uvec4 sK[BC * KSTR];                    // K tile (also Q staging and O staging)
@@ -75,7 +93,7 @@ shared uvec4 sP[16 * G * PSTR];                // P, f16
 shared vec4  sA[G * 64];                       // per row tile 16x16 broadcast of row factor
 shared float16_t sM[PQ * MSTR];                  // mask tile
 shared float sMx[NW * 16];                     // per-wave partial row max (later: partial l)
-shared uint  sR[NW];                           // per-wave "row max changed"
+shared uvec4 sR4[(NW + 3) / 4];                // per-wave "row max changed" (wave w: sR4[w/4][w%4])
 
 #define MATA  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define MATB  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
@@ -147,7 +165,10 @@ void main() {
 // makes ACO wait for each load right away (the else-path write is a WAW on the load's VGPRs), which
 // serialized the register prefetch in the base kernel. Out-of-range K/V rows read row KV-1 (finite;
 // their columns are masked to -inf, so P = 0); out-of-range mask entries are fixed up at staging.
-#define PREFETCH_K(j) { \
+#define PREFETCH_K(j) if (FOV != 0) { \
+        const uint ko_ = min((j), nj - 1) * BC * p.k_s1; \
+        [[unroll]] for (uint i = 0; i < NLK; ++i) prk[i] = data_k[kofs[i] + ko_]; \
+    } else { \
         const uint kv0_ = (j) * BC; \
         [[unroll]] for (uint i = 0; i < NLK; ++i) { \
             const uint e = min(tid + i * WG, BC * 32 - 1); \
@@ -174,7 +195,13 @@ void main() {
         } \
     }
 
-#define PREFETCH_M(j) { \
+#define PREFETCH_M(j) if (FOV != 0) { \
+        const uint mo_ = min((j), nj - 1) * BC; \
+        [[unroll]] for (uint i = 0; i < NML; ++i) { \
+            pm[i][0] = data_m[has_mask ? mofs[i] + mo_     : 0]; \
+            pm[i][1] = data_m[has_mask ? mofs[i] + mo_ + 1 : 0]; \
+        } \
+    } else { \
         const uint kv0_ = (j) * BC; \
         [[unroll]] for (uint i = 0; i < NML; ++i) { \
             const uint e = min(tid + i * WG, PQ * BC / 2 - 1); \
@@ -216,6 +243,20 @@ void main() {
         if (lane < 16) sMx[wave * 16 + lane] = mxo; \
     }
 
+    // FOV: per-thread loop-invariant prefetch offsets. The tile index is clamped to the last tile;
+    // rows past KV inside the last tile read the next head's rows (or 0 past the binding: robust
+    // buffer descriptors), always finite, and their columns are masked to -inf at staging.
+    uint kofs[NLK];
+    uint mofs[NML];
+    [[unroll]] for (uint i = 0; i < NLK; ++i) {
+        const uint e = min(tid + i * WG, BC * 32 - 1);
+        kofs[i] = k_base + (e >> 5) * p.k_s1 + (e & 31);
+    }
+    [[unroll]] for (uint i = 0; i < NML; ++i) {
+        const uint e = min(tid + i * WG, PQ * BC / 2 - 1);
+        mofs[i] = m_base + min(p0 + (e >> 4), N - 1) * p.m_s1 + (e & 15) * 2;
+    }
+
     PREFETCH_K(0)
     PREFETCH_M(0)
     STAGE_K
@@ -225,12 +266,15 @@ void main() {
     PREFETCH_M(1)
     barrier();
     {
-        MATC Sacc = MATC(0.0);
+        MATC Sc[NS];
+        [[unroll]] for (uint c = 0; c < NS; ++c) Sc[c] = MATC(0.0);
         [[unroll]] for (uint k = 0; k < 16; ++k) {
             MATA Kf;
             coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutRowMajor);
-            Sacc = coopMatMulAdd(Kf, Qf[k], Sacc);
+            Sc[k % NS] = coopMatMulAdd(Kf, Qf[k], Sc[k % NS]);
         }
+        MATC Sacc = Sc[0];
+        [[unroll]] for (uint c = 1; c < NS; ++c) Sacc = Sacc + Sc[c];
         S_FINISH(Sacc)
     }
     barrier();
@@ -238,7 +282,9 @@ void main() {
     for (uint j = 0; j < nj; ++j) {
         // ---- A(j): finish online softmax of tile j in registers, f32
         {
-            const float m_new = max(m_i, max(mxo, sMx[(wave ^ 1) * 16 + lr]));
+            const float m_c = max(m_i, max(mxo, sMx[(wave ^ 1) * 16 + lr]));
+            // FOV: both waves of a row pair see the same m_i and tile max, so they agree on m_new
+            const float m_new = (FOV != 0 && m_c <= m_i + TAU) ? m_i : m_c;
             const float alpha = exp(m_i - m_new);
             float rs = 0.0;
             f16vec2 ph[4];
@@ -252,11 +298,12 @@ void main() {
             m_i = m_new;
             sP[(t * 16 + lr) * PSTR + (lc >> 3)] = uvec4(packFloat2x16(ph[0]), packFloat2x16(ph[1]),
                                                          packFloat2x16(ph[2]), packFloat2x16(ph[3]));
-            if (half_ == 0 && lane < 16) {
+            const bool resc = subgroupAny(alpha != 1.0);
+            // FOV: alpha is the same in both waves of the pair; sA is only read when resc is set
+            if (half_ == 0 && lane < 16 && (FOV == 0 || resc)) {
                 [[unroll]] for (uint q = 0; q < 4; ++q) sA[t * 64 + lr * 4 + q] = vec4(alpha);
             }
-            const bool resc = subgroupAny(alpha != 1.0);
-            if (lane == 0) sR[wave] = resc ? 1u : 0u;
+            if (lane == 0) sR4[wave >> 2][wave & 3] = resc ? 1u : 0u;
         }
         STAGE_K
         STAGE_V
@@ -269,35 +316,58 @@ void main() {
         barrier();
 
         // ---- B(j): rescale, PV(j) for row tiles (pt0, pt0+1) x hsv quarter pq, and S^T(j+1)
+        // FOV: one 16-byte sR read for both row tiles, issued together with the kk = 0 P/V fragment
+        // loads so the rescale branch waits only for the flags, not for a serial LDS round trip each.
+        MATA Pa0, Pa1;
+        MATB Va[4];
+        uvec4 rf = uvec4(0);
+        if (FOV != 0) {
+            rf = sR4[pt0 >> 1];                // waves 2 pt0 .. 2 pt0 + 3 (pt0 even)
+            coopMatLoad(Pa0, sP, (pt0 * 16) * PSTR, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(Pa1, sP, (pt0 * 16 + 16) * PSTR, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                coopMatLoad(Va[i], sVt, (pq * 64 + i * 16) * VSTR, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+        }
         [[unroll]] for (uint r = 0; r < 2; ++r) {
             const uint tr = pt0 + r;
-            if ((sR[2 * tr] | sR[2 * tr + 1]) != 0) {
+            const bool rs_ = FOV != 0 ? (r == 0 ? (rf.x | rf.y) : (rf.z | rf.w)) != 0
+                                      : (sR4[(2 * tr) >> 2][(2 * tr) & 3] | sR4[(2 * tr + 1) >> 2][(2 * tr + 1) & 3]) != 0;
+            if ((DIAG & 32) == 0 && rs_) {
                 MATC Am;
                 coopMatLoad(Am, sA, tr * 64, 4, gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint i = 0; i < 4; ++i) Oacc[r * 4 + i] = Oacc[r * 4 + i] * Am;
             }
         }
         {
-            MATC Sacc = MATC(0.0);
+            MATC Sc[NS];
+            [[unroll]] for (uint c = 0; c < NS; ++c) Sc[c] = MATC(0.0);
             [[unroll]] for (uint kk = 0; kk < 2; ++kk) {
                 MATA Pf0, Pf1;
-                coopMatLoad(Pf0, sP, (pt0 * 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
-                coopMatLoad(Pf1, sP, (pt0 * 16 + 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+                if (FOV != 0 && kk == 0) {
+                    Pf0 = Pa0; Pf1 = Pa1;
+                } else {
+                    coopMatLoad(Pf0, sP, (pt0 * 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(Pf1, sP, (pt0 * 16 + 16) * PSTR + kk * 2, PSTR, gl_CooperativeMatrixLayoutRowMajor);
+                }
                 [[unroll]] for (uint i = 0; i < 4; ++i) {
-                    MATB Vf;
-                    coopMatLoad(Vf, sVt, (pq * 64 + i * 16) * VSTR + kk * 2, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
+                    MATB Vf = MATB(float16_t(0.001));
+                    if (FOV != 0 && kk == 0) Vf = Va[i];
+                    else if ((DIAG & 16) == 0) coopMatLoad(Vf, sVt, (pq * 64 + i * 16) * VSTR + kk * 2, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
                     if ((DIAG & 2) == 0) {
                         Oacc[i]     = coopMatMulAdd(Pf0, Vf, Oacc[i]);
                         Oacc[4 + i] = coopMatMulAdd(Pf1, Vf, Oacc[4 + i]);
                     }
                     [[unroll]] for (uint h = 0; h < 2; ++h) {
                         const uint k = kk * 8 + i * 2 + h;
-                        MATA Kf;
-                        coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutRowMajor);
-                        if ((DIAG & 1) == 0) Sacc = coopMatMulAdd(Kf, Qf[k], Sacc);
+                        MATA Kf = MATA(float16_t(0.001));
+                        if ((DIAG & 8) == 0) coopMatLoad(Kf, sK, (half_ * 16) * KSTR + k * 2, KSTR, gl_CooperativeMatrixLayoutRowMajor);
+                        if ((DIAG & 1) == 0) Sc[k % NS] = coopMatMulAdd(Kf, Qf[k], Sc[k % NS]);
                     }
                 }
             }
+            MATC Sacc = Sc[0];
+            [[unroll]] for (uint c = 1; c < NS; ++c) Sacc = Sacc + Sc[c];
             S_FINISH(Sacc)
         }
         barrier();
