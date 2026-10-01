@@ -3387,10 +3387,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         if (fpq_ns != 1 && fpq_ns != 2 && fpq_ns != 4) { fpq_ns = 1; }
                         // FOV: lazy O rescale (TAU = 8) + loop-invariant prefetch offsets; GGML_VK_NO_FOV=1 reverts
                         const uint32_t fov = getenv("GGML_VK_NO_FOV") == nullptr ? 1u : 0u;
+                        // FV2: base-2 softmax + invariant staging addresses; GGML_VK_NO_FV2=1 reverts to FOV
+                        const uint32_t fv2 = getenv("GGML_VK_NO_FV2") == nullptr ? 1u : 0u;
                         ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
                                                  fov ? flash_attn_prefill_rdna4_v64p_cm1_len : flash_attn_prefill_rdna4_v64_cm1_len,
                                                  fov ? flash_attn_prefill_rdna4_v64p_cm1_data : flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
-                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag, fpq_ns, fov}, 1, true, true, 32);
+                                                 sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag, fpq_ns, fov, fv2}, 1, true, true, 32);
                     }
                 }
             }
