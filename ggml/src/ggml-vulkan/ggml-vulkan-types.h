@@ -1358,12 +1358,6 @@ struct ggml_backend_vk_context {
     std::unordered_set<const ggml_tensor *> gdn_skip_nodes;
     std::unordered_map<const ggml_tensor *, vk_gdn_cache_fuse> gdn_cache_fuse;
     const vk_gdn_cache_fuse * cur_gdn_cache_fuse {};
-    // VSUB: memoized gdn prepass results keyed by a structural hash of the graph
-    struct vk_gdn_prepass_entry {
-        std::unordered_set<const ggml_tensor *> skip;
-        std::unordered_map<const ggml_tensor *, vk_gdn_cache_fuse> fuse;
-    };
-    std::unordered_map<uint64_t, vk_gdn_prepass_entry> gdn_prepass_cache;
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

@@ -11106,7 +11106,7 @@ static bool ggml_vk_gdn_find_gate(const ggml_tensor * n, UsesFn && uses, const g
 }
 
 // Find the GDN recurrent-cache patterns (see vk_gdn_cache_fuse) in this graph.
-static void ggml_vk_gdn_cache_prepass_compute(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->gdn_skip_nodes.clear();
     ctx->gdn_cache_fuse.clear();
     static const bool disabled = getenv("GGML_VK_NO_GDN_CACHE") != nullptr;
@@ -11120,17 +11120,38 @@ static void ggml_vk_gdn_cache_prepass_compute(ggml_backend_vk_context * ctx, con
     if (!any) {
         return;
     }
-    std::unordered_map<const ggml_tensor *, int> idx;
-    std::unordered_map<const ggml_tensor *, std::vector<int>> cpys_of; // CPY nodes keyed by their src's view_src
+    // VSUB: no per-node hash map. use counts come from the graph's own hash set, and only the CPY / GET_ROWS /
+    // GDN-view nodes (a few hundred) are indexed. GGML_VK_NO_VSUB=1 restores the original full-graph maps.
+    static const bool fast = getenv("GGML_VK_NO_VSUB") == nullptr;
+    static thread_local std::unordered_map<const ggml_tensor *, int> idx;
+    static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> cpys_of; // CPY nodes keyed by their src's view_src
+    static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> views_of; // nodes viewing a GDN node
+    idx.clear();
+    cpys_of.clear();
+    views_of.clear();
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
-        idx[n] = i;
+        if (!fast) {
+            idx[n] = i;
+        } else if (n->op == GGML_OP_CPY || n->op == GGML_OP_GET_ROWS) {
+            idx[n] = i;
+        }
         if (n->op == GGML_OP_CPY && n->src[0]->view_src) {
             cpys_of[n->src[0]->view_src].push_back(i);
+        }
+        if (fast && n->view_src && n->view_src->op == GGML_OP_GATED_DELTA_NET) {
+            views_of[n->view_src].push_back(i);
         }
     }
     auto base_of = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
     auto uses = [&](const ggml_tensor * t) -> int {
+        if (fast) {
+            if (t->op == GGML_OP_NONE) {
+                return -1;  // leaf
+            }
+            const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+            return ggml_bitset_get(cgraph->visited_hash_set.used, pos) ? cgraph->use_counts[pos] : -1;
+        }
         auto it = idx.find(t);
         return it == idx.end() ? -1 : ggml_node_get_use_count(cgraph, it->second);
     };
@@ -11213,10 +11234,23 @@ static void ggml_vk_gdn_cache_prepass_compute(ggml_backend_vk_context * ctx, con
             }
             // nothing else may read the snapshot region of the GDN output
             bool ok = true;
-            for (int j = 0; j < cgraph->n_nodes && ok; ++j) {
-                const ggml_tensor * w = cgraph->nodes[j];
-                if (w != sv && w->view_src == n && w->view_offs + ggml_nbytes(w) > s_off_b) {
-                    ok = false;
+            if (fast) {
+                auto vit = views_of.find(n);
+                if (vit != views_of.end()) {
+                    for (int j : vit->second) {
+                        const ggml_tensor * w = cgraph->nodes[j];
+                        if (w != sv && w->view_offs + ggml_nbytes(w) > s_off_b) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (int j = 0; j < cgraph->n_nodes && ok; ++j) {
+                    const ggml_tensor * w = cgraph->nodes[j];
+                    if (w != sv && w->view_src == n && w->view_offs + ggml_nbytes(w) > s_off_b) {
+                        ok = false;
+                    }
                 }
             }
             if (!ok) {
@@ -11295,46 +11329,6 @@ static void ggml_vk_gdn_cache_prepass_compute(ggml_backend_vk_context * ctx, con
         }
         ctx->gdn_cache_fuse[n] = f;
     }
-}
-
-// VSUB: the prepass is a pure function of the graph structure (op/shape/stride/view/use topology), and
-// verify graphs are rebuilt identically every step, so memoize it on a structural hash (~0.9 ms -> ~0.1 ms
-// for a 4.5k-node graph). GGML_VK_NO_VSUB=1 recomputes every time.
-static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
-    static const bool no_vsub = getenv("GGML_VK_NO_VSUB") != nullptr;
-    if (no_vsub || cgraph->n_nodes < 256) {
-        ggml_vk_gdn_cache_prepass_compute(ctx, cgraph);
-        return;
-    }
-    uint64_t h = 1469598103934665603ULL ^ (uint64_t) cgraph->n_nodes;
-    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; h ^= h >> 29; };
-    auto mix_t = [&](const ggml_tensor * t) {
-        mix((uint64_t)(uintptr_t) t);
-        mix((uint64_t)(uintptr_t) t->view_src ^ ((uint64_t) t->type << 56) ^ ((uint64_t) t->op << 48));
-        mix(t->view_offs);
-        mix((uint64_t) t->ne[0] ^ ((uint64_t) t->ne[1] << 20) ^ ((uint64_t) t->ne[2] << 40));
-        mix((uint64_t) t->ne[3] ^ ((uint64_t) t->nb[1] << 8));
-        mix((uint64_t) t->nb[0] ^ ((uint64_t) t->nb[2] << 8));
-    };
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        mix_t(n);
-        mix((uint64_t) n->flags ^ ((uint64_t)(uint32_t) n->op_params[0] << 32));
-        for (int k = 0; k < GGML_MAX_SRC && n->src[k]; ++k) {
-            mix((uint64_t)(uintptr_t) n->src[k]);
-        }
-    }
-    auto it = ctx->gdn_prepass_cache.find(h);
-    if (it != ctx->gdn_prepass_cache.end()) {
-        ctx->gdn_skip_nodes = it->second.skip;
-        ctx->gdn_cache_fuse = it->second.fuse;
-        return;
-    }
-    ggml_vk_gdn_cache_prepass_compute(ctx, cgraph);
-    if (ctx->gdn_prepass_cache.size() >= 8) {
-        ctx->gdn_prepass_cache.clear();
-    }
-    ctx->gdn_prepass_cache[h] = { ctx->gdn_skip_nodes, ctx->gdn_cache_fuse };
 }
 
 void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
