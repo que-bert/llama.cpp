@@ -348,6 +348,8 @@ struct vk_step_timing {
     int  n       = 0;
     int64_t t_last_exit = 0;   // last time the host left a blocking backend call
     int64_t t_enter = 0, t_first_submit = 0, t_exit = 0;
+    int64_t t_prepass = 0, t_xfer = 0, t_prealloc = 0; int first_node = 0;
+    double ph_prepass = 0, ph_xfer = 0, ph_prealloc = 0, ph_loop = 0, ph_fnode = 0; uint64_t ph_n = 0;
     int     cur_nodes = -1;
     int     cur_nsub = 0;
     std::map<int, agg> by_nodes;
@@ -369,6 +371,7 @@ struct vk_step_timing {
             fprintf(stderr, "VK_STEP_TIMING %6d %6llu %8.1f %8.1f %8.1f %8.1f %8.1f %5.1f %5.1f\n", kv.first, (unsigned long long) a.cnt,
                 a.gap/c/1e3, a.pre/c/1e3, a.rec/c/1e3, a.wait/c/1e3, a.sync/c/1e3, a.nsub/c, 100.0*a.late/c);
         }
+        if (ph_n) { fprintf(stderr, "VK_STEP_TIMING_PRE (us mean over %llu) prepass %.1f xfer %.1f prealloc %.1f first_batch_loop %.1f first_batch_nodes %.1f\n", (unsigned long long) ph_n, ph_prepass/ph_n/1e3, ph_xfer/ph_n/1e3, ph_prealloc/ph_n/1e3, ph_loop/ph_n/1e3, ph_fnode/ph_n); ph_prepass = ph_xfer = ph_prealloc = ph_loop = ph_fnode = 0; ph_n = 0; }
         if (n_rd) { fprintf(stderr, "VK_STEP_TIMING buffer_read cnt %llu mean %.1f us\n", (unsigned long long) n_rd, t_rd/n_rd/1e3); }
         fflush(stderr);
         by_nodes.clear(); n = 0; n_rd = 0; t_rd = 0;
@@ -11103,7 +11106,7 @@ static bool ggml_vk_gdn_find_gate(const ggml_tensor * n, UsesFn && uses, const g
 }
 
 // Find the GDN recurrent-cache patterns (see vk_gdn_cache_fuse) in this graph.
-static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+static void ggml_vk_gdn_cache_prepass_compute(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->gdn_skip_nodes.clear();
     ctx->gdn_cache_fuse.clear();
     static const bool disabled = getenv("GGML_VK_NO_GDN_CACHE") != nullptr;
@@ -11292,6 +11295,46 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         }
         ctx->gdn_cache_fuse[n] = f;
     }
+}
+
+// VSUB: the prepass is a pure function of the graph structure (op/shape/stride/view/use topology), and
+// verify graphs are rebuilt identically every step, so memoize it on a structural hash (~0.9 ms -> ~0.1 ms
+// for a 4.5k-node graph). GGML_VK_NO_VSUB=1 recomputes every time.
+static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    static const bool no_vsub = getenv("GGML_VK_NO_VSUB") != nullptr;
+    if (no_vsub || cgraph->n_nodes < 256) {
+        ggml_vk_gdn_cache_prepass_compute(ctx, cgraph);
+        return;
+    }
+    uint64_t h = 1469598103934665603ULL ^ (uint64_t) cgraph->n_nodes;
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; h ^= h >> 29; };
+    auto mix_t = [&](const ggml_tensor * t) {
+        mix((uint64_t)(uintptr_t) t);
+        mix((uint64_t)(uintptr_t) t->view_src ^ ((uint64_t) t->type << 56) ^ ((uint64_t) t->op << 48));
+        mix(t->view_offs);
+        mix((uint64_t) t->ne[0] ^ ((uint64_t) t->ne[1] << 20) ^ ((uint64_t) t->ne[2] << 40));
+        mix((uint64_t) t->ne[3] ^ ((uint64_t) t->nb[1] << 8));
+        mix((uint64_t) t->nb[0] ^ ((uint64_t) t->nb[2] << 8));
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix_t(n);
+        mix((uint64_t) n->flags ^ ((uint64_t)(uint32_t) n->op_params[0] << 32));
+        for (int k = 0; k < GGML_MAX_SRC && n->src[k]; ++k) {
+            mix((uint64_t)(uintptr_t) n->src[k]);
+        }
+    }
+    auto it = ctx->gdn_prepass_cache.find(h);
+    if (it != ctx->gdn_prepass_cache.end()) {
+        ctx->gdn_skip_nodes = it->second.skip;
+        ctx->gdn_cache_fuse = it->second.fuse;
+        return;
+    }
+    ggml_vk_gdn_cache_prepass_compute(ctx, cgraph);
+    if (ctx->gdn_prepass_cache.size() >= 8) {
+        ctx->gdn_prepass_cache.clear();
+    }
+    ctx->gdn_prepass_cache[h] = { ctx->gdn_skip_nodes, ctx->gdn_cache_fuse };
 }
 
 void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -15402,6 +15445,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ggml_vk_gdn_cache_prepass(ctx, cgraph);
+    if (vk_st.enabled) { vk_st.t_prepass = vk_step_timing::now(); }
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -15418,6 +15462,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     int submit_node_idx = 0; // index to first node in a batch
 
     ggml_vk_submit_transfer_ctx(ctx);
+    if (vk_st.enabled) { vk_st.t_xfer = vk_step_timing::now(); }
 
     vk_context compute_ctx;
     if (vk_perf_logger_enabled) {
@@ -15462,6 +15507,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
+    if (vk_st.enabled) { vk_st.t_prealloc = vk_step_timing::now(); }
+
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
     // Estimate the amount of compute work using flops, and submit every 200 GFLOP
     // (and scaled down based on total graph flops, so smaller models submit earlier).
@@ -15504,7 +15551,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->device->diag_prev_end = end;
         }
         if (vk_st.enabled) {
-            if (vk_st.cur_nsub == 0) { vk_st.t_first_submit = vk_step_timing::now(); }
+            if (vk_st.cur_nsub == 0) {
+                vk_st.t_first_submit = vk_step_timing::now();
+                vk_st.first_node = end + 1;
+                if (vk_st.cur_nodes > 2000) {
+                    vk_st.ph_n++;
+                    vk_st.ph_prepass += vk_st.t_prepass - vk_st.t_enter;
+                    vk_st.ph_xfer += vk_st.t_xfer - vk_st.t_prepass;
+                    vk_st.ph_prealloc += vk_st.t_prealloc - vk_st.t_xfer;
+                    vk_st.ph_loop += vk_st.t_first_submit - vk_st.t_prealloc;
+                    vk_st.ph_fnode += vk_st.first_node;
+                }
+            }
             vk_st.cur_nsub++;
         }
         first_node_in_batch = true;
