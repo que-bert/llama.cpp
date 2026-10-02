@@ -1054,6 +1054,9 @@ struct vk_device_struct {
 
     bool disable_fusion;
     bool disable_host_visible_vidmem;
+    size_t small_bar_visible_max = 0; // small BAR: buffers up to this size still prefer host-visible vidmem (0 = none)
+    size_t small_bar_model_max = 0;   // ...but only while the device buffers allocated so far total at most this (small models)
+    std::atomic<size_t> dev_buffer_bytes{0}; // bytes in live ggml_vk_create_buffer_device buffers
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
 
@@ -1088,10 +1091,14 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    bool counted = false; // included in device->dev_buffer_bytes
 
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
+        }
+        if (counted) {
+            device->dev_buffer_bytes -= size;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 

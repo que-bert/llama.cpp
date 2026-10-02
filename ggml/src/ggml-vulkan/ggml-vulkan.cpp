@@ -4284,6 +4284,17 @@ vk_device ggml_vk_get_device(size_t idx) {
             }
             if (max_visible_local_heap > 0 && max_visible_local_heap < max_local_heap / 2) {
                 device->disable_host_visible_vidmem = true;
+                // ...but small buffers (graph inputs live in the compute buffer) keep the host-visible
+                // preference: a plain device-local buffer turns every per-token input upload into a
+                // staging copy + queue submit + fence wait (4 per decode token, ~0.25 ms on a 2B model).
+                // GGML_VK_SMALL_BAR_MAX_MIB=<n> sets the size cap (default: half the host-visible heap, 0 = restore the plain "no host-visible vidmem" behaviour).
+                const char * cap_env = getenv("GGML_VK_SMALL_BAR_MAX_MIB");
+                device->small_bar_visible_max = cap_env ? (size_t) std::strtoull(cap_env, nullptr, 10) << 20
+                                                        : (size_t) (max_visible_local_heap / 2);  // half the window: one buffer cannot oversubscribe it
+                // Only for small models (device buffers so far <= GGML_VK_SMALL_BAR_MODEL_MAX_MIB, default 4096): a launch-bound
+                // decode graph pays the per-token upload round trips; for big models they are noise and the placement is unchanged.
+                const char * model_env = getenv("GGML_VK_SMALL_BAR_MODEL_MAX_MIB");
+                device->small_bar_model_max = (size_t) (model_env ? std::strtoull(model_env, nullptr, 10) : 4096ull) << 20;
                 GGML_LOG_DEBUG("ggml_vulkan: small BAR (%zu of %zu MiB host-visible), not preferring host-visible vidmem\n",
                                (size_t)(max_visible_local_heap >> 20), (size_t)(max_local_heap >> 20));
             }

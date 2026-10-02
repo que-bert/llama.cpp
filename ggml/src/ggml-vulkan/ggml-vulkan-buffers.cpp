@@ -202,7 +202,8 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal,
                                                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-        } else if (device->disable_host_visible_vidmem) {
+        } else if (device->disable_host_visible_vidmem && !(device->small_bar_visible_max > 0 && size <= device->small_bar_visible_max &&
+                                                          device->dev_buffer_bytes.load() <= device->small_bar_model_max)) {
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
                                                            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
@@ -226,6 +227,10 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
         throw e;
     }
 
+    if (buf && buf->size > 0) {
+        buf->counted = true;
+        device->dev_buffer_bytes += buf->size;
+    }
     return buf;
 }
 
