@@ -100,6 +100,8 @@ add_library(${TARGET}
     peg-parser.cpp
     peg-parser.h
     preset.cpp
+    serving-preset.cpp
+    serving-preset.h
     preset.h
     reasoning-budget.cpp
     reasoning-budget.h

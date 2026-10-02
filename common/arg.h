@@ -85,6 +85,7 @@ struct common_arg {
     bool is_exclude(enum llama_example ex);
     bool get_value_from_env(std::string & output) const;
     bool has_value_from_env() const;
+    void mark_explicit(common_params & params) const; // record all aliases in params.explicit_args
     std::string to_string() const;
 
     // for using as key in std::map
