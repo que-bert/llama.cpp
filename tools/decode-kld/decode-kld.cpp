@@ -142,18 +142,17 @@ int main(int argc, char ** argv) {
     // 1) depth fill, no logits
     const int64_t t0 = ggml_time_us();
     {
-        llama_batch batch = llama_batch_init(n_ub, 0, 1);
+        common_batch batch(ctx);
         for (int p = 0; p < ex.depth; p += n_ub) {
-            common_batch_clear(batch);
+            batch.clear();
             const int n = std::min(n_ub, ex.depth - p);
-            for (int j = 0; j < n; ++j) common_batch_add(batch, tokens[p + j], p + j, { 0 }, false);
-            if (llama_decode(ctx, batch) != 0) {
+            for (int j = 0; j < n; ++j) batch.add(tokens[p + j], p + j, 0, false);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
                 fprintf(stderr, "decode failed at depth fill pos %d\n", p);
                 return 1;
             }
             if ((p / n_ub) % 20 == 0) fprintf(stderr, "\rfill %d / %d", p + n, ex.depth);
         }
-        llama_batch_free(batch);
     }
     const int64_t t1 = ggml_time_us();
     fprintf(stderr, "\nfill done: %d tokens in %.1f s\n", ex.depth, (t1 - t0) / 1e6);
@@ -162,15 +161,15 @@ int main(int argc, char ** argv) {
     std::vector<ggml_fp16_t> cur((size_t) ex.score * n_vocab);
     std::vector<int32_t>     next_tok(ex.score);
     {
-        llama_batch batch = llama_batch_init(ex.batch, 0, 1);
+        common_batch batch(ctx);
         for (int s = 0; s < ex.score; s += ex.batch) {
-            common_batch_clear(batch);
+            batch.clear();
             const int n = std::min(ex.batch, ex.score - s);
             for (int j = 0; j < n; ++j) {
                 const int p = ex.depth + s + j;
-                common_batch_add(batch, tokens[p], p, { 0 }, true);
+                batch.add(tokens[p], p, 0, true);
             }
-            if (llama_decode(ctx, batch) != 0) {
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
                 fprintf(stderr, "decode failed at score pos %d\n", s);
                 return 1;
             }
@@ -180,7 +179,6 @@ int main(int argc, char ** argv) {
                 next_tok[s + j] = tokens[ex.depth + s + j + 1];
             }
         }
-        llama_batch_free(batch);
     }
     const int64_t t2 = ggml_time_us();
     fprintf(stderr, "score done: %d tokens in batches of %d in %.2f s (%.1f t/s)\n", ex.score, ex.batch, (t2 - t1) / 1e6, ex.score / ((t2 - t1) / 1e6));
