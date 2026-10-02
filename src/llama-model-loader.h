@@ -9,6 +9,7 @@
 
 #include "ggml-cpp.h"
 
+#include <tuple>
 #include <cstddef>
 #include <cstring>
 #include <map>
@@ -139,6 +140,8 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+    // [file idx, first, last) of tensors that live directly in the mmap (CPU-resident), re-populated after load
+    std::vector<std::tuple<uint32_t, size_t, size_t>> mmap_resident;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {

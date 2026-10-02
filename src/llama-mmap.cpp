@@ -672,6 +672,29 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
+void llama_mmap::populate(size_t first, size_t last) {
+#if defined(__linux__)
+    // Fault [first, last) into the page cache and map it now. MAP_POPULATE at mmap() time can be undone by
+    // reclaim while the rest of a larger-than-free-RAM file streams to the GPU, leaving CPU-resident tensors
+    // (token embeddings) to major-fault one batch row at a time during prefill.
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+    first = first & ~(page_size - 1);
+    last  = std::min((last + page_size - 1) & ~(page_size - 1), pimpl->size);
+    if (first >= last) {
+        return;
+    }
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    if (madvise((char *) pimpl->addr + first, last - first, MADV_POPULATE_READ)) {
+        posix_madvise((char *) pimpl->addr + first, last - first, POSIX_MADV_WILLNEED);
+    }
+#else
+    GGML_UNUSED(first);
+    GGML_UNUSED(last);
+#endif
+}
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else
