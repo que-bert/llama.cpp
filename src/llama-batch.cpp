@@ -173,7 +173,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd.data()) : nullptr;
+    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd_data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -1074,6 +1074,7 @@ llama_batch_ext::llama_batch_ext(
 void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
+    embd_view = nullptr;
     n_embd = 0;
 }
 
@@ -1156,6 +1157,32 @@ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
     return true;
 }
 
+bool llama_batch_ext::set_embd_view(llama_embd embd_in) {
+    if (!embd_in.data || tokens.empty() || embd_in.n_rows != tokens.size() || !embd.empty() || embd_view) {
+        return false;
+    }
+    if (n_embd != 0 && embd_in.n_embd != n_embd) {
+        return false;
+    }
+    if (embd_in.n_embd != n_embd_inp && embd_in.n_embd != n_embd_inp_enc) {
+        LLAMA_LOG_ERROR("%s: embedding row size mismatch, got %zu, expected %zu or %zu\n",
+                __func__, embd_in.n_embd, n_embd_inp, n_embd_inp_enc);
+        return false;
+    }
+    for (const token & t : tokens) {
+        if (t.has_embd) {
+            return false;
+        }
+    }
+    n_embd = embd_in.n_embd;
+    embd_view = embd_in.data;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i].has_embd = true;
+        tokens[i].embd_off = i * n_embd;
+    }
+    return true;
+}
+
 bool llama_batch_ext::set_token_pos(int32_t idx, const llama_pos * pos_in) {
     if (idx < 0 || idx >= (int32_t) tokens.size()) {
         return false;
@@ -1232,6 +1259,10 @@ bool llama_batch_ext_set_pos(llama_batch_ext * batch, int32_t idx, const llama_p
 
 bool llama_batch_ext_set_embd_token(llama_batch_ext * batch, int32_t idx, llama_embd embd) {
     return batch->set_token_embd(idx, embd);
+}
+
+bool llama_batch_ext_set_embd_view(llama_batch_ext * batch, llama_embd embd) {
+    return batch->set_embd_view(embd);
 }
 
 bool llama_batch_ext_set_embd_state(llama_batch_ext * batch, int32_t idx, llama_embd embd) {

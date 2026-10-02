@@ -1067,6 +1067,12 @@ struct common_batch {
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
     llama_batch_ext_ptr batch;
 
+    // optional batch-level embedding rows, row i belongs to entry i (token entries only); filled once by the caller via
+    // set_embd_rows(), referenced by get_sub_batch() without copying. Not combined with per-entry set_embd().
+    std::unique_ptr<float[]> embd_rows;
+    size_t embd_rows_cap = 0;  // rows allocated
+    size_t embd_rows_n   = 0;  // row width, 0 = unused
+
     int32_t n_pos = 1; // positions per embedding entry, GGML_MROPE_SECTIONS for MROPE/IMROPE
 
     common_batch() = default;
@@ -1079,7 +1085,11 @@ struct common_batch {
 
     // content type of the batch, all entries carry the same combination
     bool has_token() const { return !tokens.empty() && tokens[0].id != LLAMA_TOKEN_NULL; }
-    bool has_embd () const { return !tokens.empty() && tokens[0].embd.data != nullptr; }
+    bool has_embd () const { return !tokens.empty() && (tokens[0].embd.data != nullptr || embd_rows_n != 0); }
+
+    // reserve the batch-level embedding buffer for n_rows rows of n_embd floats (uninitialised, capacity is reused)
+    // and return it; the caller writes row i for entry i. Valid until clear()/the next call.
+    float * set_embd_rows(size_t n_rows, size_t n_embd);
 
     void clear();
 

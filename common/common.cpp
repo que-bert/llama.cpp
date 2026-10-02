@@ -2138,6 +2138,7 @@ common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx
 
 void common_batch::clear() {
     tokens.clear();
+    embd_rows_n = 0;
 }
 
 int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
@@ -2171,8 +2172,17 @@ bool common_batch::set_output(int32_t idx, bool value) {
     return true;
 }
 
+float * common_batch::set_embd_rows(size_t n_rows, size_t n_embd) {
+    if (n_rows * n_embd > embd_rows_cap) {
+        embd_rows.reset(new float[n_rows * n_embd]);
+        embd_rows_cap = n_rows * n_embd;
+    }
+    embd_rows_n = n_embd;
+    return embd_rows.get();
+}
+
 bool common_batch::set_embd(int32_t idx, llama_embd embd) {
-    if (idx < 0 || idx >= size() || tokens[idx].embd.data != nullptr) {
+    if (idx < 0 || idx >= size() || tokens[idx].embd.data != nullptr || embd_rows_n != 0) {
         return false;
     }
     tokens[idx].embd = embd;
@@ -2224,6 +2234,13 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.output) {
             llama_batch_ext_set_output_logits(res, idx, true);
+        }
+    }
+
+    if (embd_rows_n != 0 && n > 0) {
+        GGML_ASSERT((size_t) (off + n) * embd_rows_n <= embd_rows_cap);
+        if (!llama_batch_ext_set_embd_view(res, { embd_rows.get() + (size_t) off * embd_rows_n, (size_t) n, embd_rows_n })) {
+            GGML_ABORT("%s: failed to set the embedding view\n", __func__);
         }
     }
 

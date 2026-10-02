@@ -318,6 +318,28 @@ static void test_init(testing & t) {
 static void test_content_types(testing & t) {
     llama_vocab vocab;
 
+    t.test("embd_view_is_zero_copy", [&](testing & t) {
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);
+        std::vector<float> rows;
+        for (int i = 0; i < 2; ++i) {
+            const int32_t idx = bb.b.add_token(0);
+            t.assert_true(bb.b.set_token_id(idx, i));
+            const llama_pos pos = i;
+            bb.b.set_token_pos(idx, &pos);
+            const auto r = bb.row(i, bb.n_embd);
+            rows.insert(rows.end(), r.begin(), r.end());
+        }
+        t.assert_true("row count must match", !bb.b.set_embd_view({ rows.data(), 1, bb.n_embd }));
+        t.assert_true("width must match",     !bb.b.set_embd_view({ rows.data(), 2, 3 }));
+        t.assert_true(bb.b.set_embd_view({ rows.data(), 2, bb.n_embd }));
+        t.assert_true("only once", !bb.b.set_embd_view({ rows.data(), 2, bb.n_embd }));
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        t.assert_true("points at the caller rows", ba.get_batch().embd == rows.data());
+        t.assert_equal(100.0f, ba.get_batch().embd[bb.n_embd]);
+    });
+
     t.test("token_and_embd_together", [&](testing & t) {
         // e.g. MTP hook batches: a token id and its embedding on the same entry
         batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);

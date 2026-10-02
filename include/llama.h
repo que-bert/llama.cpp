@@ -1059,6 +1059,13 @@ extern "C" {
                                                int32_t   idx,
                                      struct llama_embd   embd);
 
+    // Attach one embedding row to each entry of the batch without copying: row i of embd goes to entry i.
+    // Requires embd.n_rows == number of entries in the batch and no entry carrying an embedding yet.
+    // Non-owning: embd.data must stay valid until the batch is cleared/freed and the llama_process() using it returns.
+    LLAMA_API bool llama_batch_ext_set_embd_view(
+                                struct llama_batch_ext * batch,
+                                     struct llama_embd   embd);
+
     // Set the "state" embedding for the token at index idx in the batch
     // "state" here means extra hidden state carried over from a previous stage, e.g.:
     //   - MTP: state from N layers of the target model

@@ -138,6 +138,9 @@ struct llama_batch_ext {
     };
     std::vector<token> tokens;
     std::vector<float> embd;
+    const float * embd_view = nullptr; // non-owning contiguous rows [tokens.size(), n_embd], see set_embd_view(); replaces embd
+
+    const float * embd_data() const { return embd_view ? embd_view : embd.data(); }
 
     llama_batch_ext(llama_context * ctx);
 
@@ -160,6 +163,7 @@ struct llama_batch_ext {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
+    bool set_embd_view(llama_embd embd_in);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
 };

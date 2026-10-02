@@ -1707,16 +1707,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_tgt = h_rows ? h_rows : llama_get_embeddings_nextn(ctx_tgt);
             spc_trace("got_h");
 
+            // rows are written once into the batch-level buffer (the only copy), sub-batches reference it
+            float * rows = batch.set_embd_rows((size_t) n_tokens, (size_t) n_embd);
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
-                batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                memcpy(rows + (size_t) k * n_embd, h_row, row_bytes);
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
