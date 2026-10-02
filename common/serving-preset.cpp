@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -26,7 +27,9 @@ struct preset_vals {
     int       n_parallel   = -1;
     ggml_type kv_k         = GGML_TYPE_COUNT;
     ggml_type kv_v         = GGML_TYPE_COUNT;
+    int       n_ubatch     = -1;
     bool      mtp          = false; // spec type draft-mtp
+    bool      ngram_simple = false; // spec type ngram-simple (models without MTP)
     int       draft_n_max  = -1;
     ggml_type draft_kv_k   = GGML_TYPE_COUNT;
     ggml_type draft_kv_v   = GGML_TYPE_COUNT;
@@ -69,9 +72,10 @@ preset_vals minicpm5_2b_vals() {
     preset_vals v;
     v.flash_attn = 1;
     v.n_parallel = 1;
-    v.kv_k       = GGML_TYPE_F16;
+    v.kv_k       = GGML_TYPE_F16;  // W6: f16 KV decodes ~10% faster than q8_0
     v.kv_v       = GGML_TYPE_F16;
-    // TODO(W4): draft setting (spec type / n-max), to be filled in by measurement
+    v.n_ubatch   = 1024;           // W6: +5% pp2048
+    v.ngram_simple = true;         // W2SERVE: +30% corpus, +3.5% chat-like vs no draft
     return v;
 }
 
@@ -88,6 +92,23 @@ preset_vals arch_fallback_vals() {
     v.mtp         = true;
     v.draft_n_max = 3;
     v.n_parallel  = 1; // MTP with parallel > 1 roughly halves decode
+    return v;
+}
+
+// per-arch presets (W6 sweep, results/phase2/w6), applied when no identity preset matches; MTP models also get
+// arch_fallback_vals() first
+preset_vals arch_vals(const std::string & arch) {
+    preset_vals v;
+    if (arch == "gemma4") {          // f16 KV decode +9% over q8_0; ub 1024 +4% pp2048
+        v.flash_attn = 1;
+        v.kv_k = v.kv_v = GGML_TYPE_F16;
+        v.n_ubatch = 1024;
+    } else if (arch == "qwen35moe") { // ub 1024 +19% pp2048; f16 KV
+        v.kv_k = v.kv_v = GGML_TYPE_F16;
+        v.n_ubatch = 1024;
+    } else if (arch == "qwen35") {    // q8_0 KV: +5% deep prefill, same decode (Ornith 9B)
+        v.kv_k = v.kv_v = GGML_TYPE_Q8_0;
+    }
     return v;
 }
 
@@ -164,8 +185,16 @@ void apply_vals(common_params & p, const preset_vals & v, common_serving_preset_
     if (v.kv_v != GGML_TYPE_COUNT) {
         field("--cache-type-v", ggml_type_name(v.kv_v), [&] { p.cache_type_v = v.kv_v; });
     }
+    if (v.n_ubatch >= 0) {
+        field("--ubatch-size", std::to_string(v.n_ubatch), [&] {
+            p.n_ubatch = v.n_ubatch;
+            p.n_batch  = std::max(p.n_batch, v.n_ubatch);
+        });
+    }
     if (v.mtp) {
         field("--spec-type", "draft-mtp", [&] { p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP }; });
+    } else if (v.ngram_simple) {
+        field("--spec-type", "ngram-simple", [&] { p.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE }; });
     }
     if (v.draft_n_max >= 0) {
         field("--spec-draft-n-max", std::to_string(v.draft_n_max), [&] { p.speculative.draft.n_max = v.draft_n_max; });
@@ -203,10 +232,15 @@ common_serving_preset_result common_serving_preset_select(common_params & params
         }
     }
 
-    if (m.n_nextn > 0) {
+    const preset_vals av = arch_vals(m.arch);
+    const bool has_arch = av.flash_attn >= 0 || av.kv_k != GGML_TYPE_COUNT || av.n_ubatch >= 0;
+    if (m.n_nextn > 0 || has_arch) {
         res.name = m.arch;
         res.kind = "arch-fallback";
-        apply_vals(params, arch_fallback_vals(), res);
+        if (m.n_nextn > 0) {
+            apply_vals(params, arch_fallback_vals(), res);
+        }
+        apply_vals(params, av, res);
     }
     return res;
 }
