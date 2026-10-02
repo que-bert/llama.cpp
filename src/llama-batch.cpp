@@ -84,9 +84,8 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (has_embd) {
-        embd_vec = batch_inp.embd;
-    }
+    // the ext batch outlives this allocr use: point at its embeddings instead of copying them (the copy is tens of MB
+    // per prompt-sized MTP hook batch)
 
     //
     // build flat pos array
@@ -174,7 +173,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd.data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();

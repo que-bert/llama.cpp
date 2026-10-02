@@ -91,12 +91,49 @@ struct llama_batch_ext {
     // must be either n_embd_inp or n_embd_inp_enc; encode/decode verify it against the graph input
     size_t n_embd = 0;
 
+    // small set of seq ids: the first two live inline (no heap allocation per token, unlike std::unordered_set)
+    struct seq_id_set {
+        llama_seq_id             inl[2] = {0, 0};
+        size_t                   n = 0;
+        std::vector<llama_seq_id> ext; // used (holding all ids) once more than two are inserted
+
+        const llama_seq_id * begin() const { return ext.empty() ? inl : ext.data(); }
+        const llama_seq_id * end()   const { return begin() + n; }
+        size_t size() const { return n; }
+        size_t count(llama_seq_id id) const {
+            for (const llama_seq_id * it = begin(); it != end(); ++it) {
+                if (*it == id) { return 1; }
+            }
+            return 0;
+        }
+
+        seq_id_set() = default;
+        seq_id_set(std::initializer_list<llama_seq_id> ids) { for (auto id : ids) { insert(id); } }
+
+        void insert(llama_seq_id id) {
+            for (const llama_seq_id * it = begin(); it != end(); ++it) {
+                if (*it == id) {
+                    return;
+                }
+            }
+            if (ext.empty() && n < 2) {
+                inl[n++] = id;
+                return;
+            }
+            if (ext.empty()) {
+                ext.assign(inl, inl + n);
+            }
+            ext.push_back(id);
+            n = ext.size();
+        }
+    };
+
     struct token {
         llama_token  id = LLAMA_TOKEN_NULL;
         bool         has_embd = false; // whether embd_off is set
         size_t       embd_off = 0; // index offset in the embd array
         bool         output = false; // TODO: have dedicated output flags
-        std::unordered_set<llama_seq_id> seq_ids;
+        seq_id_set seq_ids;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
     };
     std::vector<token> tokens;
