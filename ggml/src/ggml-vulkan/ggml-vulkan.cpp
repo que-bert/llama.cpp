@@ -4313,10 +4313,11 @@ vk_device ggml_vk_get_device(size_t idx) {
                 const char * cap_env = getenv("GGML_VK_SMALL_BAR_MAX_MIB");
                 device->small_bar_visible_max = cap_env ? (size_t) std::strtoull(cap_env, nullptr, 10) << 20
                                                         : (size_t) (max_visible_local_heap / 2);  // half the window: one buffer cannot oversubscribe it
-                // Only for small models (device buffers so far <= GGML_VK_SMALL_BAR_MODEL_MAX_MIB, default 4096): a launch-bound
+                // Only for small models (device buffers so far <= GGML_VK_SMALL_BAR_MODEL_MAX_MIB, default 12288): a launch-bound
                 // decode graph pays the per-token upload round trips; for big models they are noise and the placement is unchanged.
+                // 12 GiB: Ornith-9B Q4_K_M (5.5 GB) +2.9 % tg; the 27B (16/22 GB) and 35B-A3B (25 GB) stay out.
                 const char * model_env = getenv("GGML_VK_SMALL_BAR_MODEL_MAX_MIB");
-                device->small_bar_model_max = (size_t) (model_env ? std::strtoull(model_env, nullptr, 10) : 4096ull) << 20;
+                device->small_bar_model_max = (size_t) (model_env ? std::strtoull(model_env, nullptr, 10) : 12288ull) << 20;
                 GGML_LOG_DEBUG("ggml_vulkan: small BAR (%zu of %zu MiB host-visible), not preferring host-visible vidmem\n",
                                (size_t)(max_visible_local_heap >> 20), (size_t)(max_local_heap >> 20));
             }
