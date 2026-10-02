@@ -4309,10 +4309,10 @@ vk_device ggml_vk_get_device(size_t idx) {
                 // ...but small buffers (graph inputs live in the compute buffer) keep the host-visible
                 // preference: a plain device-local buffer turns every per-token input upload into a
                 // staging copy + queue submit + fence wait (4 per decode token, ~0.25 ms on a 2B model).
-                // GGML_VK_SMALL_BAR_MAX_MIB=<n> sets the size cap (default: half the host-visible heap, 0 = restore the plain "no host-visible vidmem" behaviour).
+                // GGML_VK_SMALL_BAR_MAX_MIB=<n> sets the size cap (default: 3/4 of the host-visible heap, 0 = restore the plain "no host-visible vidmem" behaviour).
                 const char * cap_env = getenv("GGML_VK_SMALL_BAR_MAX_MIB");
                 device->small_bar_visible_max = cap_env ? (size_t) std::strtoull(cap_env, nullptr, 10) << 20
-                                                        : (size_t) (max_visible_local_heap / 2);  // half the window: one buffer cannot oversubscribe it
+                                                        : (size_t) (max_visible_local_heap / 4 * 3);  // 3/4 of the window (Gemma4-E4B compute buffer is 128-160 MiB; the ~248 MiB mtmd vision buffer must stay out)
                 // Only for small models (device buffers so far <= GGML_VK_SMALL_BAR_MODEL_MAX_MIB, default 12288): a launch-bound
                 // decode graph pays the per-token upload round trips; for big models they are noise and the placement is unchanged.
                 // 12 GiB: Ornith-9B Q4_K_M (5.5 GB) +2.9 % tg; the 27B (16/22 GB) and 35B-A3B (25 GB) stay out.
