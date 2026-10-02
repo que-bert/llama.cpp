@@ -9,6 +9,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "serving-preset.h"
 #include "llama.h"
 #include "log.h"
 
@@ -106,6 +107,18 @@ int llama_server(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
+    }
+
+    if (!params.no_preset) {
+        const common_serving_preset_result preset = common_serving_preset_select(params);
+        if (params.print_preset) {
+            printf("%s", common_serving_preset_describe(preset).c_str());
+            return 0;
+        }
+        SRV_INF("%s\n", common_serving_preset_summary(preset).c_str());
+    } else if (params.print_preset) {
+        printf("preset: disabled (--no-preset)\n");
+        return 0;
     }
 
     llama_backend_init();

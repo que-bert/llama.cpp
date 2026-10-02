@@ -377,6 +377,42 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
     }
 }
 
+// detection only: log a hint when a failed load looks like an ollama-packed GGUF
+static void llama_hint_ollama_packed(const std::string & path) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * ctx = gguf_init_from_file(path.c_str(), gp);
+    if (!ctx) {
+        return;
+    }
+    std::string arch;
+    std::string tok;
+    int64_t id = gguf_find_key(ctx, "general.architecture");
+    if (id >= 0 && gguf_get_kv_type(ctx, id) == GGUF_TYPE_STRING) {
+        arch = gguf_get_val_str(ctx, id);
+    }
+    id = gguf_find_key(ctx, "tokenizer.ggml.model");
+    if (id >= 0 && gguf_get_kv_type(ctx, id) == GGUF_TYPE_STRING) {
+        tok = gguf_get_val_str(ctx, id);
+    }
+    bool packed = false;
+    const int64_t n_tensors = gguf_get_n_tensors(ctx);
+    for (int64_t i = 0; i < n_tensors && !packed; i++) {
+        const std::string name = gguf_get_tensor_name(ctx, i);
+        if (arch == "gemma4" && tok == "llama") {
+            // vision / audio towers packed into the text GGUF
+            packed = name.rfind("v.", 0) == 0 || name.rfind("a.", 0) == 0;
+        } else if (arch == "qwen35") {
+            // mtp.* tensors, or ssm_dt without the .bias suffix
+            packed = name.rfind("mtp.", 0) == 0 ||
+                     (name.size() > 7 && name.compare(name.size() - 7, 7, ".ssm_dt") == 0);
+        }
+    }
+    gguf_free(ctx);
+    if (packed) {
+        LLAMA_LOG_ERROR("%s: this GGUF looks ollama-packed; convert it with perf-lab harness/ollama_gguf_convert.py\n", __func__);
+    }
+}
+
 static struct llama_model * llama_model_load_from_file_impl(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -430,6 +466,9 @@ static struct llama_model * llama_model_load_from_file_impl(
     if (status < 0) {
         if (status == -1) {
             LLAMA_LOG_ERROR("%s: failed to load model\n", __func__);
+            if (!path_model.empty()) {
+                llama_hint_ollama_packed(path_model);
+            }
         } else if (status == -2) {
             LLAMA_LOG_INFO("%s: cancelled model load\n", __func__);
         }
