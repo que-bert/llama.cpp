@@ -1286,8 +1286,13 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     // forces the old behaviour for A/B attribution on one binary.
     const bool amd_rdna = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN;
     const bool shmem_off = getenv("GGML_VK_DISABLE_FA_SHMEM_STAGING") != nullptr;
+    // The AMD win was measured for quantised K/V (and head sizes < 256). With f16/f32 K/V at
+    // hsk/hsv >= 256 (Gemma4-E4B) it is slower than upstream's unstaged path and at hsk 512
+    // it crashes ACO, so only engage it there when K or V is quantised.
+    const bool kv_quant = (k_type != GGML_TYPE_F16 && k_type != GGML_TYPE_F32) || (v_type != GGML_TYPE_F16 && v_type != GGML_TYPE_F32);
+    const bool amd_stage = amd_rdna && ((hsk < 256 && hsv < 256) || kv_quant);
     result.shmem_staging = (!shmem_off &&
-                            ((device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) || amd_rdna)) ? 1 : 0;
+                            ((device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) || amd_stage)) ? 1 : 0;
 
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
@@ -1443,7 +1448,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, bool packed, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, bool packed, bool legacy_cm1, ggml_type k_type, ggml_type v_type) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1453,7 +1458,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (old_amd_windows   ? 8 : 0) |
                      (use_sparse        ? 16 : 0) |
                      (packed            ? 32 : 0) |
-                     (params.int8_qk    ? 64 : 0);
+                     (params.int8_qk    ? 64 : 0) |
+                     (legacy_cm1        ? 128 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -2174,6 +2180,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #else
                 continue;
 #endif
+            } else if (fa.first.flags & 128) {
+                if (f32acc) { spv_data = flash_attn_f32_f16_legacy_cm1_data;        spv_size = flash_attn_f32_f16_legacy_cm1_len; }
+                else        { spv_data = flash_attn_f32_f16_legacy_f16acc_cm1_data; spv_size = flash_attn_f32_f16_legacy_f16acc_cm1_len; }
+                name = aligned ? "flash_attn_f32_f16_aligned_cm1_legacy" : "flash_attn_f32_f16_cm1_legacy";
             } else {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
@@ -8928,7 +8938,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // of the speculative verify. GGML_VK_FA_NO_PACK forces the old layout for A/B
     // attribution on one binary.
     static const bool no_pack = getenv("GGML_VK_FA_NO_PACK") != nullptr;
-    const bool packed_gqa = !no_pack && gqa_ratio > 1 && !use_sparse &&
+    // With f16/f32 K/V (e.g. Gemma4) none of the fork's cm1 changes (packed GQA, int8 QK, q8_0 dequant
+    // sharing) pay, and the rewritten shader is ~25% slower than upstream's on prefill, so those cases
+    // run upstream's unmodified cm1 shader (flash_attn_cm1_legacy.comp). Quantised K/V (the q8_0 tuned
+    // path) keep the fork shader. GGML_VK_FA_NO_LEGACY_CM1 forces the fork shader everywhere.
+    static const bool no_legacy_cm1 = getenv("GGML_VK_FA_NO_LEGACY_CM1") != nullptr;
+    const bool legacy_cm1 = !no_legacy_cm1 && tuning_params.path == FA_COOPMAT1 && !tuning_params.int8_qk &&
+                            (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32) &&
+                            (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32);
+    const bool packed_gqa = !no_pack && !legacy_cm1 && gqa_ratio > 1 && !use_sparse &&
                             tuning_params.path == FA_COOPMAT1 &&
                             (tuning_params.block_rows / gqa_ratio) > 1;
     const uint32_t pos_per_tile = packed_gqa ? std::max(1u, tuning_params.block_rows / gqa_ratio) : 1u;
@@ -8985,7 +9003,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                         nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, packed_gqa, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, packed_gqa, legacy_cm1, k_type_eff, v_type_eff);
 
     vk_pipeline pipeline = nullptr;
 
