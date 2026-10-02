@@ -10468,6 +10468,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
+    // qwen3.6-35b-a3b expert shapes (q6_K k=512 uses the 32-thread workgroup pipeline on RDNA4)
+    for (int bs : {1, 2, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 512, bs, 2048));
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
@@ -11655,6 +11660,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    // qwen3.6-35b-a3b expert GEMV (decode / MTP verify)
+    for (int bs : {1, 2, 4, 5}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, bs, 2048));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
         }
     }
 
