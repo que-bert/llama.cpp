@@ -103,9 +103,8 @@ preset_vals arch_vals(const std::string & arch) {
         v.flash_attn = 1;
         v.kv_k = v.kv_v = GGML_TYPE_F16;
         v.n_ubatch = 1024;
-    } else if (arch == "qwen35moe") { // ub 1024 +19% pp2048; f16 KV
+    } else if (arch == "qwen35moe") { // f16 KV. Not ub 1024: +19% pp2048 but MTP acceptance 0.7009 -> 0.6824 (router flips)
         v.kv_k = v.kv_v = GGML_TYPE_F16;
-        v.n_ubatch = 1024;
     } else if (arch == "qwen35") {    // q8_0 KV: +5% deep prefill, same decode (Ornith 9B)
         v.kv_k = v.kv_v = GGML_TYPE_Q8_0;
     }
