@@ -1556,6 +1556,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const char * np = getenv("LLAMA_MTP_PIPE");
             pipe = (np && atoi(np) != 0) && n_seq == 1 && !is_mem_shared && !chain_heads;
             if (pipe) {
+                LOG_INF("%s: deferred MTP prompt pass enabled (LLAMA_MTP_PIPE)\n", __func__);
                 llama_set_nextn_dbuf(ctx_tgt, true);
                 common_dft_flush_register(ctx_dft, [this]() { flush(); });
             }
