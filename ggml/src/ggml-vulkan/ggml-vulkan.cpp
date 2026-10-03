@@ -2598,13 +2598,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // UPAR/N256 slots. Opt-in: 144 VGPRs (vs 120) and 2-6% slower on the model shapes, see R2 notes.
                 const bool p2 = getenv("GGML_VK_Q6K_PIPE2") != nullptr && atoi(getenv("GGML_VK_Q6K_PIPE2")) != 0;
                 // lean dequant (funnel-shift parity + byte-permute spread, hoisted row bases) in the UPAR, N256 and GLU
-                // slots; GGML_VK_NO_Q6K_LEANQ=1 restores the previous modules
-                const bool lq = !p2 && getenv("GGML_VK_NO_Q6K_LEANQ") == nullptr;
-                // uniform-parity variants for K/256 even (block parity is sb & 1); GGML_VK_NO_Q6K_UPAR=1 disables
-                if (getenv("GGML_VK_NO_Q6K_UPAR") == nullptr) {
+                // slots
+                const bool lq = !p2;
+                // uniform-parity variants for K/256 even (block parity is sb & 1);
+                {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_up, "mul_mm_q6k_rdna4_f16_up", p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqup_cm1_len : mul_mm_q6k_rdna4_f16_up_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_p2_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqup_cm1_data : mul_mm_q6k_rdna4_f16_up_cm1_data), "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
-                    if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
+                    {
                         ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_upsk, "mul_mm_q6k_rdna4_f16_upsk", p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqupsk_cm1_len : mul_mm_q6k_rdna4_f16_upsk_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_p2sk_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqupsk_cm1_data : mul_mm_q6k_rdna4_f16_upsk_cm1_data), "main", 3,
                                                 sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
@@ -2613,10 +2613,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // with the lean modules 128x128 wins on every model shape (pp2048 1570 vs 1540), so N256 is off unless
                 // GGML_VK_Q6K_LEANQ_N256=1
                 const bool lq_n256 = !lq || getenv("GGML_VK_Q6K_LEANQ_N256") != nullptr;
-                if (lq_n256 && getenv("GGML_VK_NO_Q6K_N256") == nullptr && getenv("GGML_VK_NO_Q6K_UPAR") == nullptr) {
+                if (lq_n256 && getenv("GGML_VK_NO_Q6K_N256") == nullptr) {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256, "mul_mm_q6k_rdna4_f16_n256", p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqn256_cm1_len : mul_mm_q6k_rdna4_f16_n256_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_n256p2_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqn256_cm1_data : mul_mm_q6k_rdna4_f16_n256_cm1_data), "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
-                    if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
+                    {
                         ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_n256sk, "mul_mm_q6k_rdna4_f16_n256sk", p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_len : (lq ? mul_mm_q6k_rdna4_f16_lqn256sk_cm1_len : mul_mm_q6k_rdna4_f16_n256sk_cm1_len), p2 ? mul_mm_q6k_rdna4_f16_n256p2sk_cm1_data : (lq ? mul_mm_q6k_rdna4_f16_lqn256sk_cm1_data : mul_mm_q6k_rdna4_f16_n256sk_cm1_data), "main", 3,
                                                 sizeof(vk_mat_mat_push_constants), {128, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
@@ -2636,8 +2636,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                                 sizeof(vk_mat_mat_push_constants), {64, 256, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                     }
                 }
-                // split-K for shapes with too few 128x128 tiles for 64 CUs (e.g. ffn_down 5120 x 17408); GGML_VK_NO_Q6K_SPLITK=1 disables
-                if (getenv("GGML_VK_NO_Q6K_SPLITK") == nullptr) {
+                // split-K for shapes with too few 128x128 tiles for 64 CUs (e.g. ffn_down 5120 x 17408)
+                {
                     ggml_vk_create_pipeline(device, device->pipeline_mm_q6k_rdna4_f16_sk, "mul_mm_q6k_rdna4_f16_sk", mul_mm_q6k_rdna4_f16_sk_cm1_len, mul_mm_q6k_rdna4_f16_sk_cm1_data, "main", 3,
                                             sizeof(vk_mat_mat_push_constants), {128, 128, 1}, {order_n, q6k_diag}, 1, true, true, 64);
                 }
@@ -3396,29 +3396,29 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4[g], "flash_attn_prefill_rdna4_g" + std::to_string(g),
                                      flash_attn_prefill_rdna4_cm1_len, flash_attn_prefill_rdna4_cm1_data, "main", 5,
                                      sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g}, 1, true, true, 32);
-            if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_VT") == nullptr && (g % 2) == 0) {  // PV pairs row tiles
+            if ((g % 2) == 0) {  // PV pairs row tiles
                 // GGML_VK_FA_PREFILL_DIAG: profiling-only bitmask that removes work (results are wrong)
                 const char * diag_env = getenv("GGML_VK_FA_PREFILL_DIAG");
                 const uint32_t diag = diag_env ? (uint32_t)atoi(diag_env) : 0u;
                 ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_vt[g], "flash_attn_prefill_rdna4_vt_g" + std::to_string(g),
                                          flash_attn_prefill_rdna4_vt_cm1_len, flash_attn_prefill_rdna4_vt_cm1_data, "main", 5,
                                          sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
-                // softmax in registers on the S^T accumulator (gfx12 lane layout); GGML_VK_NO_FA_PREFILL_RDNA4_RS=1 disables
-                if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_RS") == nullptr) {
+                // softmax in registers on the S^T accumulator (gfx12 lane layout)
+                {
                     ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_rs[g], "flash_attn_prefill_rdna4_rs_g" + std::to_string(g),
                                              flash_attn_prefill_rdna4_rs_cm1_len, flash_attn_prefill_rdna4_rs_cm1_data, "main", 5,
                                              sizeof(vk_fa_prefill_rdna4_push_constants), {1, 1, 1}, {64 * g, g, diag}, 1, true, true, 32);
-                    // V scratch pre-transposed per 32-kv tile (fa_dequant_q8_0_rdna4); GGML_VK_NO_FA_PREFILL_RDNA4_V64=1 disables
-                    if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_V64") == nullptr) {
+                    // V scratch pre-transposed per 32-kv tile (fa_dequant_q8_0_rdna4)
+                    {
                         // FPQ probe: split the QK S^T WMMA chain into NS accumulators; measured null at KV 66048
                         // (NS=2 +0.8 ms, NS=4 +3 ms per ubatch), so default 1; GGML_VK_FPQ_NS=2|4 probes it
                         uint32_t fpq_ns = 1u;
                         if (const char * e = getenv("GGML_VK_FPQ_NS")) { fpq_ns = (uint32_t)atoi(e); }
                         if (fpq_ns != 1 && fpq_ns != 2 && fpq_ns != 4) { fpq_ns = 1; }
-                        // FOV: lazy O rescale (TAU = 8) + loop-invariant prefetch offsets; GGML_VK_NO_FOV=1 reverts
-                        const uint32_t fov = getenv("GGML_VK_NO_FOV") == nullptr ? 1u : 0u;
-                        // FV2: base-2 softmax + invariant staging addresses; GGML_VK_NO_FV2=1 reverts to FOV
-                        const uint32_t fv2 = getenv("GGML_VK_NO_FV2") == nullptr ? 1u : 0u;
+                        // FOV: lazy O rescale (TAU = 8) + loop-invariant prefetch offsets
+                        const uint32_t fov = 1u;
+                        // FV2: base-2 softmax + invariant staging addresses
+                        const uint32_t fv2 = 1u;
                         ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4_v64[g], "flash_attn_prefill_rdna4_v64_g" + std::to_string(g),
                                                  fov ? flash_attn_prefill_rdna4_v64p_cm1_len : flash_attn_prefill_rdna4_v64_cm1_len,
                                                  fov ? flash_attn_prefill_rdna4_v64p_cm1_data : flash_attn_prefill_rdna4_v64_cm1_data, "main", 5,
@@ -3427,7 +3427,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 }
             }
         }
-        if (getenv("GGML_VK_NO_FA_PREFILL_RDNA4_V64") == nullptr) {
+        {
             ggml_vk_create_pipeline2(device, device->pipeline_fa_dequant_q8_0_rdna4, "fa_dequant_q8_0_rdna4", fa_dequant_q8_0_rdna4_len, fa_dequant_q8_0_rdna4_data,
                                      "main", 2, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true, true, 32);
         }
@@ -9120,9 +9120,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_pipeline pipeline_fa_mask_opt = nullptr;
     // P3: reuse the mask_opt bitmask of an earlier FA node in the same graph_compute when it read
     // the same mask with the same tiling (fixed 1 MiB buffer; larger bitmasks use prealloc_y).
-    static const bool no_mask_opt_cache = getenv("GGML_VK_NO_MASK_OPT_CACHE") != nullptr;
     const uint64_t mask_opt_cache_cap = 1u << 20;
-    const bool mask_opt_cached = use_mask_opt && !no_mask_opt_cache && mask_opt_size <= mask_opt_cache_cap;
+    const bool mask_opt_cached = use_mask_opt && mask_opt_size <= mask_opt_cache_cap;
     bool mask_opt_hit = false;
     if (mask_opt_cached) {
         if (!ctx->fa_mask_opt_buf) {
@@ -10550,9 +10549,8 @@ void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const g
     const uint32_t dst_type_size = ggml_type_size(dst->type);
 
     // ne00 == 1 f32 gather (reduced-vocab logit unpermute): one thread per element instead of one 512-thread WG per row
-    static const bool no_gr_small = getenv("GGML_VK_NO_GR_SMALL") != nullptr;
     vk_pipeline small_pipe = nullptr;
-    if (!no_gr_small && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src0->ne[0] == 1 && src1->type == GGML_TYPE_I32) {
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src0->ne[0] == 1 && src1->type == GGML_TYPE_I32) {
         small_pipe = ctx->device->pipeline_get_rows_f32_small;
     }
 
@@ -11199,8 +11197,8 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         return;
     }
     // VSUB: no per-node hash map. use counts come from the graph's own hash set, and only the CPY / GET_ROWS /
-    // GDN-view nodes (a few hundred) are indexed. GGML_VK_NO_VSUB=1 restores the original full-graph maps.
-    static const bool fast = getenv("GGML_VK_NO_VSUB") == nullptr;
+    // GDN-view nodes (a few hundred) are indexed.
+    static constexpr bool fast = true;
     static thread_local std::unordered_map<const ggml_tensor *, int> idx;
     static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> cpys_of; // CPY nodes keyed by their src's view_src
     static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> views_of; // nodes viewing a GDN node
@@ -11255,9 +11253,8 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         *cache = base;
         return t;
     };
-    // K = n_rs_seq+1 snapshot CPYs per conv layer (up to 8; LLAMA_NO_RS_INDEX=1 restores the old cap of 4)
-    static const bool no_rs_index = getenv("LLAMA_NO_RS_INDEX") != nullptr && atoi(getenv("LLAMA_NO_RS_INDEX")) != 0;
-    const size_t max_conv_cpys = no_rs_index ? 4 : 8;
+    // K = n_rs_seq+1 snapshot CPYs per conv layer (up to 8)
+    const size_t max_conv_cpys = 8;
     // no compute node in [lo, hi] other than the fused ones touches the cache
     auto cache_untouched = [&](const ggml_tensor * cache, int lo, int hi, const std::unordered_set<const ggml_tensor *> & mine) {
         for (int j = lo; j <= hi; ++j) {
@@ -16190,8 +16187,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     int first_unused = 0;
 
-    // GGML_VK_NO_KEEP_RMS_SCALE=1 / GGML_VK_NO_KEEP_UNARY_MUL=1 restore the old grouping
-    static const bool keep_rms_scale = getenv("GGML_VK_NO_KEEP_RMS_SCALE") == nullptr;
+    // GGML_VK_NO_KEEP_UNARY_MUL=1 restores the old grouping
     static const bool keep_unary_mul = getenv("GGML_VK_NO_KEEP_UNARY_MUL") == nullptr;
     auto const &rms_scale_at = [&](int n) -> bool {
         return n + 1 < graph->n_nodes && !used[n] && !used[n + 1] &&
@@ -16351,7 +16347,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
         // RMS_NORM -> SCALE (the GDN q/k l2 norms) stays adjacent so RMS_NORM_SCALE fuses
-        if (keep_rms_scale && rms_scale_at(first_unused)) {
+        if (rms_scale_at(first_unused)) {
             keep_pattern({ GGML_OP_RMS_NORM, GGML_OP_SCALE });
             continue;
         }
@@ -16395,7 +16391,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                (keep_rms_scale && rms_scale_at(j)) ||
+                rms_scale_at(j) ||
                 add_rms_mul_at(j) ||
                 swiglu_at(j) ||
                 (keep_unary_mul && unary_mul_at(j))) {

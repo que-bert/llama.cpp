@@ -558,9 +558,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // Prompt pass (no output rows, token input): the draft head only has to fill its K/V cache. K and V of this layer
     // depend only on eh_proj(enorm(tok), hnorm(h)) -> attn_norm -> wk/wv, so skip Q, attention, wo, the FFN and the head
-    // (cuts the draft prompt graph ~5x). LLAMA_NO_MTP_KVONLY=1 reverts to the full graph. K/V rows are bit-identical.
-    static const bool kv_only_on = !(getenv("LLAMA_NO_MTP_KVONLY") && atoi(getenv("LLAMA_NO_MTP_KVONLY")) != 0);
-    const bool kv_only = kv_only_on && n_outputs == 0 && ubatch.token && !layer.wqkv && layer.wk && layer.wv &&
+    // (cuts the draft prompt graph ~5x). K/V rows are bit-identical.
+    const bool kv_only = n_outputs == 0 && ubatch.token && !layer.wqkv && layer.wk && layer.wv &&
                          hparams.f_clamp_kqv <= 0.0f && !layer.wk_b && !layer.wv_b;
 
     ggml_tensor * inp_pos     = build_inp_pos();
