@@ -7,6 +7,57 @@ inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
     return os << static_cast<VkBuffer>(buffer);
 }
 }
+// AMD RDNA4 dGPU device ids (Navi 48 / Navi 44), from libdrm amdgpu.ids and `vulkaninfo --summary` on the lab box.
+// 0x7550 RX 9070 XT/9070/9070 GRE, 0x7551 AI PRO R9700, 0x7590 RX 9060 XT/9060. An id outside this set never
+// takes the RDNA4 path, even if the feature proxy below says RDNA4 (future AMD parts).
+static bool ggml_vk_is_known_rdna4_device_id(uint32_t id) {
+    return id == 0x7550 || id == 0x7551 || id == 0x7590;
+}
+
+// Validation table: device class x fork-only fast path. A device gets a fork path only if its (vendor, deviceID)
+// is listed here AND the architecture probe agrees (RDNA4). Everything else runs upstream behaviour.
+// Add a row only after the paths have been validated on that hardware (test-backend-ops + KLD/PPL + perf).
+enum : uint32_t {
+    VK_FORK_RDNA4_KERNELS = 1u << 0,
+    VK_FORK_FA_Q8_256     = 1u << 1,
+    VK_FORK_RDNA4_GEMM    = 1u << 2,
+    VK_FORK_COOPMAT_WGS   = 1u << 3,
+    VK_FORK_ALL           = 0xfu,
+};
+struct vk_fork_validation_row {
+    uint32_t vendor_id;
+    uint32_t device_id;
+    vk_device_architecture arch;
+    const char * cls;
+    uint32_t paths;
+};
+static const vk_fork_validation_row vk_fork_validation_table[] = {
+    { VK_VENDOR_ID_AMD, 0x7551, vk_device_architecture::AMD_RDNA4, "RDNA4 Navi48 (AI PRO R9700)",  VK_FORK_ALL },
+    { VK_VENDOR_ID_AMD, 0x7590, vk_device_architecture::AMD_RDNA4, "RDNA4 Navi44 (RX 9060 XT)",    VK_FORK_ALL },
+};
+
+// GGML_VK_NO_INT8_MMQ=<any non-empty value> disables the int8 cooperative-matrix MMQ everywhere
+// (coopmat_int_support stays false, so no cm1 int8 pipelines and no int8 QK flash attention).
+static bool ggml_vk_no_int8_mmq() {
+    const char * e = getenv("GGML_VK_NO_INT8_MMQ");
+    return e != nullptr && e[0] != '\0';
+}
+
+static vk_fork_gates ggml_vk_compute_fork_gates(uint32_t vendor_id, uint32_t device_id, vk_device_architecture arch) {
+    vk_fork_gates g;
+    for (const auto & row : vk_fork_validation_table) {
+        if (row.vendor_id == vendor_id && row.device_id == device_id && row.arch == arch) {
+            g.rdna4       = (row.paths & VK_FORK_RDNA4_KERNELS) != 0;
+            g.fa_q8_256   = (row.paths & VK_FORK_FA_Q8_256) != 0;
+            g.rdna4_gemm  = (row.paths & VK_FORK_RDNA4_GEMM) != 0;
+            g.coopmat_wgs = (row.paths & VK_FORK_COOPMAT_WGS) != 0;
+            g.cls         = row.cls;
+            break;
+        }
+    }
+    return g;
+}
+
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
 
@@ -54,7 +105,10 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 return vk_device_architecture::AMD_RDNA1;
             }
             if (shader_float8 || integer_dot_props.integerDotProductAccumulatingSaturating4x8BitPackedMixedSignednessAccelerated) {
-                return vk_device_architecture::AMD_RDNA4;
+                if (ggml_vk_is_known_rdna4_device_id(props.deviceID)) {
+                    return vk_device_architecture::AMD_RDNA4;
+                }
+                // unknown RDNA4-class id: fall through to the RDNA3 classification (non-RDNA4 path)
             }
             if (integer_dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated) {
                 return vk_device_architecture::AMD_RDNA3;
@@ -1354,7 +1408,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.int8_qk = enable_int8_qk && !no_decode_v3 &&
                      device->coopmat_int_support &&
                      device->coopmat_int_m == 16 && device->coopmat_int_n == 16 && device->coopmat_int_k == 16 &&
-                     device->architecture == vk_device_architecture::AMD_RDNA4 &&
+                     device->fork.rdna4 && device->fork.fa_q8_256 &&
                      k_type == GGML_TYPE_Q8_0 && v_type == GGML_TYPE_Q8_0 &&
                      (hsk % 32) == 0 && n_rows <= 8 && coopmat_block_rows <= 16;
 
@@ -2500,7 +2554,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         // Some quants are not performant on RDNA4, those fall back to FP16 matmul
         const bool rdna3 = device->architecture == AMD_RDNA3;
-        const bool rdna4 = device->architecture == AMD_RDNA4;
+        const bool rdna4_arch = device->architecture == AMD_RDNA4;      // upstream RDNA4 class
+        const bool rdna4 = device->fork.rdna4_gemm;                      // fork GEMMs / validated-types-only MMQ restriction
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32",     matmul_f32_f32_cm1_len,     matmul_f32_f32_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16",     matmul_f32_f16_cm1_len,     matmul_f32_f16_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
@@ -2652,7 +2707,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
 
-        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+        if (device->coopmat_int_support && (rdna3 || rdna4_arch)) {
             // W4 validated-only: on RDNA4 the int8 cm1 MMQ is validated (zoo KLD/PPL, phase 2) for Q8_0 and Q6_K only;
             // the other types fall back to the regular path unless GGML_VK_CM1_MMQ_UNVALIDATED=1.
             static const bool cm1_unvalidated = getenv("GGML_VK_CM1_MMQ_UNVALIDATED") && atoi(getenv("GGML_VK_CM1_MMQ_UNVALIDATED")) != 0;
@@ -2729,7 +2784,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef X_CM1_ID
 
-        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+        if (device->coopmat_int_support && (rdna3 || rdna4_arch)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_0_q8_1",   matmul_id_subgroup_q4_0_q8_1_cm1_len,   matmul_id_subgroup_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q4_1,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_1_q8_1",   matmul_id_subgroup_q4_1_q8_1_cm1_len,   matmul_id_subgroup_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_0_q8_1",   matmul_id_subgroup_q5_0_q8_1_cm1_len,   matmul_id_subgroup_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
@@ -3058,7 +3113,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (const char * e = getenv("GGML_VK_RM_STDQ")) rm_stdq = (uint32_t) std::stoul(e);
     // RDNA3: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
-    const bool is_rdna4 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA4;
+    const bool is_rdna4 = device->fork.rdna4;
     const bool is_rdna3_4 = is_rdna3 || is_rdna4;
     // RDNA4: q6_K GEMV is latency-bound at the small batch sizes used by MTP
     // verify; four rows per workgroup raises memory-level parallelism. Only the
@@ -3391,7 +3446,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    if (device->coopmat_support && device->subgroup_require_full_support && device->architecture == vk_device_architecture::AMD_RDNA4) {
+    if (device->coopmat_support && device->subgroup_require_full_support && device->fork.rdna4) {
         for (uint32_t g = 1; g <= 6; ++g) {
             ggml_vk_create_pipeline2(device, device->pipeline_fa_prefill_rdna4[g], "flash_attn_prefill_rdna4_g" + std::to_string(g),
                                      flash_attn_prefill_rdna4_cm1_len, flash_attn_prefill_rdna4_cm1_data, "main", 5,
@@ -4536,6 +4591,14 @@ vk_device ggml_vk_get_device(size_t idx) {
         } else {
             device->shader_core_count = 0;
         }
+        device->fork = ggml_vk_compute_fork_gates(device->vendor_id, device->properties.deviceID, device->architecture);
+        if (getenv("GGML_VK_DEBUG_GATES") != nullptr) {
+            std::cerr << "ggml_vulkan: fork gates: dev=" << dev_num << " id=0x" << std::hex << device->properties.deviceID << std::dec
+                      << " arch=" << get_device_architecture_name(device->architecture) << " class=" << device->fork.cls
+                      << " rdna4_kernels=" << device->fork.rdna4 << " fa_q8_256=" << device->fork.fa_q8_256
+                      << " rdna4_gemm=" << device->fork.rdna4_gemm << " coopmat_wgs=" << device->fork.coopmat_wgs
+                      << " int8_mmq=" << !ggml_vk_no_int8_mmq() << std::endl;
+        }
         device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;
         device->float_controls_denorm_preserve_fp16 = vk12_props.shaderDenormPreserveFloat16;
 
@@ -5023,7 +5086,8 @@ vk_device ggml_vk_get_device(size_t idx) {
                            (vk::ComponentTypeKHR)prop.CType      == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup &&
-                           device->coopmat_int_m == 0
+                           device->coopmat_int_m == 0 &&
+                           !ggml_vk_no_int8_mmq()
                 ) {
                     device->coopmat_int_support = true;
                     device->coopmat_int_m = prop.MSize;
@@ -5886,7 +5950,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     // m = 48, k = 5120) get one 64-lane workgroup per row from the default;
     // 4x wider workgroups spread the k loop. GGML_VK_NO_DMMV_F32_WIDE=1 disables.
     static const bool no_f32_wide = getenv("GGML_VK_NO_DMMV_F32_WIDE") != nullptr;
-    if (!no_f32_wide && ctx->device->architecture == vk_device_architecture::AMD_RDNA4 &&
+    if (!no_f32_wide && ctx->device->fork.rdna4 &&
         a_type == GGML_TYPE_F32 && m <= 256 && k >= 1024) {
         dmmv_wg = DMMV_WG_SIZE_LARGE;
     }
@@ -5896,7 +5960,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
         static const int mq5_wg = []() { const char * e = getenv("GGML_VK_MQ5_WG"); return (e && !getenv("GGML_VK_NO_MQ5_TUNE")) ? atoi(e) : 0; }();
-        if (mq5_wg && a_type == GGML_TYPE_Q6_K && num_cols >= 5 && ctx->device->architecture == vk_device_architecture::AMD_RDNA4) {
+        if (mq5_wg && a_type == GGML_TYPE_Q6_K && num_cols >= 5 && ctx->device->fork.rdna4) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
@@ -5984,7 +6048,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
 
     {
         static const bool no_q6k_wg32 = getenv("GGML_VK_ID_Q6K_WG32") && getenv("GGML_VK_ID_Q6K_WG32")[0] == '0';
-        if (!no_q6k_wg32 && ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA4 &&
+        if (!no_q6k_wg32 && ctx->device->fork.rdna4 &&
             b_type != GGML_TYPE_Q8_1 && a_type == GGML_TYPE_Q6_K && k <= 512) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
@@ -7019,7 +7083,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return e ? (uint32_t) std::stoul(e) : 5u;
     }();
     bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL || q6k_mmvq == 1 ||
-                   (device->architecture == vk_device_architecture::AMD_RDNA4 && q6k_mmvq_min_n > 0 && n >= q6k_mmvq_min_n);
+                   (device->fork.rdna4 && q6k_mmvq_min_n > 0 && n >= q6k_mmvq_min_n);
     if (q6k_mmvq == 0) {
         mmvq_q6 = false;
     }
@@ -8551,11 +8615,11 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     static bool printed_caps = false;
     if (debug && !printed_caps) {
         printed_caps = true;
-        std::cerr << "decode_q8: rdna4=" << (device->architecture == vk_device_architecture::AMD_RDNA4) << " dot2=" << device->dot2_f16
+        std::cerr << "decode_q8: rdna4=" << (device->fork.rdna4) << " dot2=" << device->dot2_f16
                   << " sgctl=" << device->subgroup_size_control << " sg=[" << device->subgroup_min_size << "," << device->subgroup_max_size << "]"
                   << " K/V=" << ggml_type_name(k->type) << "/" << ggml_type_name(v->type) << " N=" << q->ne[1] << std::endl;
     }
-    if (disabled || device->architecture != vk_device_architecture::AMD_RDNA4 ||
+    if (disabled || !device->fork.rdna4 ||
         !device->subgroup_size_control || device->subgroup_min_size > 64 || device->subgroup_max_size < 64) {
         return false;
     }
@@ -8636,7 +8700,7 @@ static bool ggml_vk_flash_attn_decode_q8(ggml_backend_vk_context * ctx, vk_conte
     // also shrink the split-K partials). R9700 kv=183296 interleaved, q8w
     // nb=4: 128 WGs 734-739 us, 256 754-757, 512 797-799; q8r nb=4: 96 872,
     // 128 864, 256 907, 512 920. 2 WGs per CU (128 on the R9700's 64 CUs).
-    const uint32_t coopmat_wgs = device->shader_core_count > 0 ? 2 * device->shader_core_count : 128;
+    const uint32_t coopmat_wgs = (device->fork.coopmat_wgs && device->shader_core_count > 0) ? 2 * device->shader_core_count : 128;
     const uint32_t target_wgs = env_wgs > 0 ? (uint32_t)env_wgs : use_q8r ? coopmat_wgs : 512;
     const uint32_t bc = use_q8w ? 128u : use_q8r ? 64u : 32u;
     uint32_t k_num = std::max(1u, target_wgs / (n_kv_head * zg));
@@ -8800,7 +8864,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         memcpy(&pf_max_bias, (const float *) dst->op_params + 1, sizeof(float));
         memcpy(&pf_softcap,  (const float *) dst->op_params + 2, sizeof(float));
         const bool use_prefill_rdna4 = !no_prefill_rdna4 && use_dequant_kv &&
-            ctx->device->architecture == vk_device_architecture::AMD_RDNA4 &&
+            ctx->device->fork.rdna4 &&
             G >= 1 && G <= 6 && ctx->device->pipeline_fa_prefill_rdna4[G] != nullptr &&
             k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
             HSK == 256 && HSV == 256 && neq1 >= 64 &&
@@ -9030,7 +9094,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     static const bool no_decode_v2 = getenv("GGML_VK_FA_NO_DECODE_V2") != nullptr;
     const bool mask_opt_packed = packed_gqa && !no_decode_v2 &&
                                  k_type_eff == GGML_TYPE_Q8_0 && v_type_eff == GGML_TYPE_Q8_0 &&
-                                 ctx->device->architecture == vk_device_architecture::AMD_RDNA4 &&
+                                 ctx->device->fork.rdna4 &&
                                  n_pos <= 8;
     const uint32_t mask_opt_br = mask_opt_packed ? pos_per_tile : tuning_params.block_rows;
     bool use_mask_opt = !no_mask_opt && mask && !use_sparse &&

@@ -666,6 +666,16 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// Fork-only fast paths enabled for this device (see ggml_vk_compute_fork_gates in ggml-vulkan.cpp).
+// All false on any device class the fork paths were not validated on: those fall back to upstream behaviour.
+struct vk_fork_gates {
+    bool rdna4 = false;       // RDNA4-specific kernels/tuning (GEMV rows, FA prefill, decode FA, f32 wide dmmv, q6_K wg32/mmvq)
+    bool fa_q8_256 = false;   // FA hsk/hsv=256 + Q8_0 K/V int8 QK path
+    bool rdna4_gemm = false;  // RDNA4 Q6_K / Q8_0 prefill GEMMs, int8 cm1 MMQ type restriction
+    bool coopmat_wgs = false; // split-KV workgroup target = 2 * CU count
+    const char * cls = "none";
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -696,6 +706,7 @@ struct vk_device_struct {
     uint32_t vendor_id;
     vk::DriverId driver_id;
     vk_device_architecture architecture;
+    vk_fork_gates fork;
     std::unique_ptr<vk_queue> compute_queue;
     std::unique_ptr<vk_queue> transfer_queue;
     bool single_queue;
