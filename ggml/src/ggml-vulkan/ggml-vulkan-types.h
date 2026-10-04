@@ -1378,6 +1378,9 @@ struct ggml_backend_vk_context {
     std::unordered_set<const ggml_tensor *> gdn_skip_nodes;
     std::unordered_map<const ggml_tensor *, vk_gdn_cache_fuse> gdn_cache_fuse;
     const vk_gdn_cache_fuse * cur_gdn_cache_fuse {};
+    // graph (ggml_cgraph::uid, n_nodes) the two containers above were computed for; a reused graph keeps its uid
+    uint64_t gdn_prepass_uid {};
+    int      gdn_prepass_n_nodes {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

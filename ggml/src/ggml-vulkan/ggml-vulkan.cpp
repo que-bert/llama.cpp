@@ -11262,7 +11262,7 @@ static bool ggml_vk_gdn_find_gate(const ggml_tensor * n, UsesFn && uses, const g
 }
 
 // Find the GDN recurrent-cache patterns (see vk_gdn_cache_fuse) in this graph.
-static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+static void ggml_vk_gdn_cache_prepass_compute(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->gdn_skip_nodes.clear();
     ctx->gdn_cache_fuse.clear();
     static const bool disabled = getenv("GGML_VK_NO_GDN_CACHE") != nullptr;
@@ -11282,9 +11282,14 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
     static thread_local std::unordered_map<const ggml_tensor *, int> idx;
     static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> cpys_of; // CPY nodes keyed by their src's view_src
     static thread_local std::unordered_map<const ggml_tensor *, std::vector<int>> views_of; // nodes viewing a GDN node
+    // only GDN / CONCAT nodes can start a fusion: collect them here instead of probing cpys_of for every node
+    static thread_local std::vector<int> cands;
+    static thread_local std::vector<const ggml_tensor *> gdn_nodes;
     idx.clear();
     cpys_of.clear();
     views_of.clear();
+    cands.clear();
+    gdn_nodes.clear();
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         if (!fast) {
@@ -11295,8 +11300,20 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         if (n->op == GGML_OP_CPY && n->src[0]->view_src) {
             cpys_of[n->src[0]->view_src].push_back(i);
         }
-        if (fast && n->view_src && n->view_src->op == GGML_OP_GATED_DELTA_NET) {
-            views_of[n->view_src].push_back(i);
+        if (n->op == GGML_OP_GATED_DELTA_NET || n->op == GGML_OP_CONCAT) {
+            cands.push_back(i);
+            if (n->op == GGML_OP_GATED_DELTA_NET) {
+                gdn_nodes.push_back(n);
+            }
+        }
+        // views follow their source in the graph, so GDN sources are already known: pointer compare, no view_src deref
+        if (fast && n->view_src && !gdn_nodes.empty()) {
+            for (const ggml_tensor * gn : gdn_nodes) {
+                if (gn == n->view_src) {
+                    views_of[gn].push_back(i);
+                    break;
+                }
+            }
         }
     }
     auto base_of = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
@@ -11333,10 +11350,17 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         *cache = base;
         return t;
     };
+    // the handful of nodes one fusion claims: a linear-probe set beats a hashed one at this size
+    struct small_set {
+        std::vector<const ggml_tensor *> v;
+        small_set(const ggml_tensor * first) { v.reserve(16); v.push_back(first); }
+        void insert(const ggml_tensor * t) { if (!count(t)) { v.push_back(t); } }
+        bool count(const ggml_tensor * t) const { for (const ggml_tensor * x : v) { if (x == t) { return true; } } return false; }
+    };
     // K = n_rs_seq+1 snapshot CPYs per conv layer (up to 8)
     const size_t max_conv_cpys = 8;
     // no compute node in [lo, hi] other than the fused ones touches the cache
-    auto cache_untouched = [&](const ggml_tensor * cache, int lo, int hi, const std::unordered_set<const ggml_tensor *> & mine) {
+    auto cache_untouched = [&](const ggml_tensor * cache, int lo, int hi, const small_set & mine) {
         for (int j = lo; j <= hi; ++j) {
             const ggml_tensor * n = cgraph->nodes[j];
             if (mine.count(n) || ggml_op_is_empty(n->op) || ggml_is_empty(n)) {  // e.g. the zero-row extra-state copy
@@ -11356,7 +11380,7 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         return true;
     };
 
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
+    for (const int i : cands) {
         const ggml_tensor * n = cgraph->nodes[i];
         auto cit = cpys_of.find(n);
         if (cit == cpys_of.end()) {
@@ -11364,7 +11388,7 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         }
         const std::vector<int> & cpys = cit->second;
         ggml_backend_vk_context::vk_gdn_cache_fuse f {};
-        std::unordered_set<const ggml_tensor *> mine = { n };
+        small_set mine(n);
         int hi = i;
 
         if (n->op == GGML_OP_GATED_DELTA_NET) {
@@ -11477,13 +11501,25 @@ static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_
         } else {
             continue;
         }
-        for (const ggml_tensor * m : mine) {
+        for (const ggml_tensor * m : mine.v) {
             if (m != n) {
                 ctx->gdn_skip_nodes.insert(m);
             }
         }
         ctx->gdn_cache_fuse[n] = f;
     }
+}
+
+// llama.cpp reuses the scheduled graph between decode steps that have the same shape (same ggml_cgraph::uid, same
+// tensors, only input data differs); the prepass reads structure only, so its result stays valid for that uid.
+static void ggml_vk_gdn_cache_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    if (cgraph->uid != 0 && cgraph->uid == ctx->gdn_prepass_uid && cgraph->n_nodes == ctx->gdn_prepass_n_nodes) {
+        return;
+    }
+    ctx->gdn_prepass_uid = 0;
+    ggml_vk_gdn_cache_prepass_compute(ctx, cgraph);
+    ctx->gdn_prepass_uid = cgraph->uid;
+    ctx->gdn_prepass_n_nodes = cgraph->n_nodes;
 }
 
 void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {

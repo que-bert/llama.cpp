@@ -379,6 +379,17 @@ public:
         return -1;
     }
 
+    // append the indices of the cells carrying seq_id with position in [p0, p1) (O(log n + k), no cell scan)
+    void seq_cells_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & out) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+            out.push_back(it->second);
+        }
+    }
+
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {
