@@ -58,6 +58,9 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // make [first, last) resident and mapped (Linux MADV_POPULATE_READ); no-op elsewhere
+    void populate(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:

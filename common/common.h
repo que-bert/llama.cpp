@@ -563,6 +563,9 @@ struct common_params {
     bool check             = false; // check rather than generate results for llama-results
 
     bool usage             = false; // print usage
+    bool no_preset         = false; // disable GGUF-derived serving presets
+    bool print_preset      = false; // print the selected preset and exit
+    std::set<std::string> explicit_args; // option names (all aliases) set by CLI or env, filled by common_params_parse
     bool completion        = false; // print source-able completion script
     bool use_color         = false; // use color to distinguish generations and inputs
     bool special           = false; // enable special token output

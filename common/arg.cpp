@@ -142,6 +142,11 @@ bool common_arg::get_value_from_env(std::string & output) const {
     return false;
 }
 
+void common_arg::mark_explicit(common_params & params) const {
+    for (const auto & a : args)     { params.explicit_args.insert(a); }
+    for (const auto & a : args_neg) { params.explicit_args.insert(a); }
+}
+
 bool common_arg::has_value_from_env() const {
     if (env != nullptr && !args_neg.empty()) {
         // for compatibility, we need to check LLAMA_ARG_NO_ env as well
@@ -785,6 +790,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     for (auto & opt : ctx_arg.options) {
         std::string value;
         if (opt.get_value_from_env(value)) {
+            opt.mark_explicit(params);
             try {
                 if (opt.handler_void && is_truthy(value)) {
                     opt.handler_void(params);
@@ -836,6 +842,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             auto & tmp = arg_to_options[arg];
             auto opt = *tmp.first;
             bool is_positive = tmp.second;
+            opt.mark_explicit(params);
             if (opt.has_value_from_env()) {
                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
             }
@@ -1447,6 +1454,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.usage = true;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}));
+    add_opt(common_arg(
+        {"--no-preset"},
+        "disable GGUF-derived serving presets (flash attention, MTP, KV types, ...)",
+        [](common_params & params) {
+            params.no_preset = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--print-preset"},
+        "print the serving preset selected for the model (applied / skipped fields) and exit before loading it",
+        [](common_params & params) {
+            params.print_preset = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--version"},
         "show version and build info",

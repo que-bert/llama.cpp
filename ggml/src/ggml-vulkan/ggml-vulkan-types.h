@@ -678,6 +678,16 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// Fork-only fast paths enabled for this device (see ggml_vk_compute_fork_gates in ggml-vulkan.cpp).
+// All false on any device class the fork paths were not validated on: those fall back to upstream behaviour.
+struct vk_fork_gates {
+    bool rdna4 = false;       // RDNA4-specific kernels/tuning (GEMV rows, FA prefill, decode FA, f32 wide dmmv, q6_K wg32/mmvq)
+    bool fa_q8_256 = false;   // FA hsk/hsv=256 + Q8_0 K/V int8 QK path
+    bool rdna4_gemm = false;  // RDNA4 Q6_K / Q8_0 prefill GEMMs, int8 cm1 MMQ type restriction
+    bool coopmat_wgs = false; // split-KV workgroup target = 2 * CU count
+    const char * cls = "none";
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -708,6 +718,7 @@ struct vk_device_struct {
     uint32_t vendor_id;
     vk::DriverId driver_id;
     vk_device_architecture architecture;
+    vk_fork_gates fork;
     std::unique_ptr<vk_queue> compute_queue;
     std::unique_ptr<vk_queue> transfer_queue;
     bool single_queue;
@@ -1069,6 +1080,9 @@ struct vk_device_struct {
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
     bool disable_host_visible_vidmem;
+    size_t small_bar_visible_max = 0; // small BAR: buffers up to this size still prefer host-visible vidmem (0 = none)
+    size_t small_bar_model_max = 0;   // ...but only while the device buffers allocated so far total at most this (small models)
+    std::atomic<size_t> dev_buffer_bytes{0}; // bytes in live ggml_vk_create_buffer_device buffers
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
 
@@ -1103,10 +1117,14 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    bool counted = false; // included in device->dev_buffer_bytes
 
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
+        }
+        if (counted) {
+            device->dev_buffer_bytes -= size;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
@@ -1381,6 +1399,9 @@ struct ggml_backend_vk_context {
     std::unordered_map<const ggml_tensor *, vk_gdn_cache_fuse> gdn_cache_fuse;
     const vk_gdn_cache_fuse * cur_gdn_cache_fuse {};
     bool fused_hc_post_gate {};
+    // graph (ggml_cgraph::uid, n_nodes) the two containers above were computed for; a reused graph keeps its uid
+    uint64_t gdn_prepass_uid {};
+    int      gdn_prepass_n_nodes {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

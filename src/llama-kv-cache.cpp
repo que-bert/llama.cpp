@@ -403,15 +403,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // enumerate this sequence's cells in [p0, p1) from its position index instead of scanning every cell
+        // (same set of cells as the former full scan; new_head is the lowest cell that becomes empty)
+        static thread_local std::vector<uint32_t> hit;
+        hit.clear();
+        cells.seq_cells_in(seq_id, p0, p1, hit);
+        for (const uint32_t i : hit) {
+            if (cells.seq_rm(i, seq_id) && i < new_head) {
+                new_head = i;
             }
         }
 

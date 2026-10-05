@@ -1665,6 +1665,9 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                if (!lazy.has(cur)) {
+                    mmap_resident.emplace_back(weight->idx, weight->offs, weight->offs + n_size);
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1776,6 +1779,10 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
+            for (const auto & r : mmap_resident) {
+                mappings.at(std::get<0>(r))->populate(std::get<1>(r), std::get<2>(r));
+            }
+            mmap_resident.clear();
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
