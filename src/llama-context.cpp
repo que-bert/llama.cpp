@@ -786,6 +786,18 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // M-RoPE (multimodal) target models also decode image embeddings: an embedding-input ubatch allocates inp_embd
+    // instead of the token path and grows the compute buffer (+n_embd*n_ubatch*4 bytes). Reserve it now: grown later,
+    // the buffer is reallocated while the mmproj fills VRAM, can land in GTT and stays there (W1 heldout slow mode,
+    // +10 ms/step). LLAMA_NO_RESERVE_EMBD=1 disables.
+    if (model.hparams.n_pos_per_embd() > 1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.hparams.no_alloc &&
+            !(getenv("LLAMA_NO_RESERVE_EMBD") && atoi(getenv("LLAMA_NO_RESERVE_EMBD")) != 0)) {
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), false, nullptr, true);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute pp buffers (embd input)");
+        }
+    }
+
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -2706,7 +2718,8 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        bool embd_input) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2733,6 +2746,12 @@ ggml_cgraph * llama_context::graph_reserve(
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+    if (embd_input) {
+        // vector-embedding input (e.g. multimodal image chunks) instead of token ids
+        ubatch.data->embd.assign((size_t) ubatch.n_tokens*model.hparams.n_embd_inp(), 0.0f);
+        ubatch.token = nullptr;
+        ubatch.embd  = ubatch.data->embd.data();
+    }
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
