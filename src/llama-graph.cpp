@@ -115,6 +115,12 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// fork: LLAMA_MIXED_GRAPH_ALWAYS=1 builds the mixed input branch for every ubatch (upstream); default only for mixed ones
+static bool llm_graph_mixed_always() {
+    static const bool v = getenv("LLAMA_MIXED_GRAPH_ALWAYS") && atoi(getenv("LLAMA_MIXED_GRAPH_ALWAYS")) != 0;
+    return v;
+}
+
 // number of token rows of the mixed path, a non-mixed ubatch is sized for the worst case
 static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
     if (!ubatch.is_mixed()) {
@@ -132,6 +138,7 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    res &= llm_graph_mixed_always() || (mixed_tokens != nullptr) == params.ubatch.is_mixed();
     res &= (!mixed_tokens) || mixed_tokens->ne[0] == llm_graph_n_tok_rows(params.ubatch);
     res &= (!mixed_embd)   || mixed_embd->ne[1]   == params.ubatch.n_tokens;
     res &= (!scale_rows) || scale_rows->ne[1] == params.ubatch.n_tokens;
@@ -2503,7 +2510,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
-    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    // fork: the mixed branch is built only for a ubatch that mixes token and embd rows (upstream builds it for every
+    // ubatch to keep one topology). Its extra non-compute nodes cost MiniCPM5-2B tg128 d8192 -2.9% on the Vulkan fork
+    // (row MIX0B). LLAMA_MIXED_GRAPH_ALWAYS=1 restores the upstream behaviour.
+    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+                           (llm_graph_mixed_always() || ubatch.is_mixed());
     if (has_mixed) {
         const int64_t n_tok_rows = llm_graph_n_tok_rows(ubatch);
 
